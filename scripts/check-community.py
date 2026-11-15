@@ -71,6 +71,13 @@ def main() -> None:
             "Community build feature set changed unexpectedly.")
     require('"$@"' not in build_script and "--all-features" not in build_script,
             "Community build entrypoint must not accept feature overrides.")
+    bootstrap_defaults = read("crates/common/src/manager/defaults.rs")
+    require(
+        "ObjectType::Application" not in bootstrap_defaults
+        and "Stalwart Web Interface" not in bootstrap_defaults
+        and "webui.zip" not in bootstrap_defaults,
+        "Upstream WebUI must not be inserted by server bootstrap defaults.",
+    )
     for dockerfile in ("Dockerfile", "Dockerfile.build"):
         for line in read(dockerfile).splitlines():
             if re.search(r"\bcargo (?:chef cook|build|zigbuild)\b", line):

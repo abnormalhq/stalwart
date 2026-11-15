@@ -300,6 +300,15 @@ pub fn normalize_url_prefix(prefix: &str) -> &str {
     prefix.trim_matches('/')
 }
 
+pub fn is_reserved_console_prefix(prefix: &str) -> bool {
+    normalize_url_prefix(prefix)
+        .split('/')
+        .next()
+        .is_some_and(|segment| {
+            segment.eq_ignore_ascii_case("admin") || segment.eq_ignore_ascii_case("account")
+        })
+}
+
 pub fn validate_url_prefix(prefix: &str) -> Result<(), &'static str> {
     let prefix = normalize_url_prefix(prefix);
     if !is_url_prefix(prefix) {

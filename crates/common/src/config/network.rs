@@ -7,6 +7,7 @@
 use super::{resource::ResourceIdentifiers, *};
 use crate::{
     expr::if_block::{BootstrapExprExt, IfBlock},
+    manager::app_client::{is_reserved_console_prefix, normalize_url_prefix},
     network::{
         autoconfig::pacc::{
             Authentication, Configuration, HttpServer, Info, Logo, OAuthPublic, Protocols,
@@ -509,9 +510,25 @@ impl Http {
             },
             response_headers: http_headers,
             remote_ip_source: RemoteIpSource::new(http.client_ip_source, http.forwarded_hops),
-            redirect_root: http.redirect_root,
+            redirect_root: normalize_redirect_root(http.redirect_root),
         }
     }
+}
+
+const CONSOLE_ROOT: &str = "https://console.abnormalhq.com/";
+
+fn normalize_redirect_root(redirect_root: Option<String>) -> Option<String> {
+    redirect_root.map(|redirect_root| {
+        let path_end = redirect_root
+            .find(['?', '#'])
+            .unwrap_or(redirect_root.len());
+        let path = normalize_url_prefix(&redirect_root[..path_end]);
+        if is_reserved_console_prefix(path) {
+            CONSOLE_ROOT.to_string()
+        } else {
+            redirect_root
+        }
+    })
 }
 
 impl AsnGeoLookupConfig {
@@ -579,6 +596,39 @@ impl ClusterRoles {
             ClusterTaskType::TaskQueueProcessing => self.task_manager = enabled,
             ClusterTaskType::TaskScheduler => self.task_scheduler = enabled,
         }
+    }
+}
+
+#[cfg(test)]
+mod community_redirect_root_tests {
+    use super::{CONSOLE_ROOT, normalize_redirect_root};
+
+    #[test]
+    fn normalizes_legacy_admin_and_account_redirects() {
+        for path in [
+            "/admin",
+            "/admin/",
+            "/admin/settings?tab=mail#security",
+            "/account",
+            "/account/",
+            "/account/security?tab=login#devices",
+        ] {
+            assert_eq!(
+                normalize_redirect_root(Some(path.to_string())).as_deref(),
+                Some(CONSOLE_ROOT)
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_explicit_destinations_and_disabled_redirects() {
+        for target in ["https://other.example/admin", "/", "/settings?tab=mail#top"] {
+            assert_eq!(
+                normalize_redirect_root(Some(target.to_string())).as_deref(),
+                Some(target)
+            );
+        }
+        assert_eq!(normalize_redirect_root(None), None);
     }
 }
 

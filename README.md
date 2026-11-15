@@ -41,13 +41,13 @@ Docker build recipes also use locked dependencies and Community-only features. T
 - Upstream copyright statements, SPDX headers, license texts, and SEL snippets.
 - Upstream documentation and project acknowledgements where applicable.
 
-## Branding scope and separately loaded admin UI
+## Admin and account entry routes
 
-This fork debrands the server's built-in login and calendar RSVP pages, the Community calendar-email fallback logo, and the server protocol banners changed by the neutral-greetings patch. It does not currently rebrand the separate administrative web UI.
+This fork uses the existing Abnormal Console at [console.abnormalhq.com](https://console.abnormalhq.com/) rather than loading the upstream Stalwart WebUI. The server no longer inserts a default WebUI application. Top-level `/admin` and `/account` paths are reserved: GET and HEAD requests redirect to the configured `http.redirectRoot` destination; other methods receive 405 with `Allow: GET, HEAD`. The server root uses the same redirect behavior.
 
-When the registry has no application object, `crates/common/src/manager/defaults.rs` inserts a default application named `Stalwart Web Interface`, with URL prefixes `/admin` and `/account`, and points it at `https://github.com/stalwartlabs/webui/releases/download/v2/webui.zip`. That UI is a separately downloaded artifact, not bundled in this server source/build, and remains upstream-branded. The [`stalwartlabs/webui`](https://github.com/stalwartlabs/webui) project is distinct from the archived `stalwartlabs/webadmin` repository. This fork has not changed the bootstrap URL or defaults.
+The schema's existing `/account` default and legacy relative `redirectRoot` values under `/admin` or `/account` (including nested paths, query strings, and fragments) normalize to `https://console.abnormalhq.com/`. Other explicit destinations are retained; if one has no fragment, the redirect adds an empty fragment so browsers do not inherit the previous page's fragment. The request path and query are never appended. A `None` redirect target leaves the root unredirected and makes GET/HEAD requests to `/admin` and `/account` return 404; other methods return 405. Operators may configure another entry destination.
 
-The current `stalwartlabs/webui` README describes its source as dual-licensed under AGPL-3.0 and SEL, but its README says SELv1 while the checked-in `LICENSES/LicenseRef-SEL.txt` is SELv2. The AGPL option permits modifications to files that are AGPL-covered or dual-licensed when the AGPL option is selected, subject to its notice and source obligations. That does not itself grant trademark rights; file-level licensing and the rights to use or alter Stalwart marks/logos in the separate UI have not been established here. Rebranding that UI needs a separate source/asset and trademark review.
+An upgrade does not delete existing Application registry records or cached bundles. Their `/admin` and `/account` mounts are ignored; other prefixes continue to be served, including unreserved prefixes on a mixed application. These redirects are navigation only: the Console has separate authentication, does not reuse Stalwart sessions, passwords, or OAuth tokens, and is not claimed to provide feature parity with Stalwart's former WebUI. The server's built-in login, device authorization, OAuth, and calendar RSVP routes are unchanged.
 
 ## Enterprise migration blockers
 

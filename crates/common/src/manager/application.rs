@@ -9,7 +9,8 @@ use crate::{
     auth::oauth::client::{AppOriginPolicy, ApplicationClient},
     manager::{
         app_client::{
-            APP_CLIENT_DOCUMENT, AppClientId, AppClientTemplate, app_base, normalize_url_prefix,
+            APP_CLIENT_DOCUMENT, AppClientId, AppClientTemplate, app_base,
+            is_reserved_console_prefix, normalize_url_prefix,
         },
         fetch_resource,
     },
@@ -279,11 +280,17 @@ impl WebApplications {
     pub async fn reload(&self, bp: &mut Bootstrap) {
         let mut apps = Vec::new();
         for app in bp.list_infallible::<Application>().await {
-            if app.object.enable {
-                apps.push(WebApplicationManager::new(app));
+            if app.object.enable
+                && let Some(app) = WebApplicationManager::new(app)
+            {
+                apps.push(app);
             }
         }
         self.applications.store(Arc::new(apps));
+
+        let mut routes = self.routes.load_full().as_ref().clone();
+        routes.retain(|prefix, _| !is_reserved_console_prefix(prefix));
+        self.routes.store(Arc::new(routes));
     }
 
     pub async fn unpack_all(&self, server: &Server, update: bool) {
@@ -339,7 +346,13 @@ impl WebApplications {
 }
 
 impl WebApplicationManager {
-    pub fn new(app: RegistryObject<Application>) -> Self {
+    pub fn new(app: RegistryObject<Application>) -> Option<Self> {
+        let prefixes =
+            filter_application_prefixes(app.object.url_prefix.iter().map(String::as_str));
+        if prefixes.is_empty() {
+            return None;
+        }
+
         let base_path = app
             .object
             .unpack_directory
@@ -347,7 +360,7 @@ impl WebApplicationManager {
             .unwrap_or_else(std::env::temp_dir)
             .join(app.id.id().to_string());
 
-        Self {
+        Some(Self {
             base_path,
             blob_key: BlobHash::generate(format!("{}{}", APP_BLOB_PREFIX, app.id.id()).as_bytes()),
             url: app.object.resource_url,
@@ -358,13 +371,8 @@ impl WebApplicationManager {
                 scope_list(app.object.oauth_scopes.iter()).as_deref(),
             ),
             oauth_client_id: app.object.oauth_client_id,
-            prefixes: app
-                .object
-                .url_prefix
-                .iter()
-                .map(|prefix| normalize_url_prefix(prefix).to_string())
-                .collect(),
-        }
+            prefixes,
+        })
     }
 
     async fn unpack(
@@ -623,6 +631,50 @@ impl WebApplicationManager {
             .delete_blob(blob_key.as_slice())
             .await
             .map(|_| ())
+    }
+}
+
+fn filter_application_prefixes<'a>(prefixes: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    prefixes
+        .into_iter()
+        .filter(|prefix| !is_reserved_console_prefix(prefix))
+        .map(|prefix| normalize_url_prefix(prefix).to_string())
+        .collect()
+}
+
+#[cfg(test)]
+mod community_prefix_tests {
+    use super::{filter_application_prefixes, is_reserved_console_prefix};
+
+    #[test]
+    fn filters_legacy_admin_and_account_mounts() {
+        assert!(filter_application_prefixes(["/admin", "/account"]).is_empty());
+        assert!(filter_application_prefixes(["///admin///", "/account/"]).is_empty());
+    }
+
+    #[test]
+    fn preserves_other_and_mixed_application_mounts() {
+        assert_eq!(
+            filter_application_prefixes(["/admin", "/mail"]),
+            vec!["mail".to_string()]
+        );
+        assert_eq!(
+            filter_application_prefixes(["/mail", "/account", "/webmail"]),
+            vec!["mail".to_string(), "webmail".to_string()]
+        );
+        assert_eq!(
+            filter_application_prefixes(["/mail", "/calendar"]),
+            vec!["mail".to_string(), "calendar".to_string()]
+        );
+    }
+
+    #[test]
+    fn reserved_prefix_matching_respects_segment_boundaries() {
+        assert!(is_reserved_console_prefix("///admin///child/"));
+        assert!(is_reserved_console_prefix("/ACCOUNT/"));
+        assert!(!is_reserved_console_prefix("/administrator"));
+        assert!(!is_reserved_console_prefix("/accounting"));
+        assert!(!is_reserved_console_prefix("/mail/admin"));
     }
 }
 
