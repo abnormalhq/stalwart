@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <meta name="referrer" content="no-referrer">
     <meta name="color-scheme" content="light dark">
-    <title>Sign in</title>
+    <title>Sign in — Abnormal Mail Server</title>
     <link rel="stylesheet" href="/ui-HASH.css">
     <script src="/ui-HASH.js"></script>
     <style>
@@ -134,6 +134,26 @@
             grid-template-columns: 1fr 1fr;
             gap: 0.625rem;
         }
+
+        .legal-notice {
+            max-width: 32rem;
+            margin: 1rem auto 2rem;
+            padding: 0 1rem;
+            color: var(--dim);
+            font-size: 0.75rem;
+            line-height: 1.5;
+            text-align: center;
+        }
+
+        .legal-notice p {
+            margin: 0.25rem 0;
+        }
+
+        .legal-notice a {
+            color: inherit;
+            text-decoration: underline;
+            text-underline-offset: 0.15em;
+        }
     </style>
 </head>
 
@@ -231,6 +251,12 @@
             </div>
         </div>
     </main>
+
+    <footer class="legal-notice" aria-label="Legal notices">
+        <p>Based on Stalwart v1.1.0; modified by abnormalhq. No warranty is provided.</p>
+        <p><a href="https://github.com/abnormalhq/stalwart">Source code</a> ·
+            <a href="https://www.gnu.org/licenses/agpl-3.0.html">AGPL-3.0</a></p>
+    </footer>
 
 </body>
 

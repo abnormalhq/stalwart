@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   auto-close:
+    if: github.repository == 'stalwartlabs/stalwart'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

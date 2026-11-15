@@ -201,7 +201,7 @@ impl Network {
             }),
             info: Info {
                 provider: Provider {
-                    name: "Stalwart".into(),
+                    name: "Abnormal Mail".into(),
                     ..Default::default()
                 },
                 ..Default::default()

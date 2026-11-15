@@ -42,7 +42,7 @@ jobs:
       attestations: write
       packages: write
     needs: [linux, windows, macos, freebsd]
-    if: github.event_name == 'push' || inputs.Docker
+    if: github.repository == 'stalwartlabs/stalwart' && (github.event_name == 'push' || inputs.Docker)
     steps:
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4.1.2
@@ -105,6 +105,7 @@ jobs:
           push-to-registry: true
 
   linux:
+    if: github.repository == 'stalwartlabs/stalwart'
     permissions:
       id-token: write
       contents: write
@@ -337,6 +338,7 @@ jobs:
           retention-days: 1
 
   windows:
+    if: github.repository == 'stalwartlabs/stalwart'
     name: Build / ${{matrix.target}}
     runs-on: windows-latest
     strategy:
@@ -369,6 +371,7 @@ jobs:
           path: artifacts
 
   macos:
+    if: github.repository == 'stalwartlabs/stalwart'
     name: Build / ${{matrix.target}}
     runs-on: macos-latest
     strategy:
@@ -414,6 +417,7 @@ jobs:
           path: artifacts
 
   freebsd:
+    if: github.repository == 'stalwartlabs/stalwart'
     name: Build / ${{matrix.target}}
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -475,7 +479,7 @@ jobs:
       id-token: write
       contents: write
       attestations: write
-    if: github.event_name == 'push' || inputs.Release
+    if: github.repository == 'stalwartlabs/stalwart' && (github.event_name == 'push' || inputs.Release)
     needs: [linux, windows, macos, freebsd]
     runs-on: ubuntu-latest
     steps:
@@ -563,7 +567,7 @@ jobs:
   publish:
     name: Publish release
     needs: [linux, windows, macos, freebsd, multiarch, release]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.repository == 'stalwartlabs/stalwart' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -576,7 +580,7 @@ jobs:
   cleanup:
     name: Cleanup failed release
     needs: [linux, windows, macos, freebsd, multiarch, release]
-    if: failure() && startsWith(github.ref, 'refs/tags/') && github.run_attempt >= 3
+    if: github.repository == 'stalwartlabs/stalwart' && failure() && startsWith(github.ref, 'refs/tags/') && github.run_attempt >= 3
     runs-on: ubuntu-latest
     permissions:
       contents: write

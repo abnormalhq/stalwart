@@ -42,7 +42,7 @@ pub struct IpcReceivers {
 }
 
 const HELP: &str = concat!(
-    "Stalwart Server v",
+    "Abnormal Mail Server v",
     env!("CARGO_PKG_VERSION"),
     r#"
 

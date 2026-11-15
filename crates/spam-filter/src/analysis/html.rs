@@ -14,6 +14,8 @@ use hyper::Uri;
 use nlp::tokenizers::types::{TokenType, TypesTokenizer};
 use std::{borrow::Cow, future::Future};
 
+use super::image_size::ImageSize;
+
 pub trait SpamFilterAnalyzeHtml: Sync + Send {
     fn spam_filter_analyze_html(
         &self,
@@ -62,7 +64,7 @@ impl SpamFilterContext<'_> {
 
             let mut has_link_to_img = false;
             let mut last_href: Option<Href> = None;
-            let mut html_img_words = 0;
+            let mut html_img_words = 0u64;
             let mut in_head: i32 = 0;
             let mut in_body: i32 = 0;
 
@@ -123,16 +125,21 @@ impl SpamFilterContext<'_> {
                             }
                         }
                         IMG if is_body_part => {
-                            let mut img_width = 800;
-                            let mut img_height = 600;
+                            // Duplicate HTML attributes use their first occurrence, as in
+                            // HTML parsing. Inline CSS takes precedence inside ImageSize.
+                            let value = |name| {
+                                attributes
+                                    .iter()
+                                    .find(|(attr, _)| *attr == name)
+                                    .and_then(|(_, value)| value.as_deref())
+                            };
+                            let size = ImageSize::new(value(WIDTH), value(HEIGHT), value(STYLE));
 
                             for (attr, value) in attributes {
                                 if let Some(value) =
                                     value.as_deref().map(|v| v.trim()).filter(|v| !v.is_empty())
                                 {
-                                    let dimension = match *attr {
-                                        WIDTH => &mut img_width,
-                                        HEIGHT => &mut img_height,
+                                    match *attr {
                                         SRC => {
                                             if starts_with_ignore_ascii_case(value, "data:")
                                                 && contains_ignore_ascii_case(value, ";base64,")
@@ -147,25 +154,14 @@ impl SpamFilterContext<'_> {
                                                 // Has external image
                                                 ctx.result.add_tag("HAS_EXTERNAL_IMG");
                                             }
-                                            continue;
                                         }
-                                        _ => {
-                                            continue;
-                                        }
-                                    };
-                                    if let Some(pct) = value.strip_suffix('%') {
-                                        if let Ok(pct) = pct.trim().parse::<u64>() {
-                                            *dimension = (*dimension * pct) / 100;
-                                        }
-                                    } else if let Ok(value) = value.parse::<u64>() {
-                                        *dimension = value;
+                                        _ => (),
                                     }
                                 }
                             }
-                            let dimensions = img_width + img_height;
 
                             if last_href.is_some() {
-                                if dimensions >= 210 {
+                                if size.is_large() {
                                     ctx.result.add_tag("HAS_LINK_TO_LARGE_IMG");
                                     has_link_to_img = true;
                                 } else {
@@ -173,10 +169,7 @@ impl SpamFilterContext<'_> {
                                 }
                             }
 
-                            if dimensions > 100 {
-                                // We assume that a single picture 100x200 contains approx 3 words of text
-                                html_img_words += dimensions / 100;
-                            }
+                            html_img_words = html_img_words.saturating_add(size.word_weight());
                         }
                         META => {
                             let mut has_equiv_refresh = false;
@@ -370,4 +363,100 @@ fn can_contain_url(text: &str) -> bool {
     text.as_bytes()
         .iter()
         .any(|byte| matches!(byte, b'.' | b'['))
+}
+
+#[cfg(test)]
+mod image_size_tests {
+    use super::*;
+    use crate::{MessageTexts, SpamFilterInput};
+    use mail_parser::MessageParser;
+    use std::collections::BTreeSet;
+
+    fn analyze(html: &str) -> BTreeSet<String> {
+        let raw = format!(
+            "From: sender@example.org\r\nTo: recipient@example.net\r\nSubject: Image sizing\r\n\
+             MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}"
+        );
+        let message = MessageParser::new().parse(raw.as_bytes()).unwrap();
+        let texts = MessageTexts::new(&message, Default::default());
+        let mut ctx = SpamFilterContext::new(SpamFilterInput::from_message(&message, &texts, 0));
+        SpamFilterContext::analyze_html(&mut ctx);
+        ctx.result.tags.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn small_inline_icon_and_auto_logo_are_not_large() {
+        for image in [
+            r#"<img src="https://images.example.org/icon.png" style="display:block;width:12px;height:12px">"#,
+            r#"<img src="https://images.example.org/logo.png" width="103" style="width:103px;height:auto;max-width:100%">"#,
+        ] {
+            let tags = analyze(&format!(
+                "<body><p>A useful notification with a short ordinary text description.</p>\
+                 <a href=\"https://example.org/\">{image}</a></body>"
+            ));
+            assert!(tags.contains("HAS_LINK_TO_IMG"));
+            assert!(tags.contains("HAS_EXTERNAL_IMG"));
+            assert!(tags.contains("HTML_SHORT_1"));
+            assert!(!tags.contains("HAS_LINK_TO_LARGE_IMG"));
+            assert!(!tags.contains("HTML_TEXT_IMG_RATIO"));
+        }
+    }
+
+    #[test]
+    fn every_linked_image_is_checked_without_erasing_previous_large_images() {
+        for images in [
+            r#"<img src="same.png" width="12" height="12"><img src="same.png" width="300" height="200">"#,
+            r#"<img src="same.png" width="300" height="200"><img src="same.png" width="12" height="12">"#,
+        ] {
+            let tags = analyze(&format!(
+                "<body><a href=\"https://example.org/\">{images}</a></body>"
+            ));
+            assert!(tags.contains("HAS_LINK_TO_LARGE_IMG"));
+        }
+        let tags = analyze(
+            r#"<body><a href="https://example.org/"><img width="12" height="12"></a>
+               <img width="800" height="600"></body>"#,
+        );
+        assert!(!tags.contains("HAS_LINK_TO_LARGE_IMG"));
+        assert!(tags.contains("HTML_TEXT_IMG_RATIO"));
+    }
+
+    #[test]
+    fn first_duplicate_html_attribute_wins() {
+        for image in [
+            r#"<img width="300" width="12" height="12">"#,
+            r#"<img style="width:300px;height:12px" style="width:12px;height:12px">"#,
+        ] {
+            let tags = analyze(&format!(
+                "<body><a href=\"https://example.org/\">{image}</a></body>"
+            ));
+            assert!(tags.contains("HAS_LINK_TO_LARGE_IMG"));
+        }
+    }
+
+    #[test]
+    fn unknown_image_presence_preserves_image_only_risk_without_inventing_size() {
+        let tags =
+            analyze(r#"<body><a href="https://example.org/"><img src="image.png"></a></body>"#);
+        assert!(tags.contains("HAS_LINK_TO_IMG"));
+        assert!(tags.contains("HTML_TEXT_IMG_RATIO"));
+        assert!(!tags.contains("HAS_LINK_TO_LARGE_IMG"));
+    }
+
+    #[test]
+    fn independent_html_risks_are_unchanged() {
+        let tags = analyze(
+            r#"<body><meta http-equiv="refresh" content="0;url=https://other.example/">
+               <a href="https://other.example/">https://example.org/
+               <img src="data:text/html;base64,PHNjcmlwdD4=" style="width:12px;height:12px"></a>"#,
+        );
+        for tag in [
+            "PHISHING",
+            "HTML_META_REFRESH_URL",
+            "HAS_DATA_URI",
+            "HTML_UNBALANCED_TAG",
+        ] {
+            assert!(tags.contains(tag), "{tag}: {tags:?}");
+        }
+    }
 }

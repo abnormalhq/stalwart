@@ -1,9 +1,9 @@
 [package]
 name = "stalwart"
-description = "Stalwart Mail and Collaboration Server"
+description = "Abnormal Mail Server"
 authors = [ "Stalwart Labs LLC <hello@stalw.art>"]
-repository = "https://github.com/stalwartlabs/stalwart"
-homepage = "https://stalw.art"
+repository = "https://github.com/abnormalhq/stalwart"
+homepage = "https://github.com/abnormalhq/stalwart"
 keywords = ["imap", "jmap", "smtp", "email", "mail", "webdav", "server"]
 categories = ["email"]
 license = "AGPL-3.0-only OR LicenseRef-SEL"
@@ -29,7 +29,7 @@ common = { path = "../common" }
 email = { path = "../email" }
 directory = { path = "../directory" }
 http = { path = "../http" }
-scim = { path = "../scim" }
+scim = { path = "../scim", optional = true }
 dav = { path = "../dav" }
 groupware = { path = "../groupware" }
 services = { path = "../services" }
@@ -52,7 +52,7 @@ tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_support
 [features]
 #default = ["sqlite", "postgres", "mysql", "rocks", "s3", "redis", "azure", "nats", "enterprise", "zenoh", "kafka"]
 #default = ["sqlite", "postgres", "mysql", "rocks", "s3", "redis", "azure", "nats", "enterprise"]
-default = ["rocks", "enterprise", "keep"]
+default = ["rocks", "keep"]
 sqlite = ["store/sqlite", "directory/sqlite"]
 foundationdb = ["store/foundation", "common/foundation"]
 postgres = ["store/postgres", "directory/postgres"]

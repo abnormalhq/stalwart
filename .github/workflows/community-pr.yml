@@ -1,0 +1,50 @@
+name: Community PR CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  community:
+    if: github.repository == 'abnormalhq/stalwart'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libclang for RocksDB
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libclang-dev
+
+      - name: Check generated UI assets
+        run: python3 scripts/generate-ui-assets.py --check
+
+      - name: Check Community gates and compatibility
+        run: python3 scripts/check-community.py
+
+      - name: Check Community build
+        run: cargo check --locked -p stalwart --no-default-features --features "sqlite postgres mysql rocks s3 redis keep azure nats"
+
+      - name: Run image-size regression tests
+        run: cargo test --locked -p spam-filter --no-default-features analysis::image_size::tests
+
+      - name: Run HTML analyzer regression tests
+        run: cargo test --locked -p spam-filter --no-default-features analysis::html::image_size_tests

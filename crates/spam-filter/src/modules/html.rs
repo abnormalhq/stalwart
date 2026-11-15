@@ -86,7 +86,7 @@ const fn tag_name(name: &[u8]) -> u64 {
     key
 }
 
-const STYLE: u64 = tag_name(b"style");
+pub(crate) const STYLE: u64 = tag_name(b"style");
 const CLASS: u64 = tag_name(b"class");
 const HIDDEN: u64 = tag_name(b"hidden");
 const SCRIPT: u64 = tag_name(b"script");

@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   redirect:
+    if: github.repository == 'stalwartlabs/stalwart'
     runs-on: ubuntu-latest
     steps:
       - name: Post support portal redirect
