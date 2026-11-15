@@ -533,6 +533,9 @@ fn normalize_redirect_root(redirect_root: Option<String>) -> Option<String> {
         if is_reserved_console_prefix(path) {
             return CONSOLE_ROOT.to_string();
         }
+        if path == "/" {
+            return CONSOLE_ROOT.to_string();
+        }
 
         let path_end = redirect_root
             .find(['?', '#'])
@@ -645,13 +648,40 @@ mod community_redirect_root_tests {
 
     #[test]
     fn preserves_explicit_destinations_and_disabled_redirects() {
-        for target in ["https://other.example/admin", "/", "/settings?tab=mail#top"] {
+        for target in [
+            "https://other.example/admin",
+            "https://other.example/",
+            "//other.example/",
+            "/settings?tab=mail#top",
+        ] {
             assert_eq!(
                 normalize_redirect_root(Some(target.to_string())).as_deref(),
                 Some(target)
             );
         }
         assert_eq!(normalize_redirect_root(None), None);
+    }
+
+    #[test]
+    fn maps_root_resolving_destinations_to_console_root() {
+        for target in [
+            "",
+            "/",
+            ".",
+            "..",
+            "../",
+            "./?tab=x",
+            "#fragment",
+            "/a/..",
+            "/%2e",
+            "/a/%2E%2e/",
+        ] {
+            assert_eq!(
+                normalize_redirect_root(Some(target.to_string())).as_deref(),
+                Some(CONSOLE_ROOT),
+                "target: {target:?}"
+            );
+        }
     }
 
     #[test]
