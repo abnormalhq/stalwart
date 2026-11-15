@@ -36,6 +36,22 @@ def cargo_tree(*args: str) -> str:
     return result.stdout
 
 
+def require_no_enterprise_feature(tree: str, label: str) -> None:
+    require(not re.search(r'feature "enterprise"', tree),
+            f"{label} feature graph activates Enterprise.")
+
+
+def check_enterprise_feature_guard() -> None:
+    synthetic_tree = 'stalwart v1.1.0\n└── feature "enterprise"\n'
+    try:
+        require_no_enterprise_feature(synthetic_tree, "Synthetic")
+    except SystemExit as error:
+        require(error.code == "Synthetic feature graph activates Enterprise.",
+                "Enterprise feature-tree guard rejected synthetic input for an unexpected reason.")
+    else:
+        raise SystemExit("Enterprise feature-tree guard accepted a synthetic Enterprise feature.")
+
+
 def main() -> None:
     main_manifest = tomllib.loads(read("crates/main/Cargo.toml"))
     http_manifest = tomllib.loads(read("crates/http/Cargo.toml"))
@@ -61,15 +77,15 @@ def main() -> None:
                 require("--locked" in line, f"Docker compile command is not locked: {line.strip()}")
                 require("enterprise" not in line, f"Docker compile command enables Enterprise: {line.strip()}")
 
+    check_enterprise_feature_guard()
+    print("Synthetic Enterprise feature-tree guard rejection passed.")
     default_tree = cargo_tree("-e", "features")
-    require(not re.search(r'feature "enterprise"', default_tree),
-            "Default Stalwart feature graph activates Enterprise.")
+    require_no_enterprise_feature(default_tree, "Default Stalwart")
     scim_package = r"\bscim v[^\n]*[/\\]crates[/\\]scim(?:\)|$)"
     require(not re.search(scim_package, default_tree),
             "Default Stalwart feature graph includes the SEL-only crates/scim package.")
-    community_tree = cargo_tree("--no-default-features", "--features", COMMUNITY_FEATURES)
-    require(not re.search(r'feature "enterprise"', community_tree),
-            "Explicit Community feature graph activates Enterprise.")
+    community_tree = cargo_tree("-e", "features", "--no-default-features", "--features", COMMUNITY_FEATURES)
+    require_no_enterprise_feature(community_tree, "Explicit Community")
     require(not re.search(scim_package, community_tree),
             "Community feature graph includes the SEL-only crates/scim package.")
 
