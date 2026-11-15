@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import gzip
 import re
 import subprocess
@@ -113,7 +114,21 @@ def main() -> None:
     require('aria-label="Abnormal Mail"' in ui, "Fallback UI logo needs an accessible product label.")
     require('aria-label="Stalwart"' not in ui, "Legacy Stalwart fallback logo remains in the UI source.")
     require("loadLogo" in ui and "currentColor" in ui, "Custom-logo fallback or theme-aware wordmark is missing.")
-    logo = base64.b64decode((ROOT / "resources/html-templates/abnormal-mail-logo.png.b64").read_text())
+    logo_source = (ROOT / "resources/html-templates/abnormal-mail-logo.png.b64").read_bytes()
+    require(logo_source.endswith(b"\r\n"), "Calendar fallback base64 must end with CRLF.")
+    logo_content = logo_source[:-2]
+    unfolded_logo = logo_content.replace(b"\r\n", b"")
+    require(b"\r" not in unfolded_logo and b"\n" not in unfolded_logo,
+            "Calendar fallback base64 must use CRLF line endings only.")
+    logo_lines = logo_content.split(b"\r\n")
+    require(all(0 < len(line) <= 76 for line in logo_lines),
+            "Calendar fallback base64 lines must be 1 to 76 characters.")
+    require(all(len(line) == 76 for line in logo_lines[:-1]),
+            "Calendar fallback base64 lines before the last must be 76 characters.")
+    try:
+        logo = base64.b64decode(b"".join(logo_lines), validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise SystemExit("Calendar fallback base64 is invalid.") from error
     require(logo.startswith(b"\x89PNG\r\n\x1a\n"), "Calendar fallback logo is not a PNG.")
     wordmark = read("resources/html-templates/abnormal-mail-logo.svg")
     require('aria-label="Abnormal Mail"' in wordmark and "Abnormal Mail</text>" in wordmark,
