@@ -510,12 +510,12 @@ async fn file_sqlite_capture_state_survives_engine_restart() {
     late_assertion
         .with_account_id(request.source.account_id)
         .with_collection(request.source.collection)
-        .with_document(request.source.document_id)
-        .assert_value(
-            ValueClass::Property(request.source.revision_property),
-            store::write::assert::AssertValue::U64(999),
-        );
+        .with_document(request.source.document_id);
     late_assertion.clear(ValueClass::Property(Field::ARCHIVE.into()));
+    late_assertion.assert_value(
+        ValueClass::Property(request.source.revision_property),
+        store::write::assert::AssertValue::U64(999),
+    );
     assert!(
         restarted
             .metadata
