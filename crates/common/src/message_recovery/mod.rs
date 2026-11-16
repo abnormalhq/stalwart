@@ -1193,7 +1193,9 @@ impl RecoveryEngine {
         Ok(Some(decoded))
     }
 
-    /// Compatibility wrapper. Offset counts index slots, not visible items; use list_page to paginate.
+    /// Compatibility wrapper returning preserved captures in ascending lexicographic capture-ID
+    /// order, not creation or deletion order. Offset counts index slots, not visible items; use
+    /// `list_page` to paginate.
     pub async fn list(
         &self,
         scope: &RecoveryScope,
@@ -1216,6 +1218,12 @@ impl RecoveryEngine {
             .items)
     }
 
+    /// Lists preserved captures in ascending lexicographic capture-ID order, not creation or
+    /// deletion order. Each page reads one bounded account index and at most `limit` manifests
+    /// (`limit` is capped at 100). `next_cursor` is the last examined index slot and is exclusive
+    /// on the next request. Nonvisible slots can produce an empty page with `has_more`; paginate
+    /// using `next_cursor` and `has_more`, not item count. This live keyset scan is not a snapshot;
+    /// IDs inserted before the cursor may require a fresh scan.
     pub async fn list_page(
         &self,
         scope: &RecoveryScope,

@@ -2342,6 +2342,117 @@ async fn recovery_payload_authentication_failure_is_terminal_without_gate_leak()
 }
 
 #[tokio::test]
+async fn capture_pages_order_by_id_and_advance_exclusive_bounded_cursors() {
+    let fixture = lifecycle_fixture().await;
+    let scope = fixture.account.scope().clone();
+    let scope_digest = scope_hash(&scope).unwrap();
+    let mut operations = ["page-order-a", "page-order-b", "page-order-c"]
+        .into_iter()
+        .map(|operation_id| {
+            let capture_id = hash_hex(&[scope_digest.as_bytes(), operation_id.as_bytes()].concat());
+            (operation_id.to_string(), capture_id)
+        })
+        .collect::<Vec<_>>();
+    operations.sort_by(|left, right| left.1.cmp(&right.1));
+    let times = [(100, 500), (300, 400), (200, 600)];
+
+    for (rank, (operation_id, expected_id)) in operations.iter().enumerate() {
+        let mut source = BatchBuilder::new();
+        source
+            .with_account_id(fixture.account.store_account_id())
+            .with_collection(Collection::Email)
+            .with_document(42)
+            .set(
+                ValueClass::Property(Field::ARCHIVE.into()),
+                1u64.to_be_bytes().to_vec(),
+            );
+        fixture.metadata.write_batch(&mut source).await.unwrap();
+
+        let (created_at, deleted_at) = times[rank];
+        let prepared = fixture
+            .engine
+            .prepare_capture(
+                capture_request(&fixture, operation_id, created_at),
+                &fixture.source_blobs,
+                &fixture.source_keys,
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.manifest().capture_id, *expected_id);
+        let mut source_delete = BatchBuilder::new();
+        prepared
+            .append_to_delete_batch(&mut source_delete, deleted_at)
+            .unwrap();
+        source_delete
+            .with_account_id(fixture.account.store_account_id())
+            .with_collection(Collection::Email)
+            .with_document(42)
+            .clear(ValueClass::Property(Field::ARCHIVE.into()));
+        fixture
+            .metadata
+            .write_batch(&mut source_delete)
+            .await
+            .unwrap();
+    }
+
+    let expected_ids = operations
+        .iter()
+        .map(|(_, capture_id)| capture_id.clone())
+        .collect::<Vec<_>>();
+    fixture.engine.reset_read_count();
+    let first = fixture.engine.list_page(&scope, None, 2).await.unwrap();
+    assert!(fixture.engine.read_count() <= 3);
+    assert!(first.has_more);
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|manifest| manifest.capture_id.clone())
+            .collect::<Vec<_>>(),
+        expected_ids[..2]
+    );
+    assert_eq!(first.next_cursor.as_deref(), Some(expected_ids[1].as_str()));
+
+    fixture.engine.reset_read_count();
+    let second = fixture
+        .engine
+        .list_page(&scope, first.next_cursor.as_deref(), 2)
+        .await
+        .unwrap();
+    assert!(fixture.engine.read_count() <= 3);
+    assert!(!second.has_more);
+    assert_eq!(second.next_cursor, None);
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|manifest| manifest.capture_id.clone())
+            .collect::<Vec<_>>(),
+        expected_ids[2..]
+    );
+
+    let listed = first
+        .items
+        .into_iter()
+        .chain(second.items)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|manifest| manifest.created_at)
+            .collect::<Vec<_>>(),
+        [100, 300, 200]
+    );
+    assert_eq!(
+        listed
+            .iter()
+            .map(|manifest| manifest.deleted_at.unwrap())
+            .collect::<Vec<_>>(),
+        [500, 400, 600]
+    );
+}
+
+#[tokio::test]
 async fn restore_rejects_split_import_batch_before_any_document_write() {
     let fixture = lifecycle_fixture().await;
     let capture_id = preserve_fixture_capture(&fixture, "restore-split", 100, 110).await;
