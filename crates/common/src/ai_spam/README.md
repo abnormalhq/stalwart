@@ -1,6 +1,6 @@
 # Community AI spam module contract
 
-This directory contains an opt-in foundation only. It is exported from `common` for focused validation, but it is not installed in the server runtime or called by SMTP. At this branch revision, `cargo test --locked -p common --no-default-features ai_spam::tests` passes 27 tests; that does not validate runtime installation or an end-to-end provider/ACK path. The module remains inactive until the parent adds Community scoring/runtime wiring and authenticated configuration/acknowledgment.
+This directory contains an opt-in foundation only. It is exported from `common` for focused validation, but it is not installed in the server runtime or called by SMTP. The focused test command is `cargo test --locked -p common --no-default-features --features ai-spam-test-sqlite ai_spam::tests`; its file-backed tests exercise the actual SQLite Store and StoreLedger but do not validate other Store backends, SMTP, or an end-to-end provider/ACK path. The module remains inactive until the parent adds Community scoring/runtime wiring and authenticated configuration/acknowledgment.
 
 ## Runtime installation
 
@@ -51,6 +51,6 @@ The response stream is capped at 2048 bytes, requires one assistant choice with 
 
 ## Durable usage and remaining integration
 
-The ledger keys totals by server and operator billing period, independent of configuration revision. A reservation writes ledger and active-period assertions in one Store batch; a CAS conflict is neutral and is not retried. Period rollover requires the expected current period and a strictly later next period. The authored test checks the production write plan, encoding, and assertions, but there is no Store-backed or restart fixture in this module yet.
+The ledger keys totals by server and operator billing period, independent of configuration revision. A reservation writes ledger and active-period assertions in one Store batch; a CAS conflict is neutral and is not retried. Period rollover requires the expected current period and a strictly later next period. The gated SQLite tests use disposable file-backed stores to check concurrent limits, charges and uncertain reservations across reopen, forward-only rollover CAS, and atomic failure of a stale multi-assert batch. They do not establish behavior for other Store backends.
 
 Parent-owned work still required: install and wire the exported module into the Community scoring path and test the actual `ScoreAccumulator` integration; connect the authoritative Mail config and authenticated service ACK transport; synchronize Console period rollover with `StoreLedger::rollover_period(server_id, expected_period, next_period)`; and connect server-side credential resolution/rotation. No current module path should be described as active or ready without those pieces.

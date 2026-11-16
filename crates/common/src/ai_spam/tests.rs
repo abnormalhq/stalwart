@@ -2,6 +2,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
+#[cfg(feature = "ai-spam-test-sqlite")]
+use super::ledger::StoreLedger;
 use super::{
     AiEvidence, AiSpamRuntime, ClassifyOutcome, MAX_CONCURRENT_CLASSIFICATIONS, MAX_SCORE_POINTS,
     NeutralReason,
@@ -19,6 +21,8 @@ use super::{
     },
     provider::{self, ModelResult, Provider, ProviderError, ProviderFuture, Verdict},
 };
+#[cfg(feature = "ai-spam-test-sqlite")]
+use futures::future::join_all;
 use mail_parser::MessageParser;
 use reqwest::Url;
 use std::{
@@ -31,6 +35,8 @@ use std::{
     },
     time::Duration,
 };
+#[cfg(feature = "ai-spam-test-sqlite")]
+use store::Store;
 use store::write::{BatchBuilder, assert::AssertValue};
 use tokio::sync::Semaphore;
 
@@ -81,6 +87,49 @@ fn local_operator(request_budget: u64, revision: u64) -> OperatorConfig {
 fn local_config_at_revision(request_budget: u64, revision: u64) -> RuntimeConfig {
     RuntimeConfig::from_operator(local_operator(request_budget, revision), None)
         .expect("valid local config")
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+struct SqliteTempDir(std::path::PathBuf);
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+impl SqliteTempDir {
+    fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "stalwart-ai-spam-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).expect("create disposable SQLite test directory");
+        Self(path)
+    }
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+impl Drop for SqliteTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+async fn open_sqlite_store(directory: &SqliteTempDir) -> Arc<Store> {
+    let store = store::backend::sqlite::SqliteStore::open(registry::schema::structs::SqliteStore {
+        path: directory.0.display().to_string(),
+        pool_workers: Some(4),
+        pool_max_connections: Some(8),
+    })
+    .expect("open file-backed SQLite store");
+    store
+        .create_tables()
+        .await
+        .expect("create SQLite Store tables");
+    Arc::new(store)
 }
 
 #[test]
@@ -1080,4 +1129,392 @@ async fn shared_permit_pool_limits_old_and_new_runtime_configs_together() {
     );
     assert_eq!(fifth, ClassifyOutcome::Neutral(NeutralReason::Overloaded));
     assert_eq!(provider.calls.load(Ordering::Relaxed), 4);
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+struct StoredValue;
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+impl store::Deserialize for StoredValue {
+    fn deserialize(_: &[u8]) -> trc::Result<Self> {
+        Ok(Self)
+    }
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+#[tokio::test]
+async fn sqlite_concurrent_reservations_never_overspend_any_budget_dimension() {
+    let directory = SqliteTempDir::new();
+    let store = open_sqlite_store(&directory).await;
+    let ledger = Arc::new(StoreLedger::new(store.clone()));
+    let reservation = Reservation {
+        requests: 1,
+        input_tokens: 4,
+        output_tokens: 2,
+        cost_micros: 3,
+    };
+    let cases = [
+        (
+            "sqlite-requests",
+            Budgets {
+                requests: 1,
+                input_tokens: 100,
+                output_tokens: 100,
+                cost_micros: 100,
+            },
+        ),
+        (
+            "sqlite-input-tokens",
+            Budgets {
+                requests: 100,
+                input_tokens: 4,
+                output_tokens: 100,
+                cost_micros: 100,
+            },
+        ),
+        (
+            "sqlite-output-tokens",
+            Budgets {
+                requests: 100,
+                input_tokens: 100,
+                output_tokens: 2,
+                cost_micros: 100,
+            },
+        ),
+        (
+            "sqlite-cost",
+            Budgets {
+                requests: 100,
+                input_tokens: 100,
+                output_tokens: 100,
+                cost_micros: 3,
+            },
+        ),
+    ];
+
+    for (server_id, budgets) in cases {
+        assert_eq!(
+            ledger.rollover_period(server_id, None, "2026-01").await,
+            ReserveOutcome::Reserved
+        );
+        let key = LedgerKey {
+            server_id: server_id.into(),
+            billing_period: "2026-01".into(),
+        };
+        let outcomes = join_all((0..8).map(|_| {
+            let ledger = ledger.clone();
+            let key = key.clone();
+            async move { ledger.reserve(key, budgets, reservation).await }
+        }))
+        .await;
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == ReserveOutcome::Reserved)
+                .count(),
+            1,
+            "only one reservation should fit the {server_id} budget"
+        );
+        assert_eq!(
+            ledger.reserve(key, budgets, reservation).await,
+            ReserveOutcome::Exhausted,
+            "the committed {server_id} charge must remain visible"
+        );
+    }
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+#[tokio::test]
+async fn sqlite_runtime_only_publishes_success_after_a_committed_reservation() {
+    let directory = SqliteTempDir::new();
+    let store = open_sqlite_store(&directory).await;
+    let ledger = Arc::new(StoreLedger::new(store.clone()));
+    assert_eq!(
+        ledger.rollover_period("server-1", None, "2026-01").await,
+        ReserveOutcome::Reserved
+    );
+    let provider = fake_provider(ModelResult {
+        verdict: Verdict::Spam,
+        confidence: 100,
+    });
+    let runtime = AiSpamRuntime::with_provider(
+        local_config(1),
+        Some(ledger.clone()),
+        Some(provider.clone()),
+    );
+    let message = parse(b"Subject: offer\r\n\r\nhello");
+    let outcomes = join_all((0..8).map(|_| runtime.classify(&message))).await;
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ClassifyOutcome::Evidence(_)))
+            .count(),
+        1
+    );
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+    assert!(outcomes.iter().all(|outcome| {
+        matches!(
+            outcome,
+            ClassifyOutcome::Evidence(_)
+                | ClassifyOutcome::Neutral(NeutralReason::BudgetExhausted)
+                | ClassifyOutcome::Neutral(NeutralReason::LedgerUnavailable)
+                | ClassifyOutcome::Neutral(NeutralReason::Overloaded)
+        )
+    }));
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+#[tokio::test]
+async fn sqlite_restart_preserves_charged_and_uncertain_reservations() {
+    let directory = SqliteTempDir::new();
+    let store = open_sqlite_store(&directory).await;
+    let ledger = Arc::new(StoreLedger::new(store.clone()));
+    let charged_key = LedgerKey {
+        server_id: "server-charged".into(),
+        billing_period: "2026-01".into(),
+    };
+    let uncertain_server = "server-uncertain";
+    let charged_budgets = Budgets {
+        requests: 1,
+        input_tokens: 4,
+        output_tokens: 2,
+        cost_micros: 3,
+    };
+    let charged_reservation = Reservation {
+        requests: 1,
+        input_tokens: 4,
+        output_tokens: 2,
+        cost_micros: 3,
+    };
+    for server_id in [charged_key.server_id.as_str(), uncertain_server] {
+        assert_eq!(
+            ledger.rollover_period(server_id, None, "2026-01").await,
+            ReserveOutcome::Reserved
+        );
+    }
+    assert_eq!(
+        ledger
+            .reserve(charged_key.clone(), charged_budgets, charged_reservation)
+            .await,
+        ReserveOutcome::Reserved
+    );
+
+    let mut uncertain_operator = local_operator(1, 1);
+    uncertain_operator.server_id = uncertain_server.into();
+    let uncertain_config =
+        RuntimeConfig::from_operator(uncertain_operator, None).expect("valid local config");
+    let uncertain_provider = Arc::new(FakeProvider {
+        calls: AtomicU64::new(0),
+        result: ModelResult {
+            verdict: Verdict::Spam,
+            confidence: 100,
+        },
+        delay: Duration::from_millis(1600),
+    });
+    let runtime = AiSpamRuntime::with_provider(
+        uncertain_config,
+        Some(ledger.clone()),
+        Some(uncertain_provider.clone()),
+    );
+    let message = parse(b"Subject: offer\r\n\r\nhello");
+    assert_eq!(
+        runtime.classify(&message).await,
+        ClassifyOutcome::Neutral(NeutralReason::Deadline)
+    );
+    assert_eq!(uncertain_provider.calls.load(Ordering::Relaxed), 1);
+
+    drop(runtime);
+    drop(ledger);
+    drop(store);
+
+    let reopened_store = open_sqlite_store(&directory).await;
+    let reopened_ledger = Arc::new(StoreLedger::new(reopened_store.clone()));
+    assert_eq!(
+        reopened_ledger
+            .reserve(charged_key, charged_budgets, charged_reservation)
+            .await,
+        ReserveOutcome::Exhausted
+    );
+    let mut reopened_operator = local_operator(1, 1);
+    reopened_operator.server_id = uncertain_server.into();
+    let reopened_config =
+        RuntimeConfig::from_operator(reopened_operator, None).expect("valid local config");
+    let reopened_provider = fake_provider(ModelResult {
+        verdict: Verdict::Spam,
+        confidence: 100,
+    });
+    let reopened_runtime = AiSpamRuntime::with_provider(
+        reopened_config,
+        Some(reopened_ledger),
+        Some(reopened_provider.clone()),
+    );
+    assert_eq!(
+        reopened_runtime.classify(&message).await,
+        ClassifyOutcome::Neutral(NeutralReason::BudgetExhausted)
+    );
+    assert_eq!(reopened_provider.calls.load(Ordering::Relaxed), 0);
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+#[tokio::test]
+async fn sqlite_rollover_rejects_old_period_replay_and_concurrent_stale_cas() {
+    let directory = SqliteTempDir::new();
+    let store = open_sqlite_store(&directory).await;
+    let ledger = Arc::new(StoreLedger::new(store));
+    let server_id = "server-rollover";
+    assert_eq!(
+        ledger.rollover_period(server_id, None, "2026-01").await,
+        ReserveOutcome::Reserved
+    );
+    assert_eq!(
+        ledger.rollover_period(server_id, None, "2026-02").await,
+        ReserveOutcome::Unavailable
+    );
+    assert_eq!(
+        ledger
+            .rollover_period(server_id, Some("2026-01"), "2026-01")
+            .await,
+        ReserveOutcome::Unavailable
+    );
+    assert_eq!(
+        ledger
+            .rollover_period(server_id, Some("2026-01"), "2025-12")
+            .await,
+        ReserveOutcome::Unavailable
+    );
+
+    let outcomes = join_all((0..8).map(|_| {
+        let ledger = ledger.clone();
+        async move {
+            ledger
+                .rollover_period(server_id, Some("2026-01"), "2026-02")
+                .await
+        }
+    }))
+    .await;
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == ReserveOutcome::Reserved)
+            .count(),
+        1
+    );
+    assert!(outcomes.iter().all(|outcome| matches!(
+        outcome,
+        ReserveOutcome::Reserved | ReserveOutcome::Unavailable
+    )));
+    assert_eq!(
+        ledger
+            .reserve(
+                LedgerKey {
+                    server_id: server_id.into(),
+                    billing_period: "2026-01".into(),
+                },
+                Budgets {
+                    requests: 1,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cost_micros: 1,
+                },
+                Reservation {
+                    requests: 1,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cost_micros: 1,
+                }
+            )
+            .await,
+        ReserveOutcome::Unavailable
+    );
+    assert_eq!(
+        ledger
+            .rollover_period(server_id, Some("2026-01"), "2026-03")
+            .await,
+        ReserveOutcome::Unavailable
+    );
+    assert_eq!(
+        ledger
+            .rollover_period(server_id, Some("2026-02"), "2026-02")
+            .await,
+        ReserveOutcome::Unavailable
+    );
+    assert_eq!(
+        ledger
+            .rollover_period(server_id, Some("2026-02"), "2026-01")
+            .await,
+        ReserveOutcome::Unavailable
+    );
+    assert_eq!(
+        ledger
+            .rollover_period(server_id, Some("2026-02"), "2026-03")
+            .await,
+        ReserveOutcome::Reserved
+    );
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+#[tokio::test]
+async fn sqlite_failed_period_assertion_is_atomic_and_skips_provider() {
+    let directory = SqliteTempDir::new();
+    let store = open_sqlite_store(&directory).await;
+    let ledger = Arc::new(StoreLedger::new(store.clone()));
+    assert_eq!(
+        ledger.rollover_period("server-1", None, "2026-01").await,
+        ReserveOutcome::Reserved
+    );
+
+    let key = LedgerKey {
+        server_id: "server-1".into(),
+        billing_period: "2026-01".into(),
+    };
+    let plan = reservation_write_plan(
+        &key,
+        &PeriodControl::new("2026-01", 0).unwrap(),
+        None,
+        Snapshot::default(),
+        Snapshot {
+            requests: 1,
+            input_tokens: config::MAX_INPUT_TOKENS,
+            output_tokens: config::MAX_OUTPUT_TOKENS,
+            cost_micros: 0,
+            version: 1,
+        },
+    );
+    let ledger_class = plan.ledger_class.clone();
+    let mut stale_batch = BatchBuilder::new();
+    plan.apply(&mut stale_batch);
+    assert_eq!(
+        ledger
+            .rollover_period("server-1", Some("2026-01"), "2026-02")
+            .await,
+        ReserveOutcome::Reserved
+    );
+    assert!(store.write_batch(&mut stale_batch).await.is_err());
+    assert!(
+        store
+            .get_value::<StoredValue>(store::ValueKey {
+                account_id: 0,
+                collection: 0,
+                document_id: 0,
+                class: ledger_class,
+            })
+            .await
+            .expect("read stale batch ledger value")
+            .is_none()
+    );
+
+    let provider = fake_provider(ModelResult {
+        verdict: Verdict::Spam,
+        confidence: 100,
+    });
+    let runtime =
+        AiSpamRuntime::with_provider(local_config(1), Some(ledger), Some(provider.clone()));
+    let message = parse(b"Subject: offer\r\n\r\nhello");
+    assert_eq!(
+        runtime.classify(&message).await,
+        ClassifyOutcome::Neutral(NeutralReason::LedgerUnavailable)
+    );
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
 }
