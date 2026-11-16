@@ -258,6 +258,12 @@ struct ScopeLedger {
     captures: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ScopeCaptureIndex {
+    scope: RecoveryScope,
+    captures: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SourceAssertion {
     pub account_id: u32,
@@ -285,6 +291,8 @@ pub struct RecoveryEngine {
     recovery_key_id: u32,
     #[cfg(test)]
     purge_finalization_fault: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    read_count: std::sync::atomic::AtomicUsize,
 }
 
 struct RawBytes(Vec<u8>);
@@ -359,6 +367,8 @@ impl RecoveryEngine {
             recovery_key_id,
             #[cfg(test)]
             purge_finalization_fault: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            read_count: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -366,6 +376,17 @@ impl RecoveryEngine {
     pub(crate) fn fail_next_purge_finalization(&self) {
         self.purge_finalization_fault
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_read_count(&self) {
+        self.read_count
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_count(&self) -> usize {
+        self.read_count.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub async fn set_policy(
@@ -591,6 +612,13 @@ impl RecoveryEngine {
             if self.blobs.get_raw_blob(&storage_key).await?.is_some() {
                 return Err(RecoveryError::Conflict("unowned recovery blob key exists"));
             }
+            let index_key = account_capture_index_key(&scope)?;
+            let (mut index, index_bytes) = self.account_capture_index(&scope).await?;
+            if index.captures.contains(&capture_id) {
+                return Err(RecoveryError::Conflict(
+                    "capture already exists in account index",
+                ));
+            }
             let ledger_key = quota_key(&scope)?;
             let ledger_old = self.read::<ScopeLedger>(&ledger_key).await?;
             let mut ledger = ledger_old
@@ -610,6 +638,7 @@ impl RecoveryEngine {
                 .checked_add(encoded_size)
                 .ok_or(RecoveryError::QuotaExceeded)?;
             ledger.captures.push(capture_id.clone());
+            index.captures.push(capture_id.clone());
             let manifest = Manifest {
                 capture_id: capture_id.clone(),
                 capture_operation_id: request.metadata.operation_id.clone(),
@@ -643,6 +672,9 @@ impl RecoveryEngine {
             batch
                 .with_account_id(0)
                 .assert_value(value_class(&hold_key), record_revision(&hold_bytes)?);
+            batch
+                .with_account_id(0)
+                .assert_value(value_class(&index_key), record_revision(&index_bytes)?);
             let old_ledger_bytes = ledger_old.as_ref().map(|(_, bytes)| bytes.as_slice());
             let ledger_revision = next_record_revision(old_ledger_bytes)?;
             if let Some(bytes) = old_ledger_bytes {
@@ -663,6 +695,10 @@ impl RecoveryEngine {
             batch.set(
                 value_class(&ledger_key),
                 encode_record(&ledger, ledger_revision)?,
+            );
+            batch.set(
+                value_class(&index_key),
+                encode_record(&index, next_record_revision(Some(&index_bytes))?)?,
             );
             batch.set(value_class(&manifest_key), encode_record(&manifest, 1)?);
             if batch.has_commit_points() || batch.is_large_batch() {
@@ -819,15 +855,10 @@ impl RecoveryEngine {
         if limit == 0 || limit > 100 || offset > MAX_ITEMS_PER_SCOPE {
             return Err(RecoveryError::Invalid("list bounds"));
         }
-        let key = quota_key(scope)?;
-        let ledger = self
-            .read::<ScopeLedger>(&key)
-            .await?
-            .map(|(v, _)| v)
-            .unwrap_or_default();
+        let (index, _) = self.account_capture_index(scope).await?;
         let mut out = Vec::with_capacity(limit);
         let mut matched = 0usize;
-        for id in ledger.captures.iter().rev() {
+        for id in index.captures.iter().rev() {
             let Some(item) = self.get(scope, id).await? else {
                 continue;
             };
@@ -843,7 +874,83 @@ impl RecoveryEngine {
         Ok(out)
     }
 
+    async fn account_capture_index(
+        &self,
+        scope: &RecoveryScope,
+    ) -> Result<(ScopeCaptureIndex, Vec<u8>)> {
+        let index_key = account_capture_index_key(scope)?;
+        if let Some((index, bytes)) = self.read::<ScopeCaptureIndex>(&index_key).await? {
+            validate_account_capture_index(scope, &index)?;
+            return Ok((index, bytes));
+        }
+
+        let ledger_key = quota_key(scope)?;
+        let ledger = self.read::<ScopeLedger>(&ledger_key).await?;
+        let mut captures = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        if let Some((ledger, _)) = &ledger {
+            if ledger.captures.len() > MAX_ITEMS_PER_SCOPE {
+                return Err(RecoveryError::Conflict(
+                    "tenant ledger exceeds capture bound",
+                ));
+            }
+            for capture_id in &ledger.captures {
+                if !is_valid_capture_id(capture_id) || !seen.insert(capture_id.as_str()) {
+                    return Err(RecoveryError::Conflict(
+                        "tenant ledger capture id is invalid",
+                    ));
+                }
+                let manifest_key = scoped_key(b"manifest", scope, capture_id)?;
+                if let Some((manifest, _)) = self.read::<Manifest>(&manifest_key).await? {
+                    if manifest.scope != *scope || manifest.capture_id != *capture_id {
+                        return Err(RecoveryError::Conflict(
+                            "tenant ledger manifest scope mismatch",
+                        ));
+                    }
+                    captures.push(capture_id.clone());
+                }
+            }
+        }
+        let index = ScopeCaptureIndex {
+            scope: scope.clone(),
+            captures,
+        };
+        validate_account_capture_index(scope, &index)?;
+
+        let mut batch = BatchBuilder::new();
+        if let Some((_, bytes)) = &ledger {
+            batch
+                .with_account_id(0)
+                .assert_value(value_class(&ledger_key), record_revision(bytes)?);
+        } else {
+            batch
+                .with_account_id(0)
+                .assert_value(value_class(&ledger_key), ());
+        }
+        self.append_cas(&mut batch, &index_key, None, &index)?;
+        if batch.has_commit_points() || batch.is_large_batch() {
+            return Err(RecoveryError::BatchTooLarge);
+        }
+        if let Err(error) = self.metadata.write_batch(&mut batch).await {
+            if let Some((index, bytes)) = self.read::<ScopeCaptureIndex>(&index_key).await? {
+                validate_account_capture_index(scope, &index)?;
+                return Ok((index, bytes));
+            }
+            return Err(error.into());
+        }
+        self.read::<ScopeCaptureIndex>(&index_key)
+            .await?
+            .ok_or(RecoveryError::Conflict("account capture index disappeared"))
+            .and_then(|(index, bytes)| {
+                validate_account_capture_index(scope, &index)?;
+                Ok((index, bytes))
+            })
+    }
+
     async fn read<T: for<'de> Deserialize<'de>>(&self, key: &[u8]) -> Result<Option<(T, Vec<u8>)>> {
+        #[cfg(test)]
+        self.read_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let raw = self
             .metadata
             .get_value::<RawBytes>(any_key(key))
@@ -1031,6 +1138,25 @@ fn recovery_blob_key(scope: &RecoveryScope, operation: &str) -> Result<Vec<u8>> 
 }
 fn quota_key(scope: &RecoveryScope) -> Result<Vec<u8>> {
     scoped_key(b"quota", &scope.tenant_id, "")
+}
+fn account_capture_index_key(scope: &RecoveryScope) -> Result<Vec<u8>> {
+    scoped_key(b"account-captures", scope, "")
+}
+fn validate_account_capture_index(scope: &RecoveryScope, index: &ScopeCaptureIndex) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    if index.scope != *scope
+        || index.captures.len() > MAX_ITEMS_PER_SCOPE
+        || index
+            .captures
+            .iter()
+            .any(|capture_id| !is_valid_capture_id(capture_id) || !seen.insert(capture_id))
+    {
+        return Err(RecoveryError::Conflict("account capture index is invalid"));
+    }
+    Ok(())
+}
+fn is_valid_capture_id(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 fn digest_hex(bytes: &[u8]) -> String {
     hash_hex(bytes)

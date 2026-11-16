@@ -836,18 +836,13 @@ impl RecoveryEngine {
         if let Some(cursor) = after_capture_id {
             validate_capture_id(cursor)?;
         }
-        let ledger_key = quota_key(scope)?;
-        let ledger = self
-            .read::<ScopeLedger>(&ledger_key)
-            .await?
-            .map(|(ledger, _)| ledger)
-            .unwrap_or_default();
-        if ledger.captures.len() > MAX_ITEMS_PER_SCOPE {
+        let (index, _) = self.account_capture_index(scope).await?;
+        if index.captures.len() > MAX_ITEMS_PER_SCOPE {
             return Err(RecoveryError::Conflict(
-                "scope ledger exceeds capture bound",
+                "account capture index exceeds capture bound",
             ));
         }
-        let mut capture_ids = ledger.captures;
+        let mut capture_ids = index.captures;
         capture_ids.sort_unstable();
         let mut page = capture_ids
             .into_iter()
@@ -1146,6 +1141,8 @@ impl RecoveryEngine {
             .read::<ScopeLedger>(&ledger_key)
             .await?
             .ok_or(RecoveryError::Conflict("purge ledger disappeared"))?;
+        let index_key = account_capture_index_key(scope)?;
+        let (mut index, index_bytes) = self.account_capture_index(scope).await?;
         let (job, job_bytes) = self
             .read::<PurgeJob>(job_key)
             .await?
@@ -1165,6 +1162,10 @@ impl RecoveryEngine {
                 .captures
                 .iter()
                 .any(|capture| capture == &request.capture_id)
+            || !index
+                .captures
+                .iter()
+                .any(|capture| capture == &request.capture_id)
         {
             return Err(RecoveryError::Conflict("purge finalization state changed"));
         }
@@ -1175,6 +1176,15 @@ impl RecoveryEngine {
         if removed_count - ledger.captures.len() != 1 {
             return Err(RecoveryError::Conflict(
                 "quota ledger capture count mismatch",
+            ));
+        }
+        let index_capture_count = index.captures.len();
+        index
+            .captures
+            .retain(|capture| capture != &request.capture_id);
+        if index_capture_count - index.captures.len() != 1 {
+            return Err(RecoveryError::Conflict(
+                "account capture index count mismatch",
             ));
         }
         ledger.charged_bytes = ledger
@@ -1204,6 +1214,7 @@ impl RecoveryEngine {
         append_assert(&mut batch, &lifecycle_key, Some(&lifecycle_bytes))?;
         append_assert(&mut batch, &hold_key, Some(&hold_bytes))?;
         append_assert(&mut batch, &ledger_key, Some(&ledger_bytes))?;
+        append_assert(&mut batch, &index_key, Some(&index_bytes))?;
         append_assert(&mut batch, job_key, Some(&job_bytes))?;
         append_assert(&mut batch, tombstone_key, None)?;
         batch
@@ -1225,6 +1236,11 @@ impl RecoveryEngine {
             .set(
                 value_class(&ledger_key),
                 encode_record(&ledger, next_record_revision(Some(&ledger_bytes))?)?,
+            )
+            .with_account_id(0)
+            .set(
+                value_class(&index_key),
+                encode_record(&index, next_record_revision(Some(&index_bytes))?)?,
             )
             .with_account_id(0)
             .set(value_class(tombstone_key), encode_record(&tombstone, 1)?);

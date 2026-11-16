@@ -1029,6 +1029,7 @@ async fn purge_retries_after_blob_deletion_and_releases_quota_once() {
         .unwrap();
     let request = purge_request(fixture.account.scope(), &capture_id, "purge-retry-op", 120);
     let ledger_key = quota_key(fixture.account.scope()).unwrap();
+    let index_key = account_capture_index_key(fixture.account.scope()).unwrap();
     let before = fixture
         .engine
         .read::<ScopeLedger>(&ledger_key)
@@ -1037,6 +1038,17 @@ async fn purge_retries_after_blob_deletion_and_releases_quota_once() {
         .unwrap()
         .0;
     assert_eq!(before.captures, vec![capture_id.clone()]);
+    assert_eq!(
+        fixture
+            .engine
+            .read::<ScopeCaptureIndex>(&index_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .captures,
+        vec![capture_id.clone()]
+    );
     let charged_before = before.charged_bytes;
 
     fixture.engine.fail_next_purge_finalization();
@@ -1108,6 +1120,17 @@ async fn purge_retries_after_blob_deletion_and_releases_quota_once() {
         .0;
     assert!(after.captures.is_empty());
     assert_eq!(after.charged_bytes, 0);
+    assert!(
+        fixture
+            .engine
+            .read::<ScopeCaptureIndex>(&index_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .captures
+            .is_empty()
+    );
     assert_eq!(
         fixture
             .engine
@@ -2103,6 +2126,19 @@ async fn cleanup_skips_copying_and_expired_preserved_records_under_hold() {
         )
         .await
         .unwrap();
+    let index_key = account_capture_index_key(&scope).unwrap();
+    let (mut index, index_bytes) = fixture
+        .engine
+        .read::<ScopeCaptureIndex>(&index_key)
+        .await
+        .unwrap()
+        .unwrap();
+    index.captures.push(held_id.clone());
+    fixture
+        .engine
+        .cas_write(&index_key, Some(&index_bytes), &index)
+        .await
+        .unwrap();
     fixture
         .engine
         .sync_hold(scope.clone(), 2, true)
@@ -2140,7 +2176,7 @@ async fn cleanup_skips_copying_and_expired_preserved_records_under_hold() {
 }
 
 #[tokio::test]
-async fn cleanup_cursor_reaches_old_expired_records_and_skips_mixed_scopes() {
+async fn cleanup_cursor_reaches_old_expired_records_and_excludes_other_scopes() {
     let fixture = lifecycle_fixture().await;
     let scope = fixture.account.scope().clone();
     let mut captures = Vec::new();
@@ -2194,12 +2230,12 @@ async fn cleanup_cursor_reaches_old_expired_records_and_skips_mixed_scopes() {
         .await
         .unwrap();
     assert_eq!(first.examined, 100);
-    assert_eq!(first.purged_capture_ids.len(), 99);
-    assert_eq!(first.skipped, 1);
+    assert_eq!(first.purged_capture_ids.len(), 100);
+    assert_eq!(first.skipped, 0);
     assert!(first.has_more);
     assert_eq!(
         first.next_cursor.as_deref(),
-        Some(format!("{:064x}", 99).as_str())
+        Some(format!("{:064x}", 100).as_str())
     );
 
     let second = fixture
@@ -2208,12 +2244,12 @@ async fn cleanup_cursor_reaches_old_expired_records_and_skips_mixed_scopes() {
         .await
         .unwrap();
     assert_eq!(second.examined, 100);
-    assert_eq!(second.purged_capture_ids.len(), 20);
-    assert_eq!(second.skipped, 80);
+    assert_eq!(second.purged_capture_ids.len(), 19);
+    assert_eq!(second.skipped, 81);
     assert!(second.has_more);
     assert_eq!(
         second.next_cursor.as_deref(),
-        Some(format!("{:064x}", 199).as_str())
+        Some(format!("{:064x}", 200).as_str())
     );
 
     let last = fixture
@@ -2221,9 +2257,306 @@ async fn cleanup_cursor_reaches_old_expired_records_and_skips_mixed_scopes() {
         .cleanup_expired(&scope, 1000, 10, 100, second.next_cursor.as_deref())
         .await
         .unwrap();
-    assert_eq!(last.examined, 30);
+    assert_eq!(last.examined, 29);
     assert!(last.purged_capture_ids.is_empty());
-    assert_eq!(last.skipped, 30);
+    assert_eq!(last.skipped, 29);
     assert!(!last.has_more);
     assert_eq!(last.next_cursor, None);
+}
+
+#[tokio::test]
+async fn account_capture_index_bounds_listing_and_cleanup_for_interleaved_accounts() {
+    let fixture = lifecycle_fixture().await;
+    let scope_a = fixture.account.scope().clone();
+    let mut scope_b = scope_a.clone();
+    scope_b.account_id = "8".into();
+    let account_b = VerifiedAccountMapping::from_verified_binding(scope_b.clone(), 8).unwrap();
+    fixture
+        .engine
+        .sync_hold(scope_b.clone(), 1, false)
+        .await
+        .unwrap();
+
+    let mut source_batch = BatchBuilder::new();
+    source_batch
+        .with_account_id(8)
+        .with_collection(Collection::Email)
+        .with_document(42)
+        .set(
+            ValueClass::Property(Field::ARCHIVE.into()),
+            1u64.to_be_bytes().to_vec(),
+        );
+    fixture
+        .metadata
+        .write_batch(&mut source_batch)
+        .await
+        .unwrap();
+
+    let mut total_charged = 0;
+    let first_a = fixture
+        .engine
+        .prepare_capture(
+            capture_request(&fixture, "account-a-1", 10),
+            &fixture.source_blobs,
+            &fixture.source_keys,
+        )
+        .await
+        .unwrap();
+    total_charged += first_a.manifest().stored_size;
+    let first_a_id = first_a.manifest().capture_id.clone();
+
+    for index in 0..20 {
+        let mut request = capture_request(&fixture, &format!("account-b-{index}"), 20 + index);
+        request.account = account_b.clone();
+        request.source.account_id = 8;
+        let prepared = fixture
+            .engine
+            .prepare_capture(request, &fixture.source_blobs, &fixture.source_keys)
+            .await
+            .unwrap();
+        total_charged += prepared.manifest().stored_size;
+    }
+
+    let second_a = fixture
+        .engine
+        .prepare_capture(
+            capture_request(&fixture, "account-a-2", 11),
+            &fixture.source_blobs,
+            &fixture.source_keys,
+        )
+        .await
+        .unwrap();
+    total_charged += second_a.manifest().stored_size;
+    let second_a_id = second_a.manifest().capture_id.clone();
+
+    for index in 20..40 {
+        let mut request = capture_request(&fixture, &format!("account-b-{index}"), 40 + index);
+        request.account = account_b.clone();
+        request.source.account_id = 8;
+        let prepared = fixture
+            .engine
+            .prepare_capture(request, &fixture.source_blobs, &fixture.source_keys)
+            .await
+            .unwrap();
+        total_charged += prepared.manifest().stored_size;
+    }
+
+    let ledger = fixture
+        .engine
+        .read::<ScopeLedger>(&quota_key(&scope_a).unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(ledger.captures.len(), 42);
+    assert_eq!(ledger.charged_bytes, total_charged);
+    assert_eq!(
+        fixture
+            .engine
+            .read::<ScopeCaptureIndex>(&account_capture_index_key(&scope_a).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .captures,
+        vec![first_a_id, second_a_id.clone()]
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .read::<ScopeCaptureIndex>(&account_capture_index_key(&scope_b).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .captures
+            .len(),
+        40
+    );
+
+    fixture.engine.reset_read_count();
+    let listed = fixture.engine.list(&scope_a, 0, 1).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].capture_id, second_a_id);
+    assert_eq!(fixture.engine.read_count(), 2);
+
+    fixture.engine.reset_read_count();
+    let cleanup = fixture
+        .engine
+        .cleanup_expired(&scope_a, 20, 100, 100, None)
+        .await
+        .unwrap();
+    assert_eq!(cleanup.examined, 2);
+    assert!(cleanup.purged_capture_ids.is_empty());
+    assert_eq!(fixture.engine.read_count(), 3);
+}
+
+#[tokio::test]
+async fn tenant_capture_limit_and_byte_charge_remain_aggregate_across_account_indexes() {
+    let fixture = lifecycle_fixture().await;
+    let scope_a = fixture.account.scope().clone();
+    let mut scope_b = scope_a.clone();
+    scope_b.account_id = "8".into();
+    let account_b = VerifiedAccountMapping::from_verified_binding(scope_b.clone(), 8).unwrap();
+    fixture
+        .engine
+        .sync_hold(scope_b.clone(), 1, false)
+        .await
+        .unwrap();
+
+    let mut source_batch = BatchBuilder::new();
+    source_batch
+        .with_account_id(8)
+        .with_collection(Collection::Email)
+        .with_document(42)
+        .set(
+            ValueClass::Property(Field::ARCHIVE.into()),
+            1u64.to_be_bytes().to_vec(),
+        );
+    fixture
+        .metadata
+        .write_batch(&mut source_batch)
+        .await
+        .unwrap();
+
+    let captures = (0..MAX_ITEMS_PER_SCOPE - 1)
+        .map(|index| format!("{index:064x}"))
+        .collect::<Vec<_>>();
+    let split = MAX_ITEMS_PER_SCOPE / 2;
+    fixture
+        .engine
+        .cas_write(
+            &account_capture_index_key(&scope_a).unwrap(),
+            None,
+            &ScopeCaptureIndex {
+                scope: scope_a.clone(),
+                captures: captures[..split].to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .engine
+        .cas_write(
+            &account_capture_index_key(&scope_b).unwrap(),
+            None,
+            &ScopeCaptureIndex {
+                scope: scope_b.clone(),
+                captures: captures[split..].to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .engine
+        .cas_write(
+            &quota_key(&scope_a).unwrap(),
+            None,
+            &ScopeLedger {
+                charged_bytes: 321,
+                captures,
+            },
+        )
+        .await
+        .unwrap();
+
+    let added = fixture
+        .engine
+        .prepare_capture(
+            capture_request(&fixture, "aggregate-limit-a", 20),
+            &fixture.source_blobs,
+            &fixture.source_keys,
+        )
+        .await
+        .unwrap();
+    let expected_bytes = 321 + added.manifest().stored_size;
+    let mut request_b = capture_request(&fixture, "aggregate-limit-b", 21);
+    request_b.account = account_b;
+    request_b.source.account_id = 8;
+    assert!(matches!(
+        fixture
+            .engine
+            .prepare_capture(request_b, &fixture.source_blobs, &fixture.source_keys)
+            .await,
+        Err(RecoveryError::QuotaExceeded)
+    ));
+
+    let ledger = fixture
+        .engine
+        .read::<ScopeLedger>(&quota_key(&scope_a).unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(ledger.captures.len(), MAX_ITEMS_PER_SCOPE);
+    assert_eq!(ledger.charged_bytes, expected_bytes);
+    assert_eq!(
+        fixture
+            .engine
+            .read::<ScopeCaptureIndex>(&account_capture_index_key(&scope_b).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .captures
+            .len(),
+        MAX_ITEMS_PER_SCOPE - 1 - split
+    );
+}
+
+#[tokio::test]
+async fn ephemeral_account_capture_index_cas_race_keeps_one_writer() {
+    let fixture = lifecycle_fixture().await;
+    let scope = fixture.account.scope().clone();
+    let index_key = account_capture_index_key(&scope).unwrap();
+    let initial = ScopeCaptureIndex {
+        scope: scope.clone(),
+        captures: vec![format!("{:064x}", 1)],
+    };
+    fixture
+        .engine
+        .cas_write(&index_key, None, &initial)
+        .await
+        .unwrap();
+    let (_, revision) = fixture
+        .engine
+        .read::<ScopeCaptureIndex>(&index_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let left = ScopeCaptureIndex {
+        captures: vec![initial.captures[0].clone(), format!("{:064x}", 2)],
+        ..initial.clone()
+    };
+    let right = ScopeCaptureIndex {
+        captures: vec![initial.captures[0].clone(), format!("{:064x}", 3)],
+        ..initial
+    };
+    let mut left_batch = BatchBuilder::new();
+    fixture
+        .engine
+        .append_cas(&mut left_batch, &index_key, Some(&revision), &left)
+        .unwrap();
+    let mut right_batch = BatchBuilder::new();
+    fixture
+        .engine
+        .append_cas(&mut right_batch, &index_key, Some(&revision), &right)
+        .unwrap();
+
+    let (left_result, right_result) = tokio::join!(
+        fixture.metadata.write_batch(&mut left_batch),
+        fixture.metadata.write_batch(&mut right_batch)
+    );
+    assert_ne!(left_result.is_ok(), right_result.is_ok());
+    let expected = if left_result.is_ok() { left } else { right };
+    assert_eq!(
+        fixture
+            .engine
+            .read::<ScopeCaptureIndex>(&index_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        expected
+    );
 }
