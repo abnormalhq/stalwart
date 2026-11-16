@@ -12,7 +12,8 @@ use crate::scheduling::{
 use ahash::AHashSet;
 use calcard::icalendar::{
     ICalendar, ICalendarComponent, ICalendarComponentType, ICalendarEntry, ICalendarMethod,
-    ICalendarParameter, ICalendarParameterName, ICalendarProperty, ICalendarStatus, ICalendarValue,
+    ICalendarParameter, ICalendarParameterName, ICalendarParticipationStatus, ICalendarProperty,
+    ICalendarStatus, ICalendarValue,
     Uri,
 };
 
@@ -398,6 +399,20 @@ pub fn itip_import_message(ical: &mut ICalendar) -> Result<(), ItipError> {
     }
 
     Ok(())
+}
+
+pub fn itip_add_uninvited_attendee(ical: &mut ICalendar, recipient: &str) {
+    for comp in ical.components.iter_mut() {
+        if comp.component_type.is_scheduling_object() {
+            comp.add_property_with_params(
+                ICalendarProperty::Attendee,
+                [ICalendarParameter::partstat(
+                    ICalendarParticipationStatus::NeedsAction,
+                )],
+                ICalendarValue::Text(format!("mailto:{recipient}")),
+            );
+        }
+    }
 }
 
 fn handle_reply(

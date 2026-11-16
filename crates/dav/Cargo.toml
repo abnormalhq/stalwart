@@ -24,9 +24,14 @@ compact_str = "0.10.0"
 tokio = { version = "1.54", features = ["time"] }
 
 [dev-dependencies]
+common = { path = "../common", features = ["test-utils"] }
+store = { path = "../store", features = ["sqlite"] }
+tokio = { version = "1.54", features = ["full"] }
 
 [features]
 dev_mode = []
+test-postgres = ["store/postgres"]
+test-rocks = ["store/rocks"]
 enterprise = ["dav-proto/enterprise", "common/enterprise", "store/enterprise", "utils/enterprise", "groupware/enterprise", "directory/enterprise", "registry/enterprise", "http_proto/enterprise", "trc/enterprise"]
 
 [lints]

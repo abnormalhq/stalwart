@@ -8,7 +8,7 @@ use super::FromDavResource;
 use crate::{
     DavError, DavMethod,
     common::{
-        ExtractETag,
+        ExtractETag, create::DavCreateFence,
         dead::{
             ContainerRequest, ContainerWrites, copy_growth, edited_container, read_container,
             stored_entry_of,
@@ -113,17 +113,14 @@ impl FileCopyMoveRequestHandler for Server {
             .account_id
             .ok_or(DavError::Code(StatusCode::BAD_GATEWAY))?;
         let is_same_account = to_account_id == from_account_id;
-        let to_resources = if is_same_account {
-            from_resources.clone()
-        } else {
-            self.fetch_groupware_resources(
-                access_token.account_id(),
-                to_account_id,
-                SyncCollection::FileNode,
-            )
-            .await
-            .caused_by(trc::location!())?
-        };
+        let (to_resources, create_fence) = DavCreateFence::prepare(
+            self,
+            access_token,
+            to_account_id,
+            SyncCollection::FileNode,
+        )
+        .await
+        .caused_by(trc::location!())?;
 
         // Map file item
         let destination_resource_name = destination
@@ -137,13 +134,9 @@ impl FileCopyMoveRequestHandler for Server {
             }
         }
 
-        let to_access_owned = (!is_same_account && !access_token.is_member(to_account_id))
+        let to_access_owned = (!access_token.is_member(to_account_id))
             .then(|| to_resources.file_access(access_token));
-        let to_access = if is_same_account {
-            from_access.as_ref()
-        } else {
-            to_access_owned.as_ref()
-        };
+        let to_access = to_access_owned.as_ref();
         if let Some(access) = to_access {
             to_resources.hide_undiscoverable(
                 &access.discoverable,
@@ -271,6 +264,7 @@ impl FileCopyMoveRequestHandler for Server {
             // Rename
             return rename_item(
                 self,
+                &create_fence,
                 access_token,
                 &from_resources,
                 from_resource,
@@ -380,6 +374,7 @@ impl FileCopyMoveRequestHandler for Server {
             (true, true) => {
                 move_container(
                     self,
+                    &create_fence,
                     access_token,
                     from_resources,
                     from_resource,
@@ -394,6 +389,7 @@ impl FileCopyMoveRequestHandler for Server {
             (true, false) => {
                 copy_container(
                     self,
+                    &create_fence,
                     access_token,
                     from_resources,
                     from_resource,
@@ -410,6 +406,7 @@ impl FileCopyMoveRequestHandler for Server {
                 if let Some(existing) = delete_destination {
                     overwrite_and_delete_item(
                         self,
+                        &create_fence,
                         access_token,
                         from_resource,
                         from_href,
@@ -421,6 +418,7 @@ impl FileCopyMoveRequestHandler for Server {
                 } else {
                     move_item(
                         self,
+                        &create_fence,
                         access_token,
                         from_resource,
                         from_href,
@@ -434,6 +432,7 @@ impl FileCopyMoveRequestHandler for Server {
                 if let Some(existing) = delete_destination {
                     overwrite_item(
                         self,
+                        &create_fence,
                         access_token,
                         from_resource,
                         existing.document_id,
@@ -442,7 +441,15 @@ impl FileCopyMoveRequestHandler for Server {
                     )
                     .await
                 } else {
-                    copy_item(self, access_token, from_resource, destination, transfer).await
+                    copy_item(
+                        self,
+                        &create_fence,
+                        access_token,
+                        from_resource,
+                        destination,
+                        transfer,
+                    )
+                    .await
                 }
             }
         }
@@ -536,6 +543,7 @@ impl Transfer {
 #[allow(clippy::too_many_arguments)]
 async fn move_container(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     from_resources: Arc<GroupwareResources>,
     from_resource: UriResource<u32, FileItemId>,
@@ -586,15 +594,13 @@ async fn move_container(
         batch
             .with_account_id(from_account_id)
             .log_vanished_item(VanishedCollection::FileNode, from_href);
-        server
-            .commit_batch(batch)
-            .await
-            .caused_by(trc::location!())?;
+        fence.commit(server, batch).await?;
 
         Ok(HttpResponse::new(StatusCode::CREATED).with_etag_opt(etag))
     } else {
         copy_container(
             server,
+            fence,
             access_token,
             from_resources,
             from_resource,
@@ -612,6 +618,7 @@ async fn move_container(
 #[allow(clippy::too_many_arguments)]
 async fn copy_container(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     from_resources: Arc<GroupwareResources>,
     from_resource: UriResource<u32, FileItemId>,
@@ -624,7 +631,7 @@ async fn copy_container(
 ) -> crate::Result<HttpResponse> {
     let infinity_copy = match depth {
         Depth::Zero if !delete_source => {
-            return copy_item(server, access_token, from_resource, destination, transfer).await;
+            return copy_item(server, fence, access_token, from_resource, destination, transfer).await;
         }
         Depth::One if !delete_source => false,
         _ => true,
@@ -769,10 +776,7 @@ async fn copy_container(
 
     // Write changes
     if !batch.is_empty() {
-        server
-            .commit_batch(batch)
-            .await
-            .caused_by(trc::location!())?;
+        fence.commit(server, batch).await?;
     }
 
     Ok(HttpResponse::new(StatusCode::CREATED))
@@ -782,6 +786,7 @@ async fn copy_container(
 #[allow(clippy::too_many_arguments)]
 async fn overwrite_and_delete_item(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     from_resource: UriResource<u32, FileItemId>,
     from_resource_path: String,
@@ -879,10 +884,7 @@ async fn overwrite_and_delete_item(
         )
         .await
         .caused_by(trc::location!())?;
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     Ok(HttpResponse::new(StatusCode::NO_CONTENT).with_etag_opt(etag))
 }
@@ -890,6 +892,7 @@ async fn overwrite_and_delete_item(
 // Overwrites the contents of one file with another
 async fn overwrite_item(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     from_resource: UriResource<u32, FileItemId>,
     to_document_id: u32,
@@ -958,10 +961,7 @@ async fn overwrite_item(
         )
         .caused_by(trc::location!())?
         .etag();
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     Ok(HttpResponse::new(StatusCode::NO_CONTENT).with_etag_opt(etag))
 }
@@ -969,6 +969,7 @@ async fn overwrite_item(
 // Moves an item under an existing container
 async fn move_item(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     from_resource: UriResource<u32, FileItemId>,
     from_resource_path: String,
@@ -1065,10 +1066,7 @@ async fn move_item(
             .caused_by(trc::location!())?;
         etag
     };
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     Ok(HttpResponse::new(StatusCode::CREATED).with_etag_opt(etag))
 }
@@ -1076,6 +1074,7 @@ async fn move_item(
 // Copies an item under an existing container
 async fn copy_item(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     from_resource: UriResource<u32, FileItemId>,
     destination: Destination,
@@ -1127,10 +1126,7 @@ async fn copy_item(
         )
         .caused_by(trc::location!())?
         .etag();
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     Ok(HttpResponse::new(StatusCode::CREATED).with_etag_opt(etag))
 }
@@ -1138,6 +1134,7 @@ async fn copy_item(
 // Renames an item
 async fn rename_item(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     from_resources: &GroupwareResources,
     from_resource: UriResource<u32, FileItemId>,
@@ -1183,10 +1180,7 @@ async fn rename_item(
     batch
         .with_account_id(from_account_id)
         .log_vanished_item(VanishedCollection::FileNode, from_resource_path);
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     Ok(HttpResponse::new(StatusCode::CREATED).with_etag_opt(etag))
 }

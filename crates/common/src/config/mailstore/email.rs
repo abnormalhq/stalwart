@@ -83,6 +83,13 @@ pub struct ExtractLimits {
     pub max_rtf_depth: usize,
 }
 
+#[cfg(not(feature = "enterprise"))]
+fn set_community_masked_address_quota(max_objects: &mut ObjectQuota, max: Option<u64>) {
+    if let Some(max) = max {
+        max_objects.set(StorageQuota::MaxMaskedAddresses, max as u32);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DefaultFolder {
     pub name: String,
@@ -180,6 +187,8 @@ impl EmailConfig {
             max_objects.set(StorageQuota::MaxMaskedAddresses, max as u32);
         }
         // SPDX-SnippetEnd
+        #[cfg(not(feature = "enterprise"))]
+        set_community_masked_address_quota(&mut max_objects, email.max_masked_addresses);
 
         // Parse default folders
         let mut default_folders = Vec::new();
@@ -366,5 +375,23 @@ impl EmailConfig {
             default_domain_id: system.default_domain_id.id() as u32,
             default_domain_name,
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "enterprise")))]
+mod masked_quota_tests {
+    use super::set_community_masked_address_quota;
+    use crate::storage::ObjectQuota;
+    use registry::schema::enums::StorageQuota;
+
+    #[test]
+    fn configured_masked_address_limit_sets_quota_and_absence_keeps_default() {
+        let mut quota = ObjectQuota::default();
+        set_community_masked_address_quota(&mut quota, Some(17));
+        assert_eq!(quota.get(StorageQuota::MaxMaskedAddresses), 17);
+
+        let mut quota = ObjectQuota::default();
+        set_community_masked_address_quota(&mut quota, None);
+        assert_eq!(quota.get(StorageQuota::MaxMaskedAddresses), u32::MAX);
     }
 }

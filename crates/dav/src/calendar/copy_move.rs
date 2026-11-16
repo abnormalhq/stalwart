@@ -8,7 +8,7 @@ use super::{CalendarComponentSupport, assert_event_privacy_access, assert_is_uni
 use crate::{
     DavError, DavMethod,
     common::{
-        ContainerOperation, assert_parent_limit,
+        ContainerOperation, assert_parent_limit, create::DavCreateFence,
         dead::{
             ContainerRequest, ContainerWrites, DeadContainers, check_growth, container_kinds,
             copy_growth, read_container,
@@ -148,6 +148,14 @@ impl CalendarCopyMoveRequestHandler for Server {
         let to_account_id = destination
             .account_id
             .ok_or(DavError::Code(StatusCode::BAD_GATEWAY))?;
+        let (to_resources, create_fence) = DavCreateFence::prepare(
+            self,
+            access_token,
+            to_account_id,
+            SyncCollection::Calendar,
+        )
+        .await
+        .caused_by(trc::location!())?;
         let is_to_owner = access_token.is_member(to_account_id);
         if !from_resource.is_container()
             && !is_to_owner
@@ -156,18 +164,6 @@ impl CalendarCopyMoveRequestHandler for Server {
         {
             return Err(DavError::Code(StatusCode::FORBIDDEN));
         }
-        let to_resources = if to_account_id == from_account_id {
-            from_resources.clone()
-        } else {
-            self.fetch_groupware_resources(
-                access_token.account_id(),
-                to_account_id,
-                SyncCollection::Calendar,
-            )
-            .await
-            .caused_by(trc::location!())?
-        };
-
         // Validate headers
         let destination_resource_name = destination
             .resource
@@ -259,6 +255,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                     // Overwrite container
                     copy_container(
                         self,
+                        &create_fence,
                         access_token,
                         &from_resources,
                         &to_resources,
@@ -332,6 +329,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                     if is_move {
                         move_event(
                             self,
+                            &create_fence,
                             access_token,
                             &to_resources,
                             from_account_id,
@@ -348,6 +346,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                     } else {
                         copy_event(
                             self,
+                            &create_fence,
                             access_token,
                             &to_resources,
                             from_account_id,
@@ -421,6 +420,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                     {
                         move_event(
                             self,
+                            &create_fence,
                             access_token,
                             &to_resources,
                             from_account_id,
@@ -437,6 +437,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                     } else {
                         rename_event(
                             self,
+                            &create_fence,
                             access_token,
                             from_account_id,
                             from_resource.document_id(),
@@ -449,6 +450,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                 } else {
                     copy_event(
                         self,
+                        &create_fence,
                         access_token,
                         &to_resources,
                         from_account_id,
@@ -490,6 +492,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                     if from_account_id != to_account_id {
                         copy_container(
                             self,
+                            &create_fence,
                             access_token,
                             &from_resources,
                             &to_resources,
@@ -511,6 +514,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                     } else {
                         rename_container(
                             self,
+                            &create_fence,
                             access_token,
                             from_account_id,
                             from_resource.document_id(),
@@ -522,6 +526,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                 } else {
                     copy_container(
                         self,
+                        &create_fence,
                         access_token,
                         &from_resources,
                         &to_resources,
@@ -596,6 +601,7 @@ impl<'x> OwnEventAccess<'x> {
 #[allow(clippy::too_many_arguments)]
 async fn copy_event(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     to_resources: &GroupwareResources,
     from_account_id: u32,
@@ -848,10 +854,7 @@ async fn copy_event(
         Ok(HttpResponse::new(StatusCode::CREATED))
     };
 
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     response
 }
@@ -859,6 +862,7 @@ async fn copy_event(
 #[allow(clippy::too_many_arguments)]
 async fn move_event(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     to_resources: &GroupwareResources,
     from_account_id: u32,
@@ -1181,10 +1185,7 @@ async fn move_event(
         Ok(HttpResponse::new(StatusCode::CREATED))
     };
 
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     response
 }
@@ -1192,6 +1193,7 @@ async fn move_event(
 #[allow(clippy::too_many_arguments)]
 async fn rename_event(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     account_id: u32,
     document_id: u32,
@@ -1237,10 +1239,7 @@ async fn rename_event(
         )
         .caused_by(trc::location!())?;
     batch.log_vanished_item(VanishedCollection::Calendar, from_resource_path);
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     Ok(HttpResponse::new(StatusCode::CREATED))
 }
@@ -1248,6 +1247,7 @@ async fn rename_event(
 #[allow(clippy::too_many_arguments)]
 async fn copy_container(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     from_resources: &GroupwareResources,
     to_resources: &GroupwareResources,
@@ -1696,10 +1696,7 @@ async fn copy_container(
             .clear_if_equals(PrincipalField::DefaultCalendarId, from_document_id);
     }
 
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     if !is_overwrite {
         Ok(HttpResponse::new(StatusCode::CREATED))
@@ -1711,6 +1708,7 @@ async fn copy_container(
 #[allow(clippy::too_many_arguments)]
 async fn rename_container(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     account_id: u32,
     document_id: u32,
@@ -1747,10 +1745,7 @@ async fn rename_container(
         )
         .caused_by(trc::location!())?;
     batch.log_vanished_item(VanishedCollection::Calendar, from_resource_path);
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     Ok(HttpResponse::new(StatusCode::CREATED))
 }

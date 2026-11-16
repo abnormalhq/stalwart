@@ -8,6 +8,7 @@ use super::proppatch::CardPropPatchRequestHandler;
 use crate::{
     DavError, DavMethod, PropStatBuilder,
     common::{
+        create::DavCreateFence,
         ExtractETag,
         dead::{DeadPatch, DeadTarget, DisplayName},
         lock::{LockRequestHandler, ResourceState},
@@ -19,10 +20,7 @@ use dav_proto::{
     RequestHeaders, Return,
     schema::{Namespace, request::MkCol, response::MkColResponse},
 };
-use groupware::{
-    cache::GroupwareCache,
-    contact::{AddressBook, AddressBookPreferences},
-};
+use groupware::contact::{AddressBook, AddressBookPreferences};
 use http_proto::HttpResponse;
 use hyper::StatusCode;
 use registry::schema::enums::StorageQuota;
@@ -61,14 +59,14 @@ impl CardMkColRequestHandler for Server {
         if !access_token.is_member(account_id) {
             return Err(DavError::Code(StatusCode::FORBIDDEN));
         }
-        let resources = self
-            .fetch_groupware_resources(
-                access_token.account_id(),
-                account_id,
-                SyncCollection::AddressBook,
-            )
-            .await
-            .caused_by(trc::location!())?;
+        let (resources, create_fence) = DavCreateFence::prepare(
+            self,
+            access_token,
+            account_id,
+            SyncCollection::AddressBook,
+        )
+        .await
+        .caused_by(trc::location!())?;
         if name.contains('/') || resources.by_path(name).is_some() {
             return Err(DavError::Code(StatusCode::METHOD_NOT_ALLOWED));
         }
@@ -164,10 +162,9 @@ impl CardMkColRequestHandler for Server {
             &mut batch,
         )
         .caused_by(trc::location!())?;
-        let etag = self
-            .commit_batch(batch)
-            .await
-            .caused_by(trc::location!())?
+        let etag = create_fence
+            .commit(self, batch)
+            .await?
             .etag();
 
         if let Some(prop_stat) = return_prop_stat {

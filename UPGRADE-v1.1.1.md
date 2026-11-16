@@ -10,18 +10,19 @@ The Community `schema_oss.json.gz` and matching hash are refreshed from the pinn
 
 Existing directory and explicit Mail aliases are not rewritten, rejected, or changed by native masked-address decoding. No stored aliases are migrated. Keep the native feature disabled until Console adaptation and isolation validation receive separate review.
 
+The upstream Community source parity now includes OAuth `SETTINGS` permission mapping, `max_masked_addresses` quota configuration, masked-object account-destroy cleanup, and `MaskedEmail` keys in the `Directory` subspace (`common/src/auth/oauth/scope.rs`, `common/src/config/mailstore/email.rs`, `services/src/task_manager/tasks/destroy_account.rs`, and `store/src/write/key.rs`). Focused tests cover these mappings and SQLite key persistence across reopen. These source changes do not open JMAP dispatch or masked-address routing.
+
 Changing the false constant alone is not a complete or approved activation path. The following Abnormal policy and lifecycle work remains excluded and needs separate design, review, and validation before activation:
 
 - Console integration and isolation validation for native masked-address creation and management.
-- OAuth scope and authorization policy for users, administrators, and object creation.
-- Product quota/configuration integration, including account/tenant scope and limits.
-- Cache invalidation for masked-object updates, disablement, expiry, and deletion.
-- Account/object cleanup and ownership handling for deletion, transfer, or loss of access.
-- Abnormal store key-path adaptation plus persistence and compatibility checks.
+- Abnormal-specific authorization policy for users, administrators, and object creation; the upstream scope mapping is source parity only.
+- Product quota policy and configuration lifecycle, including account/tenant scope and limits; upstream max-quota mapping is present, but no product limit is selected here.
+- Cache invalidation for masked-object updates, disablement, expiry, and deletion. Tenant-only invalidation changes remain in their SEL snippet and were not applied.
+- Ownership handling for transfer or loss of access; account-destroy cleanup parity alone does not settle those policies.
 - Recipient/address-format policy, including the pending Mail 14/27 decision; this port selects neither format.
-- End-to-end validation across supported storage backends and restart/import scenarios.
+- End-to-end lifecycle validation across supported storage backends and restart/import scenarios; only the key persistence mapping was exercised with SQLite.
 
-Imported or pre-existing native objects cannot activate routing while the gate remains false. The upstream schema/object mapping and quota-check code are carried but remain unreachable through Community JMAP while the guard is closed. This port does not provide Abnormal-specific OAuth scopes, quota/configuration lifecycle, cache invalidation, account cleanup, or store-key adaptation; no native provider is exposed or activated.
+Imported or pre-existing native objects cannot activate routing while the gate remains false. JMAP masked get/query/set remain forbidden before dispatch, and no native provider or alias rewriting is exposed or activated.
 
 ## Configuration migration
 
@@ -29,10 +30,21 @@ Upstream v1.1.1 changes the Netcup DNS API to key-only authentication. Existing 
 
 ## Preserved and deferred licensing boundaries
 
-The still-SEL `crates/common/src/enterprise/mod.rs`, `crates/common/src/enterprise/masked.rs`, and `crates/smtp/src/queue/tenant.rs` remain untouched. Existing still-SEL snippets remain byte-for-byte as they were on the Abnormal baseline; scheduler SEL changes are excluded. Mixed generated schema changes are selective rather than whole-file replacements. Within the calendar changes, the `itip_add_uninvited_attendee` / `ItipOrigin` forwarded-invitation interface and its paired email-ingest integration remain deferred. The independent RSVP-preservation fix in `crates/groupware/src/scheduling/inbound.rs` and first-RRULE-wins fix in `crates/groupware/src/calendar/itip.rs` are included.
+The still-SEL `crates/common/src/enterprise/mod.rs`, `crates/common/src/enterprise/masked.rs`, and `crates/smtp/src/queue/tenant.rs` remain untouched. Existing still-SEL snippets remain byte-for-byte as they were on the Abnormal baseline; scheduler and tenant-only cache-invalidation SEL changes are excluded. The four lifecycle parity files above retain their old SEL blocks unchanged alongside Community-only branches. Mixed generated schema changes are selective rather than whole-file replacements. The `itip_add_uninvited_attendee` / `ItipOrigin` forwarding interface and paired email-ingest origin mapping are ported; local SQLite integration tests call `Server.itip_ingest` and cover forwarding, rejection guards, duplicate-UID behavior, and normal invitation/RSVP processing. The RSVP-preservation and first-RRULE-wins fixes remain included.
+
+## Pinned release-delta inventory
+
+This inventory compares the worktree semantically with pinned upstream `3adead91f3c87e7415b58c9ed8e6ec05a5dda521`; changed-path counts are not treated as evidence of omitted work.
+
+- Production code in `crates/calcard/`, `crates/imap-proto/`, `crates/email/src/cache/`, `crates/email/src/message/ingest.rs`, and `crates/store/src/query/log.rs` is upstream-identical, including the iTIP ingest-origin hunk. The current email-ingest diff is test-only integration coverage for Submission-versus-Delivery MIME propagation; Server iTIP integration asserts rejected UIDs persist no documents and a duplicate UID remains a single unchanged document. These paths are not pending production ports.
+- IMAP production-source differences are the existing debranding in `crates/imap/src/lib.rs`, `crates/imap/src/op/capability.rs`, and `crates/imap/src/op/logout.rs`. `crates/imap/src/core/view.rs` contains Community regression tests, and this update adds local wire coverage; no omitted IMAP protocol hunk is identified. SMTP differences are debranding in `crates/smtp/src/inbound/data.rs` and `crates/smtp/src/inbound/spawn.rs`, plus the retained SEL-only tenant implementation in `crates/smtp/src/queue/tenant.rs`; these are not missing AGPL ports.
+- The masked-address schema and lifecycle work is Community-only, with the existing Enterprise snippets retained. JMAP masked get/query/set and native address resolution remain closed by the Community gate; the surrounding source differences in `crates/jmap/src/registry/`, `crates/common/src/cache/principals.rs`, `crates/common/src/network/mta.rs`, and `crates/registry/src/schema/` are gate/licensing adaptations, not authorization to activate routing. Tenant-only cache invalidation and scheduler changes remain excluded as SEL-only.
+- The pinned release adds `crates/dav/src/common/create.rs` with `CreateLock` / `CreateLockHandler` (191 lines, `AGPL-3.0-only OR LicenseRef-SEL`). The worktree file at that path is a 724-line fork-authored durable `DavCreateFence` implementation, not an exact port of the pinned file. Treat this as a known source-parity replacement/delta; this step did not merge the upstream `CreateLock` API into the fence implementation. The pinned file has no `SPDX-SnippetBegin` blocks, and no claim is made that the local implementation came from that upstream file.
+- `crates/common/src/network/masked.rs` is derived from the pinned upstream file with the literal-false routing gate retained; the local `crates/spam-filter/src/analysis/image_size.rs` is fork-authored and absent from the pinned release. `crates/common/src/test_utils.rs` and `crates/imap/src/core/wire_tests.rs` are local test infrastructure, not upstream imports. These files are not represented as pinned source ports.
+- The raw-byte ordered audit compared every changed `SPDX-SnippetBegin` block in the worktree against both `abnormal/main` and `HEAD`: 35 files contained such snippets, all baseline blocks remained byte-identical and in order, and no new SEL snippet was found. The source review found no other omitted AGPL release hunk in the path groups listed above; it is a scoped parity inventory, not a complete legal opinion on every upstream diff hunk.
 
 The v1.1.1 update does not modify the Mail repository, rewrite stored aliases, or change the Mail 14/27 policy.
 
-## DAV concurrent creates (excluded)
+## DAV fenced create scope
 
-The v1.1.1 DAV create-lock subpatch is excluded. Calendar, card, and file creates retain the PR1 `commit_batch` path. This deferral does **not** fix the baseline concurrent-create race: simultaneous requests can still pass the path-existence check and create duplicate resources. No concurrency-safety claim is made; remediation requires a separately reviewed, correctly fenced design across supported stores.
+Calendar, card, and file DAV PUT/MKCOL/COPY/MOVE destination creates now use a durable generation fence keyed by owner account and `SyncCollection`, read before forced primary revalidation and asserted in the final resource batch. The monotonic marker is stored in the `System` subspace and must never be cleared when a resource or account is retired; retaining it avoids an ABA window if a name is later reused. Normal/full backups include the `Data` family, which includes `System`, and restore the stored key/value records. A selective backup that omits `Data` does not preserve these markers and is not a complete DAV namespace backup. These guarantees apply only to writers that use the fence: older binaries and JMAP name writers do not participate, so no mixed old/new writer safety or global cross-protocol uniqueness is claimed. The shared fence contracts (first-writer collision and rollback, delayed stale rejection, reopen/recreate persistence, namespace isolation, and overflow) run on SQLite, RocksDB, and opt-in PostgreSQL; the Community CI runs RocksDB on an isolated path and PostgreSQL through a service mapped only to loopback. MySQL was not tested locally because no server binaries are installed. SQLite request tests also cover retry-time `If` reevaluation, concurrent Calendar/Card/File PUT races, exact File PUT versus COPY/MOVE/MKCOL collision outcomes, and successful unrelated-path retries.
