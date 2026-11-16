@@ -709,6 +709,25 @@ mod tests {
     }
 
     #[test]
+    fn fallback_preserves_event_title_when_profile_logo_is_invalid() {
+        let mut document = fallback(PresentationKind::CalendarAlarm);
+        document.brand.logo_id = Some("https://example.invalid/logo.jpg".to_string());
+        let values = BTreeMap::from([(
+            PresentationPlaceholder::EventTitle,
+            "Quarterly review".to_string(),
+        )]);
+
+        let rendered = render_or_fallback(&document, &values, None);
+
+        assert!(rendered.text.contains("Quarterly review"));
+        assert!(
+            rendered
+                .text
+                .contains("You have a reminder for Quarterly review.")
+        );
+    }
+
+    #[test]
     fn fallback_without_a_valid_title_uses_complete_generic_intros() {
         let empty = render_json_or_fallback(
             PresentationKind::CalendarAlarm,
@@ -755,6 +774,30 @@ mod tests {
             validate_subject("safe\r\nBcc: injected@example.invalid"),
             Err(PresentationError::UnsafeSubject)
         );
+    }
+
+    #[test]
+    fn normalizes_lf_and_crlf_event_descriptions_while_preserving_title() {
+        let mut document = fallback(PresentationKind::CalendarAlarm);
+        document.sections.intro = "{{eventTitle}} {{eventDescription}}".to_string();
+
+        for description in ["First line\nSecond line", "First line\r\nSecond line"] {
+            let values = BTreeMap::from([
+                (
+                    PresentationPlaceholder::EventTitle,
+                    "Quarterly review".to_string(),
+                ),
+                (
+                    PresentationPlaceholder::EventDescription,
+                    description.to_string(),
+                ),
+            ]);
+            let rendered = render(&document, &values, None).unwrap();
+
+            assert!(rendered.text.contains("Quarterly review"));
+            assert!(rendered.text.contains("First line\nSecond line"));
+            assert!(!rendered.text.contains('\r'));
+        }
     }
 
     #[test]
