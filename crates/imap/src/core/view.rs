@@ -905,6 +905,86 @@ impl<T: SessionStream> SessionData<T> {
     }
 }
 
+#[cfg(test)]
+mod community_append_tests {
+    use super::*;
+
+    fn empty_view() -> MailboxView {
+        MailboxView {
+            mailbox_id: 1,
+            rows: Arc::new(Vec::new()),
+            tombstones: Vec::new(),
+            appended: 0,
+            uid_max: 0,
+            snapshot: Arc::new(MessagesCache::new(0, Vec::new(), Vec::new())),
+            sorted: true,
+            mask: None,
+        }
+    }
+
+    fn row(uid: u32, id: u32) -> Row {
+        Row { uid, id }
+    }
+
+    #[test]
+    fn append_local_tracks_rows_and_consumes_exists_once() {
+        let mut view = empty_view();
+        view.append_local([row(2, 20), row(1, 10)]);
+
+        assert_eq!(view.rows(), &[row(1, 10), row(2, 20)]);
+        assert_eq!(view.len(), 2);
+        assert_eq!(view.uid_max(), 2);
+        assert_eq!(view.take_appended(), Some(2));
+        assert_eq!(view.take_appended(), None);
+    }
+
+    #[test]
+    fn taken_append_does_not_repeat_exists_on_flush() {
+        let mut view = empty_view();
+        view.append_local([row(1, 10)]);
+
+        let total_messages = view.take_appended().unwrap();
+        assert_eq!(
+            Exists { total_messages }.into_bytes(),
+            b"* 1 EXISTS\r\n"
+        );
+
+        let mut flushed = Vec::new();
+        view.flush(false, &mut flushed);
+        assert!(flushed.is_empty());
+
+        let mut repeated = Vec::new();
+        view.flush(false, &mut repeated);
+        assert!(repeated.is_empty());
+    }
+
+    #[test]
+    fn taking_append_preserves_pending_expunge_for_flush() {
+        let mut view = empty_view();
+        view.append_local([row(1, 10), row(2, 20)]);
+        view.tombstone(0);
+
+        assert_eq!(view.take_appended(), Some(2));
+
+        let mut actual = Vec::new();
+        view.flush(false, &mut actual);
+
+        let mut expected = Vec::new();
+        expunge::Response {
+            use_vanished: false,
+            ids: vec![1],
+        }
+        .serialize_to(&mut expected);
+        Exists { total_messages: 1 }.serialize(&mut expected);
+        assert_eq!(actual, expected);
+        assert_eq!(view.rows(), &[row(2, 20)]);
+
+        let mut repeated = Vec::new();
+        view.flush(false, &mut repeated);
+        assert!(repeated.is_empty());
+    }
+}
+
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap/src/core/view/tests.rs"]
