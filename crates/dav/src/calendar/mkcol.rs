@@ -110,7 +110,7 @@ impl CalendarMkColRequestHandler for Server {
         // Apply MKCOL properties
         let personal_id = access_token.personal_id(account_id, Collection::Calendar);
         calendar.preferences_mut(personal_id).flags |= CALENDAR_SUBSCRIBED;
-        let mut batch = BatchBuilder::new();
+        let mut batch = BatchBuilder::new_atomic();
         let document_id = batch.reserve_document_id(account_id, Collection::Calendar);
         let mut return_prop_stat = None;
         let mut is_mkcalendar = false;

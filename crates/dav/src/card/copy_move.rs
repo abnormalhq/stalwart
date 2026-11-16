@@ -479,7 +479,7 @@ async fn copy_card(
     let card = card_
         .to_unarchived::<ContactCard>()
         .caused_by(trc::location!())?;
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
 
     // Validate UID
     assert_is_unique_uid(
@@ -682,7 +682,7 @@ async fn move_card(
         )?;
     }
 
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     if from_account_id == to_account_id {
         let mut name_idx = None;
         for (idx, name) in card.inner.names.iter().enumerate() {
@@ -895,7 +895,7 @@ async fn rename_card(
         .caused_by(trc::location!())?;
     new_card.names[name_idx].name = new_name.to_string();
 
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     new_card
         .update_meta(
             access_token.changed_by(),
@@ -1023,7 +1023,7 @@ async fn copy_container(
     };
 
     // Prepare write batch
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
 
     let preference = book.preferences.into_iter().next().unwrap();
     book.name = new_name.to_string();
@@ -1319,7 +1319,7 @@ async fn rename_container(
         .caused_by(trc::location!())?;
     new_book.name = new_name.to_string();
 
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     new_book
         .update(
             access_token.changed_by(),

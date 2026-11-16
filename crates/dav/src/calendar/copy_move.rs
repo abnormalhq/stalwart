@@ -625,7 +625,7 @@ async fn copy_event(
     let event = event_
         .to_unarchived::<CalendarEvent>()
         .caused_by(trc::location!())?;
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
 
     // Validate UID
     assert_is_unique_uid(
@@ -928,7 +928,7 @@ async fn move_event(
         .account_info(access_token.account_id())
         .await
         .caused_by(trc::location!())?;
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     let event_flags = event.inner.flags.to_native();
     let mut quota = NotificationQuota::default();
     if from_calendar_id != to_calendar_id || from_account_id != to_account_id {
@@ -1227,7 +1227,7 @@ async fn rename_event(
         .caused_by(trc::location!())?;
     new_event.names[name_idx].name = new_name.to_string();
 
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     new_event
         .update_meta(
             access_token.changed_by(),
@@ -1360,7 +1360,7 @@ async fn copy_container(
     };
 
     // Prepare write batch
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
 
     let personal_id = access_token.personal_id(from_account_id, Collection::Calendar);
     let preference = calendar
@@ -1734,7 +1734,7 @@ async fn rename_container(
         .caused_by(trc::location!())?;
     new_calendar.name = new_name.to_string();
 
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     new_calendar
         .update(
             access_token.changed_by(),

@@ -137,7 +137,7 @@ impl FileMkColRequestHandler for Server {
         };
 
         // Apply MKCOL properties
-        let mut batch = BatchBuilder::new();
+        let mut batch = BatchBuilder::new_atomic();
         let document_id = batch.reserve_document_id(account_id, Collection::FileNode);
         let mut return_prop_stat = None;
         let mut dead_write = None;

@@ -578,7 +578,7 @@ async fn move_container(
         if let Some(new_name) = destination.new_name {
             new_node.name = new_name;
         }
-        let mut batch = BatchBuilder::new();
+        let mut batch = BatchBuilder::new_atomic();
         let etag = new_node
             .update(
                 access_token.changed_by(),
@@ -669,7 +669,7 @@ async fn copy_container(
     let mut removals = ContainerWrites::new(from_account_id, Collection::FileNode);
 
     // Top-down copy
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     let mut id_map = AHashMap::with_capacity(copy_files.len());
     let mut delete_files = if delete_source {
         Vec::with_capacity(copy_files.len())
@@ -839,7 +839,7 @@ async fn overwrite_and_delete_item(
     }
     source_node.parent_id = dest_node.inner.parent_id.into();
 
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     let source = replace_container(
         server,
         from_account_id,
@@ -937,7 +937,7 @@ async fn overwrite_item(
     }
     source_node.acls.clear();
     source_node.parent_id = dest_node.inner.parent_id.into();
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     replace_container(
         server,
         from_account_id,
@@ -1000,7 +1000,7 @@ async fn move_item(
         new_node.name = new_name;
     }
 
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     let etag = if from_account_id == to_account_id {
         // Destination is in the same account: just update the parent id
         transfer.prepare(server, 0).await?;
@@ -1102,7 +1102,7 @@ async fn copy_item(
     if let Some(new_name) = destination.new_name {
         node.name = new_name;
     }
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     let to_document_id = batch.reserve_document_id(to_account_id, Collection::FileNode);
     copy_node_container(
         server,
@@ -1162,7 +1162,7 @@ async fn rename_item(
     if let Some(new_name) = destination.new_name {
         new_node.name = new_name;
     }
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     let etag = new_node
         .update(
             access_token.changed_by(),

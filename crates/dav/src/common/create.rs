@@ -99,6 +99,14 @@ impl DavCreateFence {
         F: FnOnce(BatchBuilder) -> Fut,
         Fut: Future<Output = trc::Result<AssignedIds>>,
     {
+        if batch.has_commit_points() {
+            return Err(DavError::Internal(
+                trc::StoreEvent::UnexpectedError
+                    .into_err()
+                    .details("DAV fence refuses a pre-split batch"),
+            ));
+        }
+
         let next_generation = self
             .generation
             .unwrap_or_default()
@@ -333,7 +341,7 @@ mod tests {
         document_id: u32,
     ) -> BatchBuilder {
         let archive = ValueKey::archive(account_id, collection, document_id);
-        let mut batch = BatchBuilder::new();
+        let mut batch = BatchBuilder::new_atomic();
         batch
             .with_account_id(account_id)
             .with_collection(collection)
@@ -355,6 +363,22 @@ mod tests {
                 store.write_batch(&mut batch).await
             })
             .await
+    }
+
+    fn large_resource_batch(account_id: u32, first_document_id: u32, count: u32) -> BatchBuilder {
+        let mut batch = BatchBuilder::new_atomic();
+        for document_id in first_document_id..first_document_id + count {
+            let archive = ValueKey::archive(account_id, Collection::CalendarEvent, document_id);
+            batch
+                .with_account_id(account_id)
+                .with_collection(Collection::CalendarEvent)
+                .with_document(document_id)
+                .set(archive.class, b"dav-resource".to_vec())
+                .log_item_insert(SyncCollection::Calendar, None)
+                .add(ValueClass::Quota, 1)
+                .commit_point();
+        }
+        batch
     }
 
     async fn quota(store: &Store, account_id: u32) -> i64 {
@@ -462,6 +486,114 @@ mod tests {
         })
         .await
         .expect("DAV fence contract test timed out");
+    }
+
+    #[tokio::test]
+    async fn pre_split_batch_is_rejected_before_commit() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let db = TestDb::new();
+            let store = db.open().await;
+            let account_id = db.id(8);
+            let document_id = db.id(43);
+            let fence = DavCreateFence::read(&store, account_id, SyncCollection::Calendar)
+                .await
+                .expect("read fence for pre-split rejection");
+            let archive = ValueKey::archive(account_id, Collection::CalendarEvent, document_id);
+            let mut batch = BatchBuilder::new();
+            batch
+                .with_account_id(account_id)
+                .with_collection(Collection::CalendarEvent)
+                .with_document(document_id)
+                .set(archive.class.clone(), b"must-not-commit".to_vec())
+                .add_commit_point();
+            assert!(batch.has_commit_points());
+
+            let called = Arc::new(AtomicBool::new(false));
+            let called_in_commit = called.clone();
+            let result = fence
+                .commit_with(batch, move |_| async move {
+                    called_in_commit.store(true, Ordering::SeqCst);
+                    Ok(AssignedIds::default())
+                })
+                .await;
+
+            assert!(result.is_err());
+            assert!(!called.load(Ordering::SeqCst));
+            assert!(
+                !store
+                    .key_exists(archive)
+                    .await
+                    .expect("read resource after pre-split rejection")
+            );
+            assert_eq!(calendar_log_count(&store, account_id).await, 0);
+            assert_eq!(quota(&store, account_id).await, 0);
+        })
+        .await
+        .expect("pre-split fence test timed out");
+    }
+
+    #[tokio::test]
+    async fn stale_large_atomic_batch_rolls_back_resources_log_and_quota() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            const LARGE_RESOURCE_COUNT: u32 = 1100;
+
+            let db = TestDb::new();
+            let store = db.open().await;
+            let account_id = db.id(9);
+            let stale = DavCreateFence::read(&store, account_id, SyncCollection::Calendar)
+                .await
+                .expect("read stale fence");
+            let winner = DavCreateFence::read(&store, account_id, SyncCollection::Calendar)
+                .await
+                .expect("read winning fence");
+            assert!(
+                commit_to_store(
+                    &winner,
+                    &store,
+                    resource_batch(
+                        account_id,
+                        Collection::CalendarEvent,
+                        SyncCollection::Calendar,
+                        db.id(50),
+                    ),
+                )
+                .await
+                .is_ok()
+            );
+
+            let first_document_id = db.id(100);
+            let batch = large_resource_batch(account_id, first_document_id, LARGE_RESOURCE_COUNT);
+            assert!(!batch.has_commit_points());
+            let result = commit_to_store(&stale, &store, batch).await;
+            assert!(is_assertion_failure(&result));
+
+            for document_id in first_document_id..first_document_id + LARGE_RESOURCE_COUNT {
+                assert!(
+                    !store
+                        .key_exists(ValueKey::archive(
+                            account_id,
+                            Collection::CalendarEvent,
+                            document_id,
+                        ))
+                        .await
+                        .expect("read resource after stale large batch"),
+                    "resource {document_id} survived the stale large transaction"
+                );
+            }
+            assert_eq!(calendar_log_count(&store, account_id).await, 1);
+            assert_eq!(quota(&store, account_id).await, 1);
+            assert_eq!(
+                DavCreateFence::read(&store, account_id, SyncCollection::Calendar)
+                    .await
+                    .expect("read winning generation")
+                    .generation,
+                Some(1)
+            );
+        })
+        .await
+        .expect("stale large DAV fence test timed out");
     }
 
     #[tokio::test]

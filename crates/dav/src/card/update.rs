@@ -333,7 +333,7 @@ impl CardUpdateRequestHandler for Server {
             let content = ContactCardContent { card: vcard };
 
             // Prepare write batch
-            let mut batch = BatchBuilder::new();
+            let mut batch = BatchBuilder::new_atomic();
             batch.with_account_id(account_id);
             self.limit_disk_quota(&mut batch, &account);
             let document_id = batch.reserve_document_id(account_id, Collection::ContactCard);

@@ -947,12 +947,21 @@ mod tests {
 #[cfg(test)]
 mod server_integration_tests {
     use super::*;
-    use common::{auth::AccessToken, test_utils::ServerFixture};
+    use common::{
+        auth::AccessToken, storage::index::ObjectIndexBuilder, test_utils::ServerFixture,
+    };
     use dav_proto::RequestHeaders;
-    use groupware::{DavResourceName, cache::GroupwareCache};
+    use groupware::{
+        DavResourceName,
+        cache::GroupwareCache,
+        file::{FileNode, FileNodeContent},
+    };
     use registry::schema::enums::{Permission, StorageQuota};
     use std::{future::Future, sync::Arc};
-    use store::{query::log::Query, write::LogCollection};
+    use store::{
+        query::log::Query,
+        write::{BatchBuilder, LogCollection},
+    };
     use types::collection::SyncCollection;
 
     const OP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1089,6 +1098,69 @@ mod server_integration_tests {
         )
         .await
         .expect("preload DAV resources")
+    }
+
+    async fn seed_large_file_directory(
+        server: &Server,
+        account_id: u32,
+        access_token: &AccessToken,
+        base: &str,
+        name: &str,
+        child_count: u32,
+    ) -> u32 {
+        let uri = format!("{base}{name}");
+        assert_eq!(
+            dispatch_status(
+                server,
+                access_token.clone(),
+                DavResourceName::File,
+                DavMethod::MKCOL,
+                &uri,
+                None,
+                None,
+                &[],
+                false,
+                false,
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        let resources = preload(server, account_id, SyncCollection::FileNode).await;
+        let parent_id = resources
+            .by_path(name)
+            .expect("find newly-created source directory")
+            .document_id()
+            + 1;
+
+        let mut batch = BatchBuilder::new();
+        let mut slots = batch
+            .reserve_document_ids(account_id, Collection::FileNode, child_count)
+            .iter();
+        for index in 0..child_count {
+            let node = FileNode {
+                parent_id,
+                name: format!("child-{index:04}"),
+                content: FileNodeContent::Directory,
+                ..Default::default()
+            };
+            batch
+                .with_account_id(account_id)
+                .with_collection(Collection::FileNode)
+                .create_document(slots.next().expect("reserved directory child ID"))
+                .custom(
+                    ObjectIndexBuilder::<(), _>::new()
+                        .with_changes(node)
+                        .with_changed_by(access_token.changed_by()),
+                )
+                .expect("index seeded directory child");
+        }
+        bounded(
+            server.store().write_batch(&mut batch),
+            "seed large directory children",
+        )
+        .await
+        .expect("write large directory children");
+        parent_id
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1592,6 +1664,225 @@ mod server_integration_tests {
                     "unexpected source retention after {method:?} collision"
                 );
             }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_directory_copy_and_move_collisions_are_atomic() {
+        let _test_lock = INTEGRATION_TEST_LOCK.lock().await;
+        const CHILD_COUNT: u32 = 1100;
+
+        let primary = bounded(ServerFixture::new(), "build large file DAV server").await;
+        let account_id = bounded(
+            primary.create_user_account("dav-large", "dav-large-collision.test"),
+            "seed large file DAV account",
+        )
+        .await;
+        let secondary = bounded(
+            primary.new_with_shared_primary(),
+            "build independent large file DAV server",
+        )
+        .await;
+        assert!(!Arc::ptr_eq(&primary.server.inner, &secondary.server.inner));
+        let resource = DavResourceName::File;
+        let base = resource.account_base_path("dav-large@dav-large-collision.test");
+        let access = token(account_id);
+
+        for method in [DavMethod::COPY, DavMethod::MOVE] {
+            let suffix = if matches!(method, DavMethod::COPY) {
+                "copy"
+            } else {
+                "move"
+            };
+            let target_parent = format!("target-parent-{suffix}");
+            assert_eq!(
+                dispatch_status(
+                    &primary.server,
+                    access.clone(),
+                    resource,
+                    DavMethod::MKCOL,
+                    &format!("{base}{target_parent}"),
+                    None,
+                    None,
+                    &[],
+                    false,
+                    false,
+                )
+                .await,
+                StatusCode::CREATED
+            );
+            let reference_source = format!("source-{suffix}-R");
+            let reference_target = format!("{target_parent}/target-{suffix}-0");
+            seed_large_file_directory(
+                &primary.server,
+                account_id,
+                &access,
+                &base,
+                &reference_source,
+                CHILD_COUNT,
+            )
+            .await;
+            let _ = preload(&primary.server, account_id, SyncCollection::FileNode).await;
+            let before_reference = stats(
+                &primary.server,
+                account_id,
+                SyncCollection::FileNode,
+                StorageQuota::MaxFiles,
+            )
+            .await;
+            let reference_status = dispatch_status(
+                &primary.server,
+                access.clone(),
+                resource,
+                method,
+                &format!("{base}{reference_source}"),
+                Some(&format!("{base}{reference_target}")),
+                None,
+                &[],
+                false,
+                true,
+            )
+            .await;
+            assert_eq!(reference_status, StatusCode::CREATED);
+            let after_reference = stats(
+                &primary.server,
+                account_id,
+                SyncCollection::FileNode,
+                StorageQuota::MaxFiles,
+            )
+            .await;
+            let expected_delta = (
+                after_reference.0 as isize - before_reference.0 as isize,
+                after_reference.1 as isize - before_reference.1 as isize,
+                after_reference.2 - before_reference.2,
+            );
+
+            let source_a = format!("source-{suffix}-A");
+            let source_b = format!("source-{suffix}-B");
+            seed_large_file_directory(
+                &primary.server,
+                account_id,
+                &access,
+                &base,
+                &source_a,
+                CHILD_COUNT,
+            )
+            .await;
+            seed_large_file_directory(
+                &primary.server,
+                account_id,
+                &access,
+                &base,
+                &source_b,
+                CHILD_COUNT,
+            )
+            .await;
+            let before_resources =
+                preload(&primary.server, account_id, SyncCollection::FileNode).await;
+            let before_stats = stats(
+                &primary.server,
+                account_id,
+                SyncCollection::FileNode,
+                StorageQuota::MaxFiles,
+            )
+            .await;
+            let _ = preload(&secondary.server, account_id, SyncCollection::FileNode).await;
+            crate::common::create::set_test_prepare_barrier(2);
+
+            let target_name = format!("target-{suffix}-1");
+            let target_uri = format!("{base}{target_parent}/{target_name}");
+            let source_a_uri = format!("{base}{source_a}");
+            let source_b_uri = format!("{base}{source_b}");
+            let first = dispatch_status(
+                &primary.server,
+                access.clone(),
+                resource,
+                method,
+                &source_a_uri,
+                Some(&target_uri),
+                None,
+                &[],
+                false,
+                true,
+            );
+            let second = dispatch_status(
+                &secondary.server,
+                access.clone(),
+                resource,
+                method,
+                &source_b_uri,
+                Some(&target_uri),
+                None,
+                &[],
+                false,
+                true,
+            );
+            let (first_status, second_status) = bounded(
+                async { tokio::join!(first, second) },
+                "large directory COPY/MOVE collision",
+            )
+            .await;
+            assert!(matches!(
+                (first_status, second_status),
+                (StatusCode::CREATED, StatusCode::PRECONDITION_FAILED)
+                    | (StatusCode::PRECONDITION_FAILED, StatusCode::CREATED)
+            ));
+
+            let after_resources =
+                preload(&secondary.server, account_id, SyncCollection::FileNode).await;
+            assert!(
+                after_resources
+                    .by_path(&format!("{target_parent}/{target_name}"))
+                    .is_some()
+            );
+            assert!(
+                after_resources
+                    .by_path(&format!("{target_parent}/{target_name}/child-0000"))
+                    .is_some()
+            );
+            assert!(
+                after_resources
+                    .by_path(&format!("{target_parent}/{target_name}/child-1099"))
+                    .is_some()
+            );
+
+            let (winner_source, loser_source) = if first_status == StatusCode::CREATED {
+                (&source_a, &source_b)
+            } else {
+                (&source_b, &source_a)
+            };
+            if matches!(method, DavMethod::COPY) {
+                assert!(after_resources.by_path(&source_a).is_some());
+                assert!(after_resources.by_path(&source_b).is_some());
+                assert_eq!(
+                    after_resources.resources.total,
+                    before_resources.resources.total + CHILD_COUNT as usize + 1
+                );
+            } else {
+                assert!(after_resources.by_path(winner_source).is_none());
+                assert!(after_resources.by_path(loser_source).is_some());
+                assert_eq!(
+                    after_resources.resources.total,
+                    before_resources.resources.total
+                );
+            }
+
+            let after_stats = stats(
+                &primary.server,
+                account_id,
+                SyncCollection::FileNode,
+                StorageQuota::MaxFiles,
+            )
+            .await;
+            assert_eq!(
+                (
+                    after_stats.0 as isize - before_stats.0 as isize,
+                    after_stats.1 as isize - before_stats.1 as isize,
+                    after_stats.2 - before_stats.2,
+                ),
+                expected_delta,
+                "the losing request added no resource, log, or quota effects"
+            );
         }
     }
 }

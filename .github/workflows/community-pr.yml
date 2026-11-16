@@ -52,6 +52,7 @@ jobs:
           cargo test --locked -p common --no-default-features masked
           cargo test --locked -p common --no-default-features network::masked::tests
           cargo test --locked -p jmap --no-default-features registry::tests::masked_email_is_forbidden_while_regular_objects_remain_available
+          cargo test --locked -p store --no-default-features atomic_builder_suppresses_splits_and_default_builder_still_splits
           cargo test --locked -p store --no-default-features --features sqlite masked_email_directory_record_persists_after_reopen
           cargo test --locked -p services --no-default-features community_account_cleanup_includes_masked_emails
           cargo test --locked -p groupware --no-default-features scheduling::inbound::rsvp_tests
