@@ -38,6 +38,11 @@ use std::{
 #[cfg(feature = "ai-spam-test-sqlite")]
 use store::Store;
 use store::write::{BatchBuilder, assert::AssertValue};
+#[cfg(feature = "ai-spam-test-sqlite")]
+use store::{
+    Subspace, ValueKey,
+    write::{AnyClass, ValueClass},
+};
 use tokio::sync::Semaphore;
 
 fn parse<'a>(raw: &'a [u8]) -> mail_parser::Message<'a> {
@@ -1132,12 +1137,66 @@ async fn shared_permit_pool_limits_old_and_new_runtime_configs_together() {
 }
 
 #[cfg(feature = "ai-spam-test-sqlite")]
-struct StoredValue;
+struct StoredBytes(Vec<u8>);
 
 #[cfg(feature = "ai-spam-test-sqlite")]
-impl store::Deserialize for StoredValue {
-    fn deserialize(_: &[u8]) -> trc::Result<Self> {
-        Ok(Self)
+impl store::Deserialize for StoredBytes {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
+        Ok(Self(bytes.to_vec()))
+    }
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+fn sqlite_value_key(class: ValueClass) -> ValueKey<ValueClass> {
+    ValueKey {
+        account_id: 0,
+        collection: 0,
+        document_id: 0,
+        class,
+    }
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+async fn sqlite_value(store: &Store, class: ValueClass) -> Option<Vec<u8>> {
+    store
+        .get_value::<StoredBytes>(sqlite_value_key(class))
+        .await
+        .expect("read SQLite Store value")
+        .map(|value| value.0)
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+fn sqlite_key_classes(key: &LedgerKey) -> (ValueClass, ValueClass) {
+    let template = reservation_write_plan(
+        key,
+        &PeriodControl::new(&key.billing_period, 0).expect("valid test billing period"),
+        None,
+        Snapshot::default(),
+        Snapshot::default(),
+    );
+    (template.period_class, template.ledger_class)
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+fn snapshot_after(snapshot: Snapshot, reservation: Reservation) -> Snapshot {
+    Snapshot {
+        requests: snapshot
+            .requests
+            .checked_add(reservation.requests)
+            .expect("test request total fits"),
+        input_tokens: snapshot
+            .input_tokens
+            .checked_add(reservation.input_tokens)
+            .expect("test input total fits"),
+        output_tokens: snapshot
+            .output_tokens
+            .checked_add(reservation.output_tokens)
+            .expect("test output total fits"),
+        cost_micros: snapshot
+            .cost_micros
+            .checked_add(reservation.cost_micros)
+            .expect("test cost total fits"),
+        version: snapshot.version.checked_add(1).expect("test version fits"),
     }
 }
 
@@ -1469,22 +1528,110 @@ async fn sqlite_failed_period_assertion_is_atomic_and_skips_provider() {
         server_id: "server-1".into(),
         billing_period: "2026-01".into(),
     };
-    let plan = reservation_write_plan(
-        &key,
-        &PeriodControl::new("2026-01", 0).unwrap(),
-        None,
-        Snapshot::default(),
+    let (period_class, ledger_class) = sqlite_key_classes(&key);
+    let budgets = Budgets {
+        requests: 10,
+        input_tokens: 100,
+        output_tokens: 100,
+        cost_micros: 100,
+    };
+    let first_charge = Reservation {
+        requests: 1,
+        input_tokens: 7,
+        output_tokens: 5,
+        cost_micros: 11,
+    };
+    let second_charge = Reservation {
+        requests: 1,
+        input_tokens: 13,
+        output_tokens: 17,
+        cost_micros: 19,
+    };
+    let third_charge = Reservation {
+        requests: 1,
+        input_tokens: 23,
+        output_tokens: 29,
+        cost_micros: 31,
+    };
+    assert_eq!(
+        ledger.reserve(key.clone(), budgets, first_charge).await,
+        ReserveOutcome::Reserved
+    );
+
+    let period_bytes = sqlite_value(&store, period_class.clone())
+        .await
+        .expect("initial active period persisted");
+    let actual_period = decode_period(&period_bytes).expect("decode initial active period");
+    assert_eq!(actual_period.period, "2026-01");
+    assert_eq!(actual_period.version, 0);
+    let first_bytes = sqlite_value(&store, ledger_class.clone())
+        .await
+        .expect("first charge persisted");
+    let first_snapshot = decode_snapshot(&first_bytes).expect("decode first charge");
+    assert_eq!(
+        first_snapshot,
         Snapshot {
             requests: 1,
-            input_tokens: config::MAX_INPUT_TOKENS,
-            output_tokens: config::MAX_OUTPUT_TOKENS,
-            cost_micros: 0,
+            input_tokens: 7,
+            output_tokens: 5,
+            cost_micros: 11,
             version: 1,
-        },
+        }
     );
-    let ledger_class = plan.ledger_class.clone();
+
+    let valid_plan = reservation_write_plan(
+        &key,
+        &actual_period,
+        Some(&first_bytes),
+        first_snapshot,
+        snapshot_after(first_snapshot, second_charge),
+    );
+    assert_eq!(
+        valid_plan.period_assertion,
+        AssertValue::U64(actual_period.version)
+    );
+    assert_eq!(
+        valid_plan.ledger_assertion,
+        AssertValue::U64(first_snapshot.version)
+    );
+    let mut valid_batch = BatchBuilder::new();
+    valid_plan.apply(&mut valid_batch);
+    store
+        .write_batch(&mut valid_batch)
+        .await
+        .expect("valid plan succeeds before rollover");
+
+    let second_bytes = sqlite_value(&store, ledger_class.clone())
+        .await
+        .expect("second charge persisted");
+    let second_snapshot = decode_snapshot(&second_bytes).expect("decode second charge");
+    assert_eq!(
+        second_snapshot,
+        snapshot_after(first_snapshot, second_charge)
+    );
+    let stale_period_plan = reservation_write_plan(
+        &key,
+        &actual_period,
+        Some(&second_bytes),
+        second_snapshot,
+        snapshot_after(second_snapshot, third_charge),
+    );
+    assert_eq!(
+        stale_period_plan.period_assertion,
+        AssertValue::U64(actual_period.version)
+    );
+    assert_eq!(
+        stale_period_plan.ledger_assertion,
+        AssertValue::U64(second_snapshot.version)
+    );
+
+    let sentinel_class = ValueClass::Any(AnyClass {
+        subspace: Subspace::System,
+        key: b"community-ai-spam-period-atomicity-sentinel".to_vec(),
+    });
     let mut stale_batch = BatchBuilder::new();
-    plan.apply(&mut stale_batch);
+    stale_batch.set(sentinel_class.clone(), b"sentinel".to_vec());
+    stale_period_plan.apply(&mut stale_batch);
     assert_eq!(
         ledger
             .rollover_period("server-1", Some("2026-01"), "2026-02")
@@ -1492,18 +1639,24 @@ async fn sqlite_failed_period_assertion_is_atomic_and_skips_provider() {
         ReserveOutcome::Reserved
     );
     assert!(store.write_batch(&mut stale_batch).await.is_err());
-    assert!(
-        store
-            .get_value::<StoredValue>(store::ValueKey {
-                account_id: 0,
-                collection: 0,
-                document_id: 0,
-                class: ledger_class,
-            })
-            .await
-            .expect("read stale batch ledger value")
-            .is_none()
+    assert!(sqlite_value(&store, sentinel_class).await.is_none());
+    assert_eq!(
+        decode_snapshot(
+            &sqlite_value(&store, ledger_class.clone())
+                .await
+                .expect("ledger snapshot remains present")
+        )
+        .expect("decode unchanged ledger snapshot"),
+        second_snapshot
     );
+    let rolled_period = decode_period(
+        &sqlite_value(&store, period_class)
+            .await
+            .expect("rolled period persisted"),
+    )
+    .expect("decode rolled period");
+    assert_eq!(rolled_period.period, "2026-02");
+    assert_eq!(rolled_period.version, actual_period.version + 1);
 
     let provider = fake_provider(ModelResult {
         verdict: Verdict::Spam,
@@ -1517,4 +1670,159 @@ async fn sqlite_failed_period_assertion_is_atomic_and_skips_provider() {
         ClassifyOutcome::Neutral(NeutralReason::LedgerUnavailable)
     );
     assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+#[tokio::test]
+async fn sqlite_stale_ledger_assertion_rolls_back_and_preserves_totals_across_reopen() {
+    let directory = SqliteTempDir::new();
+    let store = open_sqlite_store(&directory).await;
+    let ledger = Arc::new(StoreLedger::new(store.clone()));
+    let key = LedgerKey {
+        server_id: "server-ledger-cas".into(),
+        billing_period: "2026-01".into(),
+    };
+    let budgets = Budgets {
+        requests: 10,
+        input_tokens: 100,
+        output_tokens: 100,
+        cost_micros: 100,
+    };
+    let first_charge = Reservation {
+        requests: 1,
+        input_tokens: 7,
+        output_tokens: 5,
+        cost_micros: 11,
+    };
+    let committed_charge = Reservation {
+        requests: 1,
+        input_tokens: 13,
+        output_tokens: 17,
+        cost_micros: 19,
+    };
+    let stale_charge = Reservation {
+        requests: 1,
+        input_tokens: 23,
+        output_tokens: 29,
+        cost_micros: 31,
+    };
+    assert_eq!(
+        ledger
+            .rollover_period(&key.server_id, None, &key.billing_period)
+            .await,
+        ReserveOutcome::Reserved
+    );
+    assert_eq!(
+        ledger.reserve(key.clone(), budgets, first_charge).await,
+        ReserveOutcome::Reserved
+    );
+
+    let (period_class, ledger_class) = sqlite_key_classes(&key);
+    let period_bytes = sqlite_value(&store, period_class.clone())
+        .await
+        .expect("active period persisted");
+    let period = decode_period(&period_bytes).expect("decode active period");
+    assert_eq!(period.period, key.billing_period);
+    assert_eq!(period.version, 0);
+    let first_bytes = sqlite_value(&store, ledger_class.clone())
+        .await
+        .expect("first reservation persisted");
+    let first_snapshot = decode_snapshot(&first_bytes).expect("decode first reservation");
+    let expected_first = Snapshot {
+        requests: 1,
+        input_tokens: 7,
+        output_tokens: 5,
+        cost_micros: 11,
+        version: 1,
+    };
+    assert_eq!(first_snapshot, expected_first);
+
+    let stale_plan = reservation_write_plan(
+        &key,
+        &period,
+        Some(&first_bytes),
+        first_snapshot,
+        snapshot_after(first_snapshot, stale_charge),
+    );
+    assert_eq!(
+        stale_plan.period_assertion,
+        AssertValue::U64(period.version)
+    );
+    assert_eq!(
+        stale_plan.ledger_assertion,
+        AssertValue::U64(first_snapshot.version)
+    );
+    assert_eq!(
+        decode_snapshot(&stale_plan.ledger_value).expect("decode stale planned value"),
+        snapshot_after(first_snapshot, stale_charge)
+    );
+
+    assert_eq!(
+        ledger.reserve(key.clone(), budgets, committed_charge).await,
+        ReserveOutcome::Reserved
+    );
+    let current_period = decode_period(
+        &sqlite_value(&store, period_class.clone())
+            .await
+            .expect("active period remains persisted"),
+    )
+    .expect("decode unchanged active period");
+    assert_eq!(current_period.period, period.period);
+    assert_eq!(current_period.version, period.version);
+    let expected_current = Snapshot {
+        requests: 2,
+        input_tokens: 20,
+        output_tokens: 22,
+        cost_micros: 30,
+        version: 2,
+    };
+    let current_bytes = sqlite_value(&store, ledger_class.clone())
+        .await
+        .expect("second reservation persisted");
+    assert_eq!(
+        decode_snapshot(&current_bytes).expect("decode second reservation"),
+        expected_current
+    );
+
+    let sentinel_class = ValueClass::Any(AnyClass {
+        subspace: Subspace::System,
+        key: b"community-ai-spam-ledger-atomicity-sentinel".to_vec(),
+    });
+    let mut stale_batch = BatchBuilder::new();
+    stale_batch.set(sentinel_class.clone(), b"sentinel".to_vec());
+    stale_plan.apply(&mut stale_batch);
+    assert!(store.write_batch(&mut stale_batch).await.is_err());
+    assert!(sqlite_value(&store, sentinel_class).await.is_none());
+    assert_eq!(
+        decode_snapshot(
+            &sqlite_value(&store, ledger_class.clone())
+                .await
+                .expect("ledger snapshot remains present")
+        )
+        .expect("decode ledger snapshot after failed CAS"),
+        expected_current
+    );
+
+    drop(ledger);
+    drop(store);
+
+    let reopened_store = open_sqlite_store(&directory).await;
+    let (reopened_period_class, reopened_ledger_class) = sqlite_key_classes(&key);
+    let reopened_period = decode_period(
+        &sqlite_value(&reopened_store, reopened_period_class)
+            .await
+            .expect("active period survives reopen"),
+    )
+    .expect("decode reopened active period");
+    assert_eq!(reopened_period.period, key.billing_period);
+    assert_eq!(reopened_period.version, 0);
+    assert_eq!(
+        decode_snapshot(
+            &sqlite_value(&reopened_store, reopened_ledger_class)
+                .await
+                .expect("ledger totals survive reopen")
+        )
+        .expect("decode reopened ledger snapshot"),
+        expected_current
+    );
 }
