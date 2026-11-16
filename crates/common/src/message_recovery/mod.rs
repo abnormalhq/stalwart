@@ -649,9 +649,9 @@ impl RecoveryEngine {
         if raw.len() > MAX_BLOB_BYTES {
             return Err(RecoveryError::Invalid("source blob too large"));
         }
-        let source_format =
-            BlobFormat::of(&raw).ok_or(RecoveryError::Invalid("source blob encoding"))?;
-        if source_format.key_id == Some(self.recovery_key_id) {
+        if BlobFormat::of(&raw)
+            .is_some_and(|source_format| source_format.key_id == Some(self.recovery_key_id))
+        {
             return Err(RecoveryError::Invalid(
                 "recovery key must differ from source key",
             ));
