@@ -264,6 +264,13 @@ struct ScopeCaptureIndex {
     captures: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureListPage {
+    pub items: Vec<Manifest>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct SourceAssertion {
     pub account_id: u32,
@@ -580,6 +587,18 @@ impl RecoveryEngine {
             return Err(RecoveryError::Conflict("capture was permanently purged"));
         }
         let existing = self.read::<Manifest>(&manifest_key).await?;
+        let account_index = self.account_capture_index(&scope).await?;
+        if let Some((index, _)) = &account_index {
+            if index.captures.contains(&capture_id) != existing.is_some() {
+                return Err(RecoveryError::Conflict(
+                    "capture manifest and account index disagree",
+                ));
+            }
+        } else if existing.is_some() {
+            return Err(RecoveryError::Conflict(
+                "existing capture is missing its account index",
+            ));
+        }
         let mut registered_writer = false;
         if let Some((manifest, _)) = &existing {
             if manifest.state == ManifestState::Copying {
@@ -613,7 +632,15 @@ impl RecoveryEngine {
                 return Err(RecoveryError::Conflict("unowned recovery blob key exists"));
             }
             let index_key = account_capture_index_key(&scope)?;
-            let (mut index, index_bytes) = self.account_capture_index(&scope).await?;
+            let (mut index, index_bytes) = account_index.clone().unwrap_or_else(|| {
+                (
+                    ScopeCaptureIndex {
+                        scope: scope.clone(),
+                        captures: Vec::new(),
+                    },
+                    Vec::new(),
+                )
+            });
             if index.captures.contains(&capture_id) {
                 return Err(RecoveryError::Conflict(
                     "capture already exists in account index",
@@ -639,6 +666,7 @@ impl RecoveryEngine {
                 .ok_or(RecoveryError::QuotaExceeded)?;
             ledger.captures.push(capture_id.clone());
             index.captures.push(capture_id.clone());
+            index.captures.sort_unstable();
             let manifest = Manifest {
                 capture_id: capture_id.clone(),
                 capture_operation_id: request.metadata.operation_id.clone(),
@@ -672,9 +700,12 @@ impl RecoveryEngine {
             batch
                 .with_account_id(0)
                 .assert_value(value_class(&hold_key), record_revision(&hold_bytes)?);
-            batch
-                .with_account_id(0)
-                .assert_value(value_class(&index_key), record_revision(&index_bytes)?);
+            batch.with_account_id(0);
+            if index_bytes.is_empty() {
+                batch.assert_value(value_class(&index_key), ());
+            } else {
+                batch.assert_value(value_class(&index_key), record_revision(&index_bytes)?);
+            }
             let old_ledger_bytes = ledger_old.as_ref().map(|(_, bytes)| bytes.as_slice());
             let ledger_revision = next_record_revision(old_ledger_bytes)?;
             if let Some(bytes) = old_ledger_bytes {
@@ -698,7 +729,12 @@ impl RecoveryEngine {
             );
             batch.set(
                 value_class(&index_key),
-                encode_record(&index, next_record_revision(Some(&index_bytes))?)?,
+                encode_record(
+                    &index,
+                    next_record_revision(
+                        (!index_bytes.is_empty()).then_some(index_bytes.as_slice()),
+                    )?,
+                )?,
             );
             batch.set(value_class(&manifest_key), encode_record(&manifest, 1)?);
             if batch.has_commit_points() || batch.is_large_batch() {
@@ -843,108 +879,88 @@ impl RecoveryEngine {
         Ok(Some(decoded))
     }
 
+    /// Compatibility wrapper. Offset counts index slots, not visible items; use list_page to paginate.
     pub async fn list(
         &self,
         scope: &RecoveryScope,
         offset: usize,
         limit: usize,
     ) -> Result<Vec<Manifest>> {
-        if !valid_recovery_scope(scope) {
-            return Err(RecoveryError::Invalid("recovery scope"));
-        }
-        if limit == 0 || limit > 100 || offset > MAX_ITEMS_PER_SCOPE {
+        if offset > MAX_ITEMS_PER_SCOPE {
             return Err(RecoveryError::Invalid("list bounds"));
         }
-        let (index, _) = self.account_capture_index(scope).await?;
-        let mut out = Vec::with_capacity(limit);
-        let mut matched = 0usize;
-        for id in index.captures.iter().rev() {
-            let Some(item) = self.get(scope, id).await? else {
-                continue;
-            };
-            if matched < offset {
-                matched += 1;
-                continue;
-            }
-            out.push(item);
-            if out.len() == limit {
-                break;
+        let (index, _) = self.required_account_capture_index(scope).await?;
+        if offset >= index.captures.len() && offset != 0 {
+            return Ok(Vec::new());
+        }
+        let cursor = offset
+            .checked_sub(1)
+            .and_then(|slot| index.captures.get(slot));
+        Ok(self
+            .list_page(scope, cursor.map(String::as_str), limit)
+            .await?
+            .items)
+    }
+
+    pub async fn list_page(
+        &self,
+        scope: &RecoveryScope,
+        after_capture_id: Option<&str>,
+        limit: usize,
+    ) -> Result<CaptureListPage> {
+        if !valid_recovery_scope(scope)
+            || limit == 0
+            || limit > 100
+            || after_capture_id.is_some_and(|cursor| !is_valid_capture_id(cursor))
+        {
+            return Err(RecoveryError::Invalid("list page bounds"));
+        }
+        let (index, _) = self.required_account_capture_index(scope).await?;
+        let start = after_capture_id.map_or(0, |cursor| {
+            index
+                .captures
+                .partition_point(|capture_id| capture_id.as_str() <= cursor)
+        });
+        let end = start.saturating_add(limit).min(index.captures.len());
+        let candidates = index.captures[start..end].to_vec();
+        let has_more = end < index.captures.len();
+        let next_cursor = has_more.then(|| candidates.last().cloned()).flatten();
+        let mut items = Vec::with_capacity(candidates.len());
+        for capture_id in candidates {
+            if let Some(manifest) = self.get(scope, &capture_id).await?
+                && manifest.state == ManifestState::Preserved
+            {
+                items.push(manifest);
             }
         }
-        Ok(out)
+        Ok(CaptureListPage {
+            items,
+            next_cursor,
+            has_more,
+        })
     }
 
     async fn account_capture_index(
         &self,
         scope: &RecoveryScope,
-    ) -> Result<(ScopeCaptureIndex, Vec<u8>)> {
+    ) -> Result<Option<(ScopeCaptureIndex, Vec<u8>)>> {
         let index_key = account_capture_index_key(scope)?;
         if let Some((index, bytes)) = self.read::<ScopeCaptureIndex>(&index_key).await? {
             validate_account_capture_index(scope, &index)?;
-            return Ok((index, bytes));
+            return Ok(Some((index, bytes)));
         }
+        Ok(None)
+    }
 
-        let ledger_key = quota_key(scope)?;
-        let ledger = self.read::<ScopeLedger>(&ledger_key).await?;
-        let mut captures = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        if let Some((ledger, _)) = &ledger {
-            if ledger.captures.len() > MAX_ITEMS_PER_SCOPE {
-                return Err(RecoveryError::Conflict(
-                    "tenant ledger exceeds capture bound",
-                ));
-            }
-            for capture_id in &ledger.captures {
-                if !is_valid_capture_id(capture_id) || !seen.insert(capture_id.as_str()) {
-                    return Err(RecoveryError::Conflict(
-                        "tenant ledger capture id is invalid",
-                    ));
-                }
-                let manifest_key = scoped_key(b"manifest", scope, capture_id)?;
-                if let Some((manifest, _)) = self.read::<Manifest>(&manifest_key).await? {
-                    if manifest.scope != *scope || manifest.capture_id != *capture_id {
-                        return Err(RecoveryError::Conflict(
-                            "tenant ledger manifest scope mismatch",
-                        ));
-                    }
-                    captures.push(capture_id.clone());
-                }
-            }
-        }
-        let index = ScopeCaptureIndex {
-            scope: scope.clone(),
-            captures,
-        };
-        validate_account_capture_index(scope, &index)?;
-
-        let mut batch = BatchBuilder::new();
-        if let Some((_, bytes)) = &ledger {
-            batch
-                .with_account_id(0)
-                .assert_value(value_class(&ledger_key), record_revision(bytes)?);
-        } else {
-            batch
-                .with_account_id(0)
-                .assert_value(value_class(&ledger_key), ());
-        }
-        self.append_cas(&mut batch, &index_key, None, &index)?;
-        if batch.has_commit_points() || batch.is_large_batch() {
-            return Err(RecoveryError::BatchTooLarge);
-        }
-        if let Err(error) = self.metadata.write_batch(&mut batch).await {
-            if let Some((index, bytes)) = self.read::<ScopeCaptureIndex>(&index_key).await? {
-                validate_account_capture_index(scope, &index)?;
-                return Ok((index, bytes));
-            }
-            return Err(error.into());
-        }
-        self.read::<ScopeCaptureIndex>(&index_key)
+    async fn required_account_capture_index(
+        &self,
+        scope: &RecoveryScope,
+    ) -> Result<(ScopeCaptureIndex, Vec<u8>)> {
+        self.account_capture_index(scope)
             .await?
-            .ok_or(RecoveryError::Conflict("account capture index disappeared"))
-            .and_then(|(index, bytes)| {
-                validate_account_capture_index(scope, &index)?;
-                Ok((index, bytes))
-            })
+            .ok_or(RecoveryError::Conflict(
+                "account capture index is not initialized",
+            ))
     }
 
     async fn read<T: for<'de> Deserialize<'de>>(&self, key: &[u8]) -> Result<Option<(T, Vec<u8>)>> {
@@ -1146,6 +1162,7 @@ fn validate_account_capture_index(scope: &RecoveryScope, index: &ScopeCaptureInd
     let mut seen = std::collections::HashSet::new();
     if index.scope != *scope
         || index.captures.len() > MAX_ITEMS_PER_SCOPE
+        || index.captures.windows(2).any(|pair| pair[0] >= pair[1])
         || index
             .captures
             .iter()

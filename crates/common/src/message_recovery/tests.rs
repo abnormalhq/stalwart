@@ -2069,6 +2069,19 @@ async fn cleanup_skips_copying_and_expired_preserved_records_under_hold() {
         )
         .await
         .unwrap();
+    let index_key = account_capture_index_key(&scope).unwrap();
+    let (mut index, index_bytes) = fixture
+        .engine
+        .read::<ScopeCaptureIndex>(&index_key)
+        .await
+        .unwrap()
+        .unwrap();
+    index.captures.push(copying_id.clone());
+    fixture
+        .engine
+        .cas_write(&index_key, Some(&index_bytes), &index)
+        .await
+        .unwrap();
 
     let copying_report = fixture
         .engine
@@ -2223,6 +2236,22 @@ async fn cleanup_cursor_reaches_old_expired_records_and_excludes_other_scopes() 
         )
         .await
         .unwrap();
+    let index_key = account_capture_index_key(&scope).unwrap();
+    let (mut index, index_bytes) = fixture
+        .engine
+        .read::<ScopeCaptureIndex>(&index_key)
+        .await
+        .unwrap()
+        .unwrap();
+    index.captures = (0..230)
+        .filter(|index| *index != 10)
+        .map(|index| format!("{index:064x}"))
+        .collect();
+    fixture
+        .engine
+        .cas_write(&index_key, Some(&index_bytes), &index)
+        .await
+        .unwrap();
 
     let first = fixture
         .engine
@@ -2350,6 +2379,8 @@ async fn account_capture_index_bounds_listing_and_cleanup_for_interleaved_accoun
         .0;
     assert_eq!(ledger.captures.len(), 42);
     assert_eq!(ledger.charged_bytes, total_charged);
+    let mut expected_account_a_ids = vec![first_a_id, second_a_id.clone()];
+    expected_account_a_ids.sort_unstable();
     assert_eq!(
         fixture
             .engine
@@ -2359,7 +2390,7 @@ async fn account_capture_index_bounds_listing_and_cleanup_for_interleaved_accoun
             .unwrap()
             .0
             .captures,
-        vec![first_a_id, second_a_id.clone()]
+        expected_account_a_ids
     );
     assert_eq!(
         fixture
@@ -2375,9 +2406,10 @@ async fn account_capture_index_bounds_listing_and_cleanup_for_interleaved_accoun
     );
 
     fixture.engine.reset_read_count();
-    let listed = fixture.engine.list(&scope_a, 0, 1).await.unwrap();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].capture_id, second_a_id);
+    let listed = fixture.engine.list_page(&scope_a, None, 1).await.unwrap();
+    assert!(listed.items.is_empty());
+    assert!(listed.has_more);
+    assert!(listed.next_cursor.is_some());
     assert_eq!(fixture.engine.read_count(), 2);
 
     fixture.engine.reset_read_count();
@@ -2423,11 +2455,17 @@ async fn tenant_capture_limit_and_byte_charge_remain_aggregate_across_account_in
         .map(|index| format!("{index:064x}"))
         .collect::<Vec<_>>();
     let split = MAX_ITEMS_PER_SCOPE / 2;
+    let (_, account_a_index_revision) = fixture
+        .engine
+        .read::<ScopeCaptureIndex>(&account_capture_index_key(&scope_a).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
     fixture
         .engine
         .cas_write(
             &account_capture_index_key(&scope_a).unwrap(),
-            None,
+            Some(&account_a_index_revision),
             &ScopeCaptureIndex {
                 scope: scope_a.clone(),
                 captures: captures[..split].to_vec(),
@@ -2513,9 +2551,15 @@ async fn ephemeral_account_capture_index_cas_race_keeps_one_writer() {
         scope: scope.clone(),
         captures: vec![format!("{:064x}", 1)],
     };
+    let (_, revision) = fixture
+        .engine
+        .read::<ScopeCaptureIndex>(&index_key)
+        .await
+        .unwrap()
+        .unwrap();
     fixture
         .engine
-        .cas_write(&index_key, None, &initial)
+        .cas_write(&index_key, Some(&revision), &initial)
         .await
         .unwrap();
     let (_, revision) = fixture
@@ -2559,4 +2603,104 @@ async fn ephemeral_account_capture_index_cas_race_keeps_one_writer() {
             .0,
         expected
     );
+}
+
+#[tokio::test]
+async fn empty_account_page_does_not_probe_large_tenant_ledger() {
+    let fixture = lifecycle_fixture().await;
+    let mut other_scope = fixture.account.scope().clone();
+    other_scope.account_id = "8".into();
+    let other = VerifiedAccountMapping::from_verified_binding(other_scope.clone(), 8).unwrap();
+    fixture.engine.activate_account(&other).await.unwrap();
+    fixture
+        .engine
+        .cas_write(
+            &quota_key(fixture.account.scope()).unwrap(),
+            None,
+            &ScopeLedger {
+                charged_bytes: 123,
+                captures: (0..MAX_ITEMS_PER_SCOPE)
+                    .map(|index| format!("{index:064x}"))
+                    .collect(),
+            },
+        )
+        .await
+        .unwrap();
+
+    fixture.engine.reset_read_count();
+    let page = fixture
+        .engine
+        .list_page(&other_scope, None, 100)
+        .await
+        .unwrap();
+    assert!(page.items.is_empty());
+    assert!(!page.has_more);
+    assert_eq!(page.next_cursor, None);
+    assert_eq!(fixture.engine.read_count(), 1);
+}
+
+#[tokio::test]
+async fn capture_page_cursor_advances_across_nonvisible_index_slots() {
+    let fixture = lifecycle_fixture().await;
+    let scope = fixture.account.scope().clone();
+    let ids = (0..MAX_ITEMS_PER_SCOPE)
+        .map(|index| format!("{index:064x}"))
+        .collect::<Vec<_>>();
+    let index_key = account_capture_index_key(&scope).unwrap();
+    let (_, revision) = fixture
+        .engine
+        .read::<ScopeCaptureIndex>(&index_key)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .engine
+        .cas_write(
+            &index_key,
+            Some(&revision),
+            &ScopeCaptureIndex {
+                scope: scope.clone(),
+                captures: ids.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    for chunk in ids.chunks(100) {
+        let mut batch = BatchBuilder::new();
+        for capture_id in chunk {
+            let manifest = synthetic_manifest(
+                scope.clone(),
+                capture_id.clone(),
+                ManifestState::Copying,
+                1,
+                None,
+                0,
+                1,
+            );
+            batch.with_account_id(0).set(
+                value_class(&scoped_key(b"manifest", &scope, capture_id).unwrap()),
+                encode_record(&manifest, 1).unwrap(),
+            );
+        }
+        fixture.metadata.write_batch(&mut batch).await.unwrap();
+    }
+
+    fixture.engine.reset_read_count();
+    let first = fixture.engine.list_page(&scope, None, 100).await.unwrap();
+    assert!(first.items.is_empty());
+    assert!(first.has_more);
+    assert_eq!(first.next_cursor.as_deref(), Some(ids[99].as_str()));
+    assert_eq!(fixture.engine.read_count(), 101);
+
+    fixture.engine.reset_read_count();
+    let second = fixture
+        .engine
+        .list_page(&scope, first.next_cursor.as_deref(), 100)
+        .await
+        .unwrap();
+    assert!(second.items.is_empty());
+    assert!(second.has_more);
+    assert_eq!(second.next_cursor.as_deref(), Some(ids[199].as_str()));
+    assert_eq!(fixture.engine.read_count(), 101);
 }

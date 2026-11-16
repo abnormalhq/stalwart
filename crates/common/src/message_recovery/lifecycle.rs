@@ -311,6 +311,8 @@ impl RecoveryEngine {
             return Err(RecoveryError::Invalid("account lifecycle binding"));
         }
         let key = account_lifecycle_key(scope)?;
+        let index_key = account_capture_index_key(scope)?;
+        let index_current = self.account_capture_index(scope).await?;
         let current = self.read::<AccountLifecycleControl>(&key).await?;
         match current {
             Some((control, _))
@@ -318,7 +320,9 @@ impl RecoveryEngine {
                     && control.store_account_id == account.store_account_id()
                     && control.state == AccountLifecycleState::Live =>
             {
-                Ok(())
+                index_current.map(|_| ()).ok_or(RecoveryError::Conflict(
+                    "live account is missing its capture index",
+                ))
             }
             Some((control, _)) if control.state == AccountLifecycleState::Retired => {
                 Err(RecoveryError::Conflict("account generation is retired"))
@@ -333,7 +337,26 @@ impl RecoveryEngine {
                     state: AccountLifecycleState::Live,
                     pending_restores: 0,
                 };
-                self.cas_write(&key, None, &control).await
+                let (index, index_bytes) = index_current.unwrap_or_else(|| {
+                    (
+                        ScopeCaptureIndex {
+                            scope: scope.clone(),
+                            captures: Vec::new(),
+                        },
+                        Vec::new(),
+                    )
+                });
+                let mut batch = BatchBuilder::new();
+                self.append_cas(&mut batch, &key, None, &control)?;
+                self.append_cas(
+                    &mut batch,
+                    &index_key,
+                    (!index_bytes.is_empty()).then_some(&index_bytes),
+                    &index,
+                )?;
+                ensure_single_segment(&batch)?;
+                self.metadata.write_batch(&mut batch).await?;
+                Ok(())
             }
         }
     }
@@ -836,25 +859,21 @@ impl RecoveryEngine {
         if let Some(cursor) = after_capture_id {
             validate_capture_id(cursor)?;
         }
-        let (index, _) = self.account_capture_index(scope).await?;
+        let (index, _) = self.required_account_capture_index(scope).await?;
         if index.captures.len() > MAX_ITEMS_PER_SCOPE {
             return Err(RecoveryError::Conflict(
                 "account capture index exceeds capture bound",
             ));
         }
-        let mut capture_ids = index.captures;
-        capture_ids.sort_unstable();
-        let mut page = capture_ids
-            .into_iter()
-            .filter(|id| after_capture_id.is_none_or(|cursor| id.as_str() > cursor))
-            .take(limit + 1)
-            .collect::<Vec<_>>();
-        let has_more = page.len() > limit;
-        if has_more {
-            page.pop();
-        }
-        let next_cursor = has_more.then(|| page.last().cloned()).flatten();
-        let candidates = page;
+        let start = after_capture_id.map_or(0, |cursor| {
+            index
+                .captures
+                .partition_point(|capture_id| capture_id.as_str() <= cursor)
+        });
+        let end = start.saturating_add(limit).min(index.captures.len());
+        let candidates = index.captures[start..end].to_vec();
+        let has_more = end < index.captures.len();
+        let next_cursor = has_more.then(|| candidates.last().cloned()).flatten();
         let mut report = CleanupReport {
             examined: 0,
             skipped: 0,
@@ -957,6 +976,12 @@ impl RecoveryEngine {
                 .ok_or(RecoveryError::NotFound)?;
             if manifest.scope != request.scope || manifest.capture_id != request.capture_id {
                 return Err(RecoveryError::Conflict("purge capture scope mismatch"));
+            }
+            let (index, _) = self.required_account_capture_index(scope).await?;
+            if !index.captures.contains(&request.capture_id) {
+                return Err(RecoveryError::Conflict(
+                    "capture missing from account index",
+                ));
             }
             if cleanup {
                 let grace = grace_seconds.ok_or(RecoveryError::Invalid("cleanup grace"))?;
@@ -1142,7 +1167,7 @@ impl RecoveryEngine {
             .await?
             .ok_or(RecoveryError::Conflict("purge ledger disappeared"))?;
         let index_key = account_capture_index_key(scope)?;
-        let (mut index, index_bytes) = self.account_capture_index(scope).await?;
+        let (mut index, index_bytes) = self.required_account_capture_index(scope).await?;
         let (job, job_bytes) = self
             .read::<PurgeJob>(job_key)
             .await?
