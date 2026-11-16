@@ -452,6 +452,7 @@ fn synthetic_manifest(
         state,
         original_blob_key: format!("original-{capture_id}").into_bytes(),
         recovery_blob_key: format!("recovery-{capture_id}").into_bytes(),
+        stored_recovery_key_id: Some(2),
         source_account_id,
         source_collection: Collection::Email as u8,
         source_document_id: 42,
@@ -1841,6 +1842,111 @@ async fn delayed_same_operation_capture_retry_starts_retention_at_deletion_barri
     assert_eq!(preserved.created_at, 10);
     assert_eq!(preserved.deleted_at, Some(200));
     assert_eq!(preserved.expires_at, 200 + 30 * 86_400);
+}
+
+#[tokio::test]
+async fn retained_recovery_key_allows_staging_retry_and_preserved_read_after_rotation() {
+    let fixture = lifecycle_fixture().await;
+    let request = capture_request(&fixture, "key-rotation", 10);
+    let first = fixture
+        .engine
+        .prepare_capture(request.clone(), &fixture.source_blobs, &fixture.source_keys)
+        .await
+        .unwrap();
+    let capture_id = first.manifest().capture_id.clone();
+    let blob_key = first.manifest().recovery_blob_key.clone();
+    assert_eq!(first.manifest().stored_recovery_key_id, Some(2));
+    let source_payload = fixture
+        .source_blobs
+        .get_raw_blob(&fixture.source_blob_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let old_blob = fixture
+        .recovery_blobs
+        .get_raw_blob(&blob_key)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let new_key = Arc::new(BlobKey::new(
+        3,
+        SymmetricCipher::Aes256Gcm,
+        &[3; BLOB_KEY_LEN],
+    ));
+    let rotated = RecoveryEngine::new_for_test(
+        fixture.metadata.clone(),
+        fixture.recovery_blobs.clone(),
+        BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(new_key.clone())),
+        BlobKeyring::new(vec![fixture.recovery_key.clone(), new_key.clone()]),
+    )
+    .unwrap();
+    let retry = rotated
+        .prepare_capture(request.clone(), &fixture.source_blobs, &fixture.source_keys)
+        .await
+        .unwrap();
+    assert_eq!(retry.manifest().stored_recovery_key_id, Some(2));
+    assert_eq!(
+        fixture
+            .recovery_blobs
+            .get_raw_blob(&blob_key)
+            .await
+            .unwrap()
+            .unwrap(),
+        old_blob
+    );
+
+    let unavailable = RecoveryEngine::new_for_test(
+        fixture.metadata.clone(),
+        fixture.recovery_blobs.clone(),
+        BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(new_key.clone())),
+        BlobKeyring::new(vec![new_key]),
+    )
+    .unwrap();
+    assert!(matches!(
+        unavailable
+            .prepare_capture(request, &fixture.source_blobs, &fixture.source_keys,)
+            .await,
+        Err(RecoveryError::BlobMismatch)
+    ));
+
+    let mut delete_batch = BatchBuilder::new();
+    retry.append_to_delete_batch(&mut delete_batch, 11).unwrap();
+    delete_batch
+        .with_account_id(fixture.account.store_account_id())
+        .with_collection(Collection::Email)
+        .with_document(42)
+        .clear(ValueClass::Property(Field::ARCHIVE.into()));
+    fixture
+        .metadata
+        .write_batch(&mut delete_batch)
+        .await
+        .unwrap();
+    assert_eq!(
+        rotated
+            .get_payload(fixture.account.scope(), &capture_id)
+            .await
+            .unwrap(),
+        Some(source_payload)
+    );
+    assert!(matches!(
+        unavailable
+            .get_payload(fixture.account.scope(), &capture_id)
+            .await,
+        Err(RecoveryError::BlobMismatch)
+    ));
+
+    fixture
+        .recovery_blobs
+        .put_blob(&blob_key, &fixture.message, &BlobOpts::PLAIN)
+        .await
+        .unwrap();
+    assert!(matches!(
+        rotated
+            .get_payload(fixture.account.scope(), &capture_id)
+            .await,
+        Err(RecoveryError::BlobMismatch)
+    ));
 }
 
 #[tokio::test]

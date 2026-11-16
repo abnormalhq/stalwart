@@ -213,6 +213,8 @@ pub struct Manifest {
     pub state: ManifestState,
     pub original_blob_key: Vec<u8>,
     pub recovery_blob_key: Vec<u8>,
+    #[serde(default)]
+    pub stored_recovery_key_id: Option<u32>,
     pub source_account_id: u32,
     pub source_collection: u8,
     pub source_document_id: u32,
@@ -615,6 +617,7 @@ impl RecoveryEngine {
                 state: ManifestState::Copying,
                 original_blob_key: request.original_blob_key.clone(),
                 recovery_blob_key: storage_key.clone(),
+                stored_recovery_key_id: Some(self.recovery_key_id),
                 source_account_id: request.source.account_id,
                 source_collection: request.source.collection as u8,
                 source_document_id: request.source.document_id,
@@ -700,7 +703,12 @@ impl RecoveryEngine {
             .await?
             .ok_or(RecoveryError::BlobMissing)?;
         let format = BlobFormat::of(&stored).ok_or(RecoveryError::BlobMismatch)?;
-        if format.key_id != Some(self.recovery_key_id) {
+        let stored_key_id = format.key_id.ok_or(RecoveryError::BlobMismatch)?;
+        if staging
+            .stored_recovery_key_id
+            .is_some_and(|key_id| key_id != stored_key_id)
+            || self.keys.get(stored_key_id).is_none()
+        {
             return Err(RecoveryError::BlobMismatch);
         }
         let stored_size = stored.len() as u64;
@@ -736,6 +744,7 @@ impl RecoveryEngine {
         if ready.state != ManifestState::Staging {
             return Err(RecoveryError::Conflict("capture is not verified staging"));
         }
+        ready.stored_recovery_key_id = Some(stored_key_id);
         ready.state = ManifestState::Preserved;
         Ok(PreparedCapture {
             policy_key,
@@ -778,7 +787,12 @@ impl RecoveryEngine {
             .await?
             .ok_or(RecoveryError::BlobMissing)?;
         let format = BlobFormat::of(&stored).ok_or(RecoveryError::BlobMismatch)?;
-        if format.key_id != Some(self.recovery_key_id) {
+        let stored_key_id = format.key_id.ok_or(RecoveryError::BlobMismatch)?;
+        if manifest
+            .stored_recovery_key_id
+            .is_some_and(|key_id| key_id != stored_key_id)
+            || self.keys.get(stored_key_id).is_none()
+        {
             return Err(RecoveryError::BlobMismatch);
         }
         if stored.len() as u64 != manifest.stored_size {
