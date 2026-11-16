@@ -1247,7 +1247,9 @@ fn build_rsvp_invitation(
             ICalendarProperty::Summary => invitation.summary = Some(value),
             ICalendarProperty::Description => invitation.description = Some(value),
             ICalendarProperty::Location => invitation.location = Some(value),
-            ICalendarProperty::Rrule => invitation.recurrence = Some(value),
+            ICalendarProperty::Rrule if invitation.recurrence.is_none() => {
+                invitation.recurrence = Some(value)
+            }
             ICalendarProperty::Dtstart if invitation.when.is_none() => {
                 invitation.when = Some(value)
             }

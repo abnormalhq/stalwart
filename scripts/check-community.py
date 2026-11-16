@@ -6,6 +6,8 @@ from __future__ import annotations
 import base64
 import binascii
 import gzip
+import hashlib
+import json
 import re
 import subprocess
 import tomllib
@@ -52,6 +54,88 @@ def check_enterprise_feature_guard() -> None:
         raise SystemExit("Enterprise feature-tree guard accepted a synthetic Enterprise feature.")
 
 
+def check_masked_address_gate() -> None:
+    masked = read("crates/common/src/network/masked.rs")
+    require(
+        re.search(r"pub const MASKED_ADDRESS_ROUTING_AVAILABLE: bool = false;", masked) is not None,
+        "Native masked-address routing must remain server-disabled by a literal false gate.",
+    )
+    wrapper = re.search(r"pub fn parse_for_routing\(.*?\n    }", masked, re.DOTALL)
+    require(wrapper is not None, "Masked-address routing parser is missing.")
+    require(
+        wrapper.group(0).index("MASKED_ADDRESS_ROUTING_AVAILABLE")
+        < wrapper.group(0).index("Self::parse(local_part)"),
+        "Masked-address routing must check availability before decoding.",
+    )
+
+    for path in (
+        "crates/common/src/network/mta.rs",
+        "crates/common/src/cache/principals.rs",
+    ):
+        source = read(path)
+        require(
+            "MaskedAddress::parse_for_routing(local_part.as_ref())" in source,
+            f"Masked routing must handle borrowed and owned local parts: {path}",
+        )
+        parser = source.find("MaskedAddress::parse_for_routing(")
+        registry = source.find(".object::<MaskedEmail>", parser)
+        require(parser >= 0 and registry > parser, f"Masked routing call is missing or reordered: {path}")
+        gate = source.rfind('#[cfg(not(feature = "enterprise"))]', 0, parser)
+        require(gate >= 0 and parser - gate < 1000, f"Community-only masked routing gate is missing: {path}")
+
+    availability = read("crates/jmap/src/registry/mod.rs")
+    for required in (
+        "ObjectType::MaskedEmail",
+        "MASKED_ADDRESS_ROUTING_AVAILABLE",
+        "trc::JmapEvent::Forbidden",
+    ):
+        require(required in availability, f"Community MaskedEmail availability guard is missing: {required}")
+    for path in (
+        "crates/jmap/src/registry/get.rs",
+        "crates/jmap/src/registry/query.rs",
+        "crates/jmap/src/registry/set.rs",
+    ):
+        source = read(path)
+        guard = source.find("self.assert_enterprise_object(object_type)?;")
+        dispatch = source.find("match object_type", guard)
+        require(guard >= 0 and dispatch > guard, f"Registry access guard must precede dispatch: {path}")
+
+
+def check_community_schema_contract() -> None:
+    compressed = (ROOT / "resources/schema/schema_oss.json.gz").read_bytes()
+    checksum = read("resources/schema/schema_oss.json.sha256").strip()
+    expected_checksum = base64.urlsafe_b64encode(hashlib.sha256(compressed).digest()).decode().rstrip("=")
+    require(checksum == expected_checksum, "Community OSS schema checksum does not match its compressed asset.")
+
+    schema = json.loads(gzip.decompress(compressed))
+    fields = schema.get("fields", {})
+    netcup = fields.get("x:DnsServerNetcup", {}).get("properties", {})
+    require("apiKey" in netcup, "Community OSS schema is missing the Netcup apiKey field.")
+    require(
+        not {"apiKeyId", "customerNumber", "password"}.intersection(netcup),
+        "Community OSS schema still advertises obsolete Netcup authentication fields.",
+    )
+
+    for object_name in ("x:DmarcTroubleshoot", "x:SpamClassify"):
+        mail_from = fields.get(object_name, {}).get("properties", {}).get("mailFrom", {})
+        require(
+            mail_from.get("type", {}).get("nullable") is True,
+            f"Community OSS schema must mark {object_name}.mailFrom nullable.",
+        )
+
+    parameters = schema.get("enums", {}).get("SpamClassifyParameters", [])
+    require(
+        [parameter.get("name") for parameter in parameters]
+        == ["bit7", "bit8Mime", "binaryMime", "smtpUtf8"],
+        "Community OSS schema has an incorrect SpamClassifyParameters enum.",
+    )
+    bit8_mime = next(parameter for parameter in parameters if parameter.get("name") == "bit8Mime")
+    require(
+        bit8_mime.get("label") == "8-bit MIME message content",
+        "Community OSS schema has an incorrect bit8Mime label.",
+    )
+
+
 def main() -> None:
     main_manifest = tomllib.loads(read("crates/main/Cargo.toml"))
     http_manifest = tomllib.loads(read("crates/http/Cargo.toml"))
@@ -85,7 +169,10 @@ def main() -> None:
                 require("enterprise" not in line, f"Docker compile command enables Enterprise: {line.strip()}")
 
     check_enterprise_feature_guard()
+    check_masked_address_gate()
+    check_community_schema_contract()
     print("Synthetic Enterprise feature-tree guard rejection passed.")
+    print("Community OSS schema checksum and v1.1.1 contract checks passed.")
     default_tree = cargo_tree("-e", "features")
     require_no_enterprise_feature(default_tree, "Default Stalwart")
     scim_package = r"\bscim v[^\n]*[/\\]crates[/\\]scim(?:\)|$)"
@@ -173,6 +260,14 @@ def main() -> None:
     community_ci = read(".github/workflows/community-pr.yml")
     require("contents: read" in community_ci and "write" not in community_ci,
             "Community PR CI must use read-only permissions.")
+    require(
+        "pull_request:\n    branches: [main, devin/1794777185-community-debranding]" in community_ci,
+        "Community PR CI must also run for the PR1 debranding target branch.",
+    )
+    require(
+        "push:\n    branches: [main]" in community_ci,
+        "Community push CI must remain restricted to main.",
+    )
 
     capabilities = read("crates/jmap-proto/src/request/capability.rs")
     for urn in (

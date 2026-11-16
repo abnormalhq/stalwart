@@ -39,6 +39,15 @@ use store::{
 use trc::{AddContext, SpamEvent};
 use utils::DomainPart;
 
+#[cfg(not(feature = "enterprise"))]
+use crate::network::masked::MaskedAddress;
+#[cfg(not(feature = "enterprise"))]
+use registry::schema::structs::MaskedEmail;
+#[cfg(not(feature = "enterprise"))]
+use store::write::now;
+#[cfg(not(feature = "enterprise"))]
+use types::id::Id;
+
 // SPDX-SnippetBegin
 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
 // SPDX-License-Identifier: LicenseRef-SEL
@@ -122,6 +131,33 @@ impl Server {
             };
         }
         // SPDX-SnippetEnd
+
+        #[cfg(not(feature = "enterprise"))]
+        if let Some(masked_id) = MaskedAddress::parse_for_routing(local_part.as_ref())
+            && let Some(masked_entry) = self
+                .registry()
+                .object::<MaskedEmail>(Id::new(masked_id))
+                .await
+                .caused_by(trc::location!())?
+        {
+            return if masked_entry.enable
+                && masked_entry
+                    .expires_at
+                    .is_none_or(|at| at.timestamp() > now() as i64)
+                && let Some(account) = self
+                    .try_account(masked_entry.account_id.document_id())
+                    .await
+                    .caused_by(trc::location!())?
+                && account
+                    .addresses
+                    .iter()
+                    .any(|addr| addr.domain_id == domain.id)
+            {
+                Ok(RcptResolution::Rewrite(account.name().to_string()))
+            } else {
+                Ok(RcptResolution::UnknownRecipient)
+            };
+        }
 
         // Obtain external directory, if configured
         let directory = self

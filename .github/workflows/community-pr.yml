@@ -2,7 +2,7 @@ name: Community PR CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, devin/1794777185-community-debranding]
   push:
     branches: [main]
 
@@ -46,7 +46,10 @@ jobs:
       - name: Run Community route tests
         run: |
           cargo test --locked -p common --no-default-features community_
-          cargo test --locked -p http@1.1.0 --no-default-features community_redirect_tests
+          cargo test --locked -p common --no-default-features network::masked::tests
+          cargo test --locked -p jmap --no-default-features registry::tests::masked_email_is_forbidden_while_regular_objects_remain_available
+          cargo test --locked -p groupware --no-default-features scheduling::inbound::rsvp_tests
+          cargo test --locked -p http@1.1.1 --no-default-features community_redirect_tests
 
       - name: Run image-size regression tests
         run: cargo test --locked -p spam-filter --no-default-features analysis::image_size::tests

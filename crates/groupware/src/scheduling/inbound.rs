@@ -512,11 +512,10 @@ impl EntryChange {
         let mut changes = Vec::new();
         let itip_component = itip_snapshot.comp;
         let changed_part_stat = attendee.part_stat != updated_attendee.part_stat;
-        let changed_rsvp = attendee.rsvp != updated_attendee.rsvp;
         let changed_delegated_to = attendee.delegated_to != updated_attendee.delegated_to;
         let has_request_status = !itip_snapshot.request_status.is_empty();
 
-        if changed_part_stat || changed_rsvp || changed_delegated_to || has_request_status {
+        if changed_part_stat || changed_delegated_to || has_request_status {
             // Update participant status
             let mut add_parameters = Vec::new();
             let mut remove_parameters = Vec::new();
@@ -524,13 +523,6 @@ impl EntryChange {
                 remove_parameters.push(ICalendarParameterName::Partstat);
                 if let Some(part_stat) = updated_attendee.part_stat {
                     add_parameters.push(ICalendarParameter::partstat(part_stat.clone()));
-                }
-            }
-
-            if changed_rsvp {
-                remove_parameters.push(ICalendarParameterName::Rsvp);
-                if let Some(rsvp) = updated_attendee.rsvp {
-                    add_parameters.push(ICalendarParameter::rsvp(rsvp));
                 }
             }
 
@@ -701,7 +693,6 @@ impl InstanceId {
 impl Attendee<'_> {
     fn answers_differently(&self, reply: &Attendee<'_>) -> bool {
         self.part_stat != reply.part_stat
-            || self.rsvp != reply.rsvp
             || self.delegated_to != reply.delegated_to
     }
 }
@@ -881,3 +872,45 @@ pub fn itip_method(ical: &ICalendar) -> Result<&ICalendarMethod, ItipError> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/groupware/src/scheduling/inbound/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod rsvp_tests {
+    use super::*;
+
+    #[test]
+    fn reply_rsvp_does_not_change_organizer_rsvp() {
+        let organizer = Attendee {
+            entry_id: 0,
+            email: crate::scheduling::Email::new("organizer@example.com", &[]).unwrap(),
+            name: None,
+            part_stat: None,
+            delegated_from: Vec::new(),
+            delegated_to: Vec::new(),
+            role: None,
+            cu_type: None,
+            sent_by: None,
+            rsvp: Some(true),
+            is_server_scheduling: false,
+            force_send: None,
+        };
+        let reply = Attendee {
+            rsvp: Some(false),
+            ..organizer.clone()
+        };
+        let component = ICalendarComponent::default();
+        let snapshot = ItipSnapshot {
+            comp_id: 0,
+            comp: &component,
+            attendees: AHashSet::new(),
+            dtstamp: None,
+            entries: Default::default(),
+            sequence: None,
+            request_status: Vec::new(),
+            recurrence_time: None,
+        };
+
+        assert!(!organizer.answers_differently(&reply));
+        assert!(EntryChange::participation(&snapshot, &organizer, &snapshot, &reply).is_empty());
+        assert_eq!(organizer.rsvp, Some(true));
+    }
+}

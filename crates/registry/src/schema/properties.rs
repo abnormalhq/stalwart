@@ -86,6 +86,9 @@ pub enum ObjectInner {
     #[cfg(feature = "enterprise")]
     MaskedEmail(Box<MaskedEmail>),
     // SPDX-SnippetEnd
+
+    #[cfg(not(feature = "enterprise"))]
+    MaskedEmail(Box<MaskedEmail>),
     MemoryLookupKey(Box<MemoryLookupKey>),
     MemoryLookupKeyValue(Box<MemoryLookupKeyValue>),
     Metadata(Box<Metadata>),
@@ -267,6 +270,9 @@ pub enum ObjectType {
     #[cfg(feature = "enterprise")]
     MaskedEmail = 52,
     // SPDX-SnippetEnd
+
+    #[cfg(not(feature = "enterprise"))]
+    MaskedEmail = 52,
     MemoryLookupKey = 53,
     MemoryLookupKeyValue = 54,
     Metadata = 55,
@@ -601,6 +607,9 @@ pub enum Property {
     #[cfg(feature = "enterprise")]
     CreatedBy = 575,
     // SPDX-SnippetEnd
+
+    #[cfg(not(feature = "enterprise"))]
+    CreatedBy = 575,
     CredentialId = 730,
     Credentials = 385,
     CurrentSecret = 4,
@@ -723,6 +732,8 @@ pub enum Property {
     #[cfg(feature = "enterprise")]
     EmailDomain = 577,
     // SPDX-SnippetEnd
+    #[cfg(not(feature = "enterprise"))]
+    EmailDomain = 577,
     EmailLimit = 893,
     // SPDX-SnippetBegin
     // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -732,6 +743,8 @@ pub enum Property {
     #[cfg(feature = "enterprise")]
     EmailTemplate = 212,
     // SPDX-SnippetEnd
+    #[cfg(not(feature = "enterprise"))]
+    EmailPrefix = 576,
     Enable = 51,
     EnableAssistedDiscovery = 1005,
     EnableEdns = 349,
@@ -860,6 +873,9 @@ pub enum Property {
     #[cfg(feature = "enterprise")]
     ForDomain = 574,
     // SPDX-SnippetEnd
+
+    #[cfg(not(feature = "enterprise"))]
+    ForDomain = 574,
     Format = 493,
     ForwardedHops = 480,
     From = 76,
@@ -1164,6 +1180,9 @@ pub enum Property {
     #[cfg(feature = "enterprise")]
     MaxMaskedAddresses = 437,
     // SPDX-SnippetEnd
+
+    #[cfg(not(feature = "enterprise"))]
+    MaxMaskedAddresses = 437,
     MaxMatchVars = 829,
     MaxMediaSize = 31,
     MaxMessageSize = 426,
