@@ -72,6 +72,9 @@ impl StoreLedger {
         expected_period: Option<&str>,
         next_period: &str,
     ) -> ReserveOutcome {
+        if self.store.is_none() || self.store.is_ephemeral() {
+            return ReserveOutcome::Unavailable;
+        }
         if !valid_server_id(server_id) {
             return ReserveOutcome::Unavailable;
         }
@@ -117,6 +120,9 @@ impl ReservationLedger for StoreLedger {
         reservation: Reservation,
     ) -> LedgerFuture<'a> {
         Box::pin(async move {
+            if self.store.is_none() || self.store.is_ephemeral() {
+                return ReserveOutcome::Unavailable;
+            }
             if !valid_server_id(&key.server_id) || !valid_period(&key.billing_period) {
                 return ReserveOutcome::Unavailable;
             }
