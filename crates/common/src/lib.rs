@@ -93,6 +93,8 @@ pub mod gateway;
 pub mod i18n;
 pub mod ipc;
 pub mod mail_capabilities;
+pub mod mail_presentation;
+pub mod recipient_policy;
 pub mod manager;
 pub mod network;
 pub mod scripts;
