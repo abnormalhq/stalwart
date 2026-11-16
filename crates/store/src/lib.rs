@@ -952,6 +952,23 @@ impl Store {
         }
     }
 
+    pub fn same_instance(&self, other: &Store) -> bool {
+        match (self, other) {
+            #[cfg(feature = "sqlite")]
+            (Store::SQLite(a), Store::SQLite(b)) => Arc::ptr_eq(a, b),
+            #[cfg(feature = "foundation")]
+            (Store::FoundationDb(a), Store::FoundationDb(b)) => Arc::ptr_eq(a, b),
+            #[cfg(feature = "postgres")]
+            (Store::PostgreSQL(a), Store::PostgreSQL(b)) => Arc::ptr_eq(a, b),
+            #[cfg(feature = "mysql")]
+            (Store::MySQL(a), Store::MySQL(b)) => Arc::ptr_eq(a, b),
+            #[cfg(feature = "rocks")]
+            (Store::RocksDb(a), Store::RocksDb(b)) => Arc::ptr_eq(a, b),
+            (Store::Ephemeral(a), Store::Ephemeral(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
     #[inline(always)]
     pub fn is_sql(&self) -> bool {
         match self {
@@ -1097,3 +1114,20 @@ impl From<Value<'static>> for () {
 #[rustfmt::skip]
 #[path = "../../../../stalwart-tests/unit/store/src/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod same_instance_tests {
+    use super::*;
+
+    #[test]
+    fn same_instance_uses_arc_identity_and_rejects_none() {
+        let store = EphemeralStore::open();
+        let clone = store.clone();
+        let different = EphemeralStore::open();
+        let none = Store::None;
+
+        assert!(store.same_instance(&clone));
+        assert!(!store.same_instance(&different));
+        assert!(!none.same_instance(&none));
+    }
+}

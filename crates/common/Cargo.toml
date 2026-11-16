@@ -101,6 +101,7 @@ enterprise = ["store/enterprise", "utils/enterprise", "trc/enterprise", "telemet
 foundation = []
 redis = ["store/redis"]
 keep = ["store/keep"]
+recovery-test-sqlite = ["store/sqlite"]
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["full"] }
