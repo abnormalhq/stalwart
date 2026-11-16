@@ -40,6 +40,23 @@ jobs:
       - name: Check Community gates and compatibility
         run: python3 scripts/check-community.py
 
+      - name: Run presentation and recipient-policy tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for filter in mail_presentation::tests recipient_policy::; do
+            selected="$(cargo test --locked -p common --no-default-features "$filter" -- --list | awk '/: test$/ { count += 1 } END { print count + 0 }')"
+            if [[ "$selected" -eq 0 ]]; then
+              echo "No tests selected for filter: $filter" >&2
+              exit 1
+            fi
+            echo "$filter: $selected tests selected"
+          done
+
+          cargo test --locked -p common --no-default-features mail_presentation::tests
+          cargo test --locked -p common --no-default-features recipient_policy::
+
       - name: Check Community build
         run: cargo check --locked -p stalwart --no-default-features --features "sqlite postgres mysql rocks s3 redis keep azure nats"
 
