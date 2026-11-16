@@ -277,25 +277,34 @@ pub fn parse_profile(value: &str) -> Result<PresentationDocument, PresentationEr
     Ok(document)
 }
 
-fn validate_values(
+fn normalize_values(
     kind: PresentationKind,
     values: &PresentationValues,
-) -> Result<(), PresentationError> {
+) -> Result<PresentationValues, PresentationError> {
     let allowed = allowed_placeholders(kind);
     let mut total = 0;
+    let mut normalized_values = BTreeMap::new();
     for (name, value) in values {
-        if !allowed.contains(name) || !is_control_free(value) {
+        if !allowed.contains(name) {
             return Err(PresentationError::InvalidValue);
         }
-        if value.len() > MAX_PLACEHOLDER_VALUE_BYTES {
+        let normalized = value.replace("\r\n", "\n");
+        if normalized
+            .chars()
+            .any(|character| character.is_control() && character != '\n')
+        {
             return Err(PresentationError::InvalidValue);
         }
-        total += value.len();
+        if normalized.len() > MAX_PLACEHOLDER_VALUE_BYTES {
+            return Err(PresentationError::InvalidValue);
+        }
+        total += normalized.len();
+        normalized_values.insert(*name, normalized);
     }
     if total > MAX_PLACEHOLDER_VALUES_BYTES {
         return Err(PresentationError::InvalidValue);
     }
-    Ok(())
+    Ok(normalized_values)
 }
 
 fn escape_html(value: &str) -> String {
@@ -355,14 +364,14 @@ pub fn render(
     logo_content_id: Option<&str>,
 ) -> Result<PresentationContent, PresentationError> {
     validate(document)?;
-    validate_values(document.kind, values)?;
+    let values = normalize_values(document.kind, values)?;
     if let Some(content_id) = logo_content_id {
         if expected_logo_content_id(document).as_deref() != Some(content_id) {
             return Err(PresentationError::InvalidLogoContentId);
         }
     }
 
-    let title = substitute(&document.sections.title, values)?;
+    let title = substitute(&document.sections.title, &values)?;
     let intro_template = if !values
         .get(&PresentationPlaceholder::EventTitle)
         .is_some_and(|title| !title.trim().is_empty())
@@ -379,8 +388,8 @@ pub fn render(
     } else {
         document.sections.intro.as_str()
     };
-    let intro = substitute(intro_template, values)?;
-    let footer = substitute(&document.sections.footer, values)?;
+    let intro = substitute(intro_template, &values)?;
+    let footer = substitute(&document.sections.footer, &values)?;
     let display_name = document.brand.display_name.trim();
     let accent = document.brand.accent.to_ascii_lowercase();
     let text = [
@@ -472,9 +481,11 @@ fn fallback_values(kind: PresentationKind, values: &PresentationValues) -> Prese
             continue;
         }
         let candidate = BTreeMap::from([(placeholder, value.clone())]);
-        if validate_values(kind, &candidate).is_ok() {
-            total_bytes += value.len();
-            safe_values.insert(placeholder, value.clone());
+        if let Ok(normalized) = normalize_values(kind, &candidate) {
+            if let Some(normalized_value) = normalized.get(&placeholder) {
+                total_bytes += normalized_value.len();
+                safe_values.insert(placeholder, normalized_value.clone());
+            }
         }
     }
     safe_values
@@ -718,6 +729,31 @@ mod tests {
             !rendered
                 .text
                 .contains(&"x".repeat(MAX_PLACEHOLDER_VALUE_BYTES + 1))
+        );
+    }
+
+    #[test]
+    fn normalizes_body_crlf_values_and_rejects_other_controls() {
+        let document = fallback(PresentationKind::CalendarAlarm);
+        let values = BTreeMap::from([(
+            PresentationPlaceholder::EventTitle,
+            "First line\r\nSecond line".to_string(),
+        )]);
+        let rendered = render(&document, &values, None).unwrap();
+        assert!(rendered.text.contains("First line\nSecond line"));
+        assert!(!rendered.text.contains('\r'));
+
+        for invalid in ["First\rSecond", "First\tSecond"] {
+            let values =
+                BTreeMap::from([(PresentationPlaceholder::EventTitle, invalid.to_string())]);
+            assert_eq!(
+                render(&document, &values, None),
+                Err(PresentationError::InvalidValue)
+            );
+        }
+        assert_eq!(
+            validate_subject("safe\r\nBcc: injected@example.invalid"),
+            Err(PresentationError::UnsafeSubject)
         );
     }
 
