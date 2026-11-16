@@ -94,6 +94,26 @@ pub struct PendingEmail {
     start_time: Instant,
 }
 
+pub struct PendingEmailResultSlots {
+    pub account_id: u32,
+    pub document_slot: Slot,
+    pub thread_id: PendingId,
+    pub mailbox_ids: Vec<u32>,
+    pub uid_slots: SlotRange,
+}
+
+impl PendingEmail {
+    pub fn result_slots(&self) -> PendingEmailResultSlots {
+        PendingEmailResultSlots {
+            account_id: self.account_id,
+            document_slot: self.document_slot.clone(),
+            thread_id: self.thread_id.clone(),
+            mailbox_ids: self.mailbox_ids.clone(),
+            uid_slots: self.uid_slots.clone(),
+        }
+    }
+}
+
 pub struct IngestEmail<'x> {
     pub raw_message: &'x [u8],
     pub blob_hash: Option<&'x BlobHash>,
