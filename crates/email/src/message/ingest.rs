@@ -1392,3 +1392,29 @@ pub mod recheck;
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/email/src/message/ingest/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod message_recovery_slot_tests {
+    use super::*;
+    use common::message_recovery::{PendingMailboxUid, PendingRestoreIds};
+
+    #[test]
+    fn pending_restore_ids_accept_native_inbox_id() {
+        let mut batch = BatchBuilder::new();
+        let document_slot = batch.reserve_document_id(1, Collection::Email);
+        let thread_slot = batch.reserve_document_id(1, Collection::Thread);
+        let uid_slot = batch.reserve_uid(1, INBOX_ID);
+
+        assert!(
+            PendingRestoreIds::new(
+                PendingId::Slot(document_slot),
+                PendingId::Slot(thread_slot),
+                vec![PendingMailboxUid {
+                    mailbox_id: INBOX_ID,
+                    uid: PendingId::Slot(uid_slot),
+                }],
+            )
+            .is_ok()
+        );
+    }
+}

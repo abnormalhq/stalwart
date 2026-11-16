@@ -143,7 +143,6 @@ impl PendingRestoreIds {
             || matches!(thread_id, PendingId::Assigned(0))
             || mailbox_uids.is_empty()
             || mailbox_uids.len() > MAX_RESTORE_MAILBOXES
-            || mailbox_uids.iter().any(|uid| uid.mailbox_id == 0)
             || mailbox_uids.iter().any(|uid| uid.uid.slot().is_none())
         {
             return Err(RecoveryError::Invalid("pending restore slots"));

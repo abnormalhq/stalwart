@@ -1738,6 +1738,8 @@ fn pending_restore_ids_require_fresh_slots_and_mailbox_uids() {
     let document_slot = batch.reserve_document_id(7, Collection::Email);
     let thread_slot = batch.reserve_document_id(7, Collection::Thread);
     let uid_slot = batch.reserve_uid(7, 11);
+    let inbox_uid_slot = batch.reserve_uid(7, 0);
+    let duplicate_inbox_uid_slot = batch.reserve_uid(7, 0);
     assert!(
         PendingRestoreIds::new(
             PendingId::Assigned(1),
@@ -1767,6 +1769,45 @@ fn pending_restore_ids_require_fresh_slots_and_mailbox_uids() {
             }],
         )
         .is_ok()
+    );
+    assert!(
+        PendingRestoreIds::new(
+            PendingId::Slot(document_slot),
+            PendingId::Slot(thread_slot),
+            vec![PendingMailboxUid {
+                mailbox_id: 0,
+                uid: PendingId::Slot(inbox_uid_slot),
+            }],
+        )
+        .is_ok()
+    );
+    assert!(
+        PendingRestoreIds::new(
+            PendingId::Slot(document_slot),
+            PendingId::Slot(thread_slot),
+            vec![
+                PendingMailboxUid {
+                    mailbox_id: 0,
+                    uid: PendingId::Slot(inbox_uid_slot),
+                },
+                PendingMailboxUid {
+                    mailbox_id: 0,
+                    uid: PendingId::Slot(duplicate_inbox_uid_slot),
+                },
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        PendingRestoreIds::new(
+            PendingId::Slot(document_slot),
+            PendingId::Slot(thread_slot),
+            vec![PendingMailboxUid {
+                mailbox_id: 0,
+                uid: PendingId::Assigned(0),
+            }],
+        )
+        .is_err()
     );
 }
 
