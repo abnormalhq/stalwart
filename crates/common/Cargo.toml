@@ -99,6 +99,7 @@ dns-update = { version = "0.6", features = ["test_provider"] }
 dev_mode = []
 enterprise = ["store/enterprise", "utils/enterprise", "trc/enterprise", "telemetry/enterprise", "directory/enterprise", "coordinator/enterprise", "registry/enterprise", "jmap_proto/enterprise"]
 foundation = []
+ai-spam-test-sqlite = ["store/sqlite"]
 redis = ["store/redis"]
 keep = ["store/keep"]
 recovery-test-sqlite = ["store/sqlite"]
