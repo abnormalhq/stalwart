@@ -37,8 +37,16 @@ struct CaptureLifecycleControl {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 enum LifecycleLock {
-    Restore { operation_id: String },
-    Purge { operation_id: String },
+    Restore {
+        operation_id: String,
+    },
+    Purge {
+        operation_id: String,
+    },
+    AttemptCleanup {
+        operation_id: String,
+        attempt_id: u8,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +68,7 @@ pub struct LifecycleOperationSummary {
 pub enum LifecycleOperationKind {
     Restore,
     Purge,
+    AttemptCleanup,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -300,6 +309,7 @@ pub struct CleanupReport {
     pub examined: usize,
     pub skipped: usize,
     pub purged_capture_ids: Vec<String>,
+    pub cleaned_attempts: usize,
     pub next_cursor: Option<String>,
     pub has_more: bool,
 }
@@ -434,6 +444,11 @@ impl RecoveryEngine {
                 },
                 LifecycleLock::Purge { operation_id } => LifecycleOperationSummary {
                     kind: LifecycleOperationKind::Purge,
+                    operation_id,
+                    pending: true,
+                },
+                LifecycleLock::AttemptCleanup { operation_id, .. } => LifecycleOperationSummary {
+                    kind: LifecycleOperationKind::AttemptCleanup,
                     operation_id,
                     pending: true,
                 },
@@ -878,6 +893,7 @@ impl RecoveryEngine {
             examined: 0,
             skipped: 0,
             purged_capture_ids: Vec::new(),
+            cleaned_attempts: 0,
             next_cursor,
             has_more,
         };
@@ -888,17 +904,48 @@ impl RecoveryEngine {
                 report.skipped += 1;
                 continue;
             };
+            let unselected_cleanups = if manifest.state == ManifestState::Purging {
+                0
+            } else {
+                manifest
+                    .copy_attempts
+                    .iter()
+                    .filter(|attempt| {
+                        matches!(
+                            &attempt.state,
+                            CopyAttemptState::Verified | CopyAttemptState::Cleaning
+                        ) && manifest.selected_attempt_id != Some(attempt.id)
+                    })
+                    .count()
+            };
+            if unselected_cleanups != 0 {
+                match self
+                    .cleanup_unselected_copy_attempts(scope, &capture_id)
+                    .await
+                {
+                    Ok(()) => report.cleaned_attempts += unselected_cleanups,
+                    Err(
+                        RecoveryError::Conflict(_)
+                        | RecoveryError::Held
+                        | RecoveryError::InProgress,
+                    ) => report.skipped += 1,
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
             let cleanup_operation = cleanup_operation_id(&capture_id);
-            let pending_cleanup = manifest.state == ManifestState::Purging
-                && self
-                    .read::<CaptureLifecycleControl>(&capture_lifecycle_key(scope, &capture_id)?)
+            let pending_cleanup = if manifest.state == ManifestState::Purging {
+                self.read::<CaptureLifecycleControl>(&capture_lifecycle_key(scope, &capture_id)?)
                     .await?
                     .is_some_and(|(control, _)| {
                         control.lock
                             == Some(LifecycleLock::Purge {
                                 operation_id: cleanup_operation.clone(),
                             })
-                    });
+                    })
+            } else {
+                false
+            };
             if !pending_cleanup {
                 let eligible_at = manifest
                     .created_at
@@ -956,13 +1003,20 @@ impl RecoveryEngine {
             let Some((manifest, _)) = self.read::<Manifest>(&key).await? else {
                 return Ok(());
             };
-            let Some(attempt) = manifest.copy_attempts.iter().find(|attempt| {
-                attempt.state == CopyAttemptState::Verified
-                    && manifest.selected_attempt_id != Some(attempt.id)
-            }) else {
+            let Some(attempt_id) = manifest
+                .copy_attempts
+                .iter()
+                .find(|attempt| {
+                    matches!(
+                        &attempt.state,
+                        CopyAttemptState::Verified | CopyAttemptState::Cleaning
+                    ) && manifest.selected_attempt_id != Some(attempt.id)
+                })
+                .map(|attempt| attempt.id)
+            else {
                 return Ok(());
             };
-            self.cleanup_unselected_copy_attempt(scope, capture_id, attempt.id)
+            self.cleanup_unselected_copy_attempt(scope, capture_id, attempt_id)
                 .await?;
         }
     }
@@ -977,56 +1031,192 @@ impl RecoveryEngine {
         let hold_key = scoped_key(b"hold", scope, "")?;
         let lifecycle_key = capture_lifecycle_key(scope, capture_id)?;
         let ledger_key = quota_key(scope)?;
-        let (manifest, _) = self
+        let operation_id = attempt_cleanup_operation_id(capture_id, attempt_id);
+
+        let (mut manifest, manifest_bytes) = self
             .read::<Manifest>(&manifest_key)
             .await?
             .ok_or(RecoveryError::NotFound)?;
-        let attempt = manifest
+        let position = manifest
             .copy_attempts
             .iter()
-            .find(|attempt| attempt.id == attempt_id)
+            .position(|attempt| attempt.id == attempt_id)
             .ok_or(RecoveryError::Conflict("copy attempt is missing"))?;
-        if attempt.state == CopyAttemptState::Cleaned {
+        if manifest.copy_attempts[position].state == CopyAttemptState::Cleaned {
             return Ok(());
         }
-        if attempt.state == CopyAttemptState::Writing {
-            return Err(RecoveryError::InProgress);
-        }
-        if attempt.state != CopyAttemptState::Verified
+        if manifest.copy_attempts[position].state == CopyAttemptState::Writing
+            || manifest.copy_attempts[position].state == CopyAttemptState::Selected
             || manifest.selected_attempt_id == Some(attempt_id)
             || manifest.state == ManifestState::Purging
         {
             return Err(RecoveryError::Conflict("copy attempt is not cleanable"));
         }
-        let (hold, _) = self
+        let (mut hold, hold_bytes) = self
             .read::<HoldControl>(&hold_key)
             .await?
             .ok_or(RecoveryError::Conflict("hold state disappeared"))?;
-        if hold.active || hold.pending_purges != 0 {
-            return Err(RecoveryError::Held);
-        }
-        if self
-            .read::<CaptureLifecycleControl>(&lifecycle_key)
+        let (mut lifecycle, lifecycle_bytes) =
+            match self.read::<CaptureLifecycleControl>(&lifecycle_key).await? {
+                Some((record, bytes)) => (record, Some(bytes)),
+                None => (
+                    CaptureLifecycleControl {
+                        scope: Some(scope.clone()),
+                        capture_id: capture_id.to_string(),
+                        lock: None,
+                    },
+                    None,
+                ),
+            };
+        let (ledger, ledger_bytes) = self
+            .read::<ScopeLedger>(&ledger_key)
             .await?
-            .is_some_and(|(lifecycle, _)| lifecycle.lock.is_some())
+            .ok_or(RecoveryError::Conflict("quota ledger disappeared"))?;
+        if manifest.scope != *scope
+            || manifest.capture_id != capture_id
+            || hold.scope != *scope
+            || lifecycle
+                .scope
+                .as_ref()
+                .is_some_and(|stored| stored != scope)
+            || lifecycle.capture_id != capture_id
+            || ledger.charged_bytes < manifest.copy_attempts[position].stored_size
+        {
+            return Err(RecoveryError::Conflict(
+                "copy cleanup scope or quota mismatch",
+            ));
+        }
+
+        let lock = LifecycleLock::AttemptCleanup {
+            operation_id: operation_id.clone(),
+            attempt_id,
+        };
+        match lifecycle.lock.as_ref() {
+            Some(existing) if existing == &lock => {
+                if manifest.copy_attempts[position].state != CopyAttemptState::Cleaning
+                    || hold.active
+                    || hold.pending_purges != 1
+                {
+                    return Err(RecoveryError::Conflict("copy cleanup reservation mismatch"));
+                }
+            }
+            Some(_) => return Err(RecoveryError::InProgress),
+            None => {
+                if manifest.copy_attempts[position].state != CopyAttemptState::Verified
+                    || hold.active
+                    || hold.pending_purges != 0
+                {
+                    return Err(RecoveryError::InProgress);
+                }
+                hold.pending_purges = 1;
+                lifecycle.lock = Some(lock.clone());
+                manifest.copy_attempts[position].state = CopyAttemptState::Cleaning;
+                lifecycle.scope = Some(scope.clone());
+                lifecycle.capture_id = capture_id.to_string();
+                let mut reservation = BatchBuilder::new();
+                append_assert(&mut reservation, &manifest_key, Some(&manifest_bytes))?;
+                append_assert(&mut reservation, &hold_key, Some(&hold_bytes))?;
+                append_assert_optional(&mut reservation, &lifecycle_key, lifecycle_bytes.as_ref())?;
+                append_assert(&mut reservation, &ledger_key, Some(&ledger_bytes))?;
+                reservation.with_account_id(0).set(
+                    value_class(&manifest_key),
+                    encode_record(&manifest, next_record_revision(Some(&manifest_bytes))?)?,
+                );
+                reservation.with_account_id(0).set(
+                    value_class(&hold_key),
+                    encode_record(&hold, next_record_revision(Some(&hold_bytes))?)?,
+                );
+                reservation.with_account_id(0).set(
+                    value_class(&lifecycle_key),
+                    encode_record(
+                        &lifecycle,
+                        next_record_revision(lifecycle_bytes.as_deref())?,
+                    )?,
+                );
+                ensure_single_segment(&reservation)?;
+                if let Err(error) = self.metadata.write_batch(&mut reservation).await {
+                    let reserved =
+                        self.read::<Manifest>(&manifest_key)
+                            .await?
+                            .is_some_and(|(manifest, _)| {
+                                manifest.copy_attempts.iter().any(|attempt| {
+                                    attempt.id == attempt_id
+                                        && attempt.state == CopyAttemptState::Cleaning
+                                })
+                            })
+                            && self
+                                .read::<CaptureLifecycleControl>(&lifecycle_key)
+                                .await?
+                                .is_some_and(|(lifecycle, _)| lifecycle.lock == Some(lock.clone()))
+                            && self
+                                .read::<HoldControl>(&hold_key)
+                                .await?
+                                .is_some_and(|(hold, _)| hold.pending_purges == 1);
+                    if !reserved {
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+
+        #[cfg(test)]
+        if self
+            .fail_after_attempt_cleanup_reservation
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             return Err(RecoveryError::InProgress);
+        }
+
+        let (reserved_manifest, _) = self
+            .read::<Manifest>(&manifest_key)
+            .await?
+            .ok_or(RecoveryError::NotFound)?;
+        let (reserved_hold, _) = self
+            .read::<HoldControl>(&hold_key)
+            .await?
+            .ok_or(RecoveryError::Conflict("hold state disappeared"))?;
+        let attempt = reserved_manifest
+            .copy_attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or(RecoveryError::Conflict("reserved copy attempt disappeared"))?;
+        if reserved_manifest.copy_attempts[position].state != CopyAttemptState::Cleaning
+            || reserved_manifest.selected_attempt_id == Some(attempt_id)
+            || reserved_hold.scope != *scope
+            || reserved_hold.active
+            || reserved_hold.pending_purges != 1
+            || self
+                .read::<CaptureLifecycleControl>(&lifecycle_key)
+                .await?
+                .map_or(true, |(lifecycle, _)| lifecycle.lock != Some(lock.clone()))
+        {
+            return Err(RecoveryError::Conflict("copy cleanup reservation changed"));
         }
         self.blobs.delete_blob(&attempt.blob_key).await?;
         if self.blobs.get_raw_blob(&attempt.blob_key).await?.is_some() {
             return Err(RecoveryError::InProgress);
         }
+        #[cfg(test)]
+        if self
+            .fail_after_attempt_cleanup_delete
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RecoveryError::InProgress);
+        }
 
-        let (mut current, manifest_bytes) = self
+        let (mut current, current_manifest_bytes) = self
             .read::<Manifest>(&manifest_key)
             .await?
             .ok_or(RecoveryError::NotFound)?;
-        let (current_hold, hold_bytes) = self
+        let (mut current_hold, current_hold_bytes) = self
             .read::<HoldControl>(&hold_key)
             .await?
             .ok_or(RecoveryError::Conflict("hold state disappeared"))?;
-        let lifecycle = self.read::<CaptureLifecycleControl>(&lifecycle_key).await?;
-        let (mut ledger, ledger_bytes) = self
+        let (mut current_lifecycle, current_lifecycle_bytes) = self
+            .read::<CaptureLifecycleControl>(&lifecycle_key)
+            .await?
+            .ok_or(RecoveryError::Conflict("cleanup lifecycle disappeared"))?;
+        let (mut current_ledger, current_ledger_bytes) = self
             .read::<ScopeLedger>(&ledger_key)
             .await?
             .ok_or(RecoveryError::Conflict("quota ledger disappeared"))?;
@@ -1038,54 +1228,82 @@ impl RecoveryEngine {
         if current.copy_attempts[position].state == CopyAttemptState::Cleaned {
             return Ok(());
         }
-        if current.copy_attempts[position].state != CopyAttemptState::Verified
+        if current.copy_attempts[position].state != CopyAttemptState::Cleaning
             || current.selected_attempt_id == Some(attempt_id)
             || current.state == ManifestState::Purging
+            || current_lifecycle.lock != Some(lock)
             || current_hold.active
-            || current_hold.pending_purges != 0
-            || lifecycle
-                .as_ref()
-                .is_some_and(|(control, _)| control.lock.is_some())
+            || current_hold.pending_purges != 1
+            || current_lifecycle.scope.as_ref() != Some(scope)
+            || current_lifecycle.capture_id != capture_id
+            || current_hold.scope != *scope
         {
-            return Err(RecoveryError::Conflict("copy cleanup fence changed"));
+            return Err(RecoveryError::Conflict(
+                "copy cleanup finalization fence changed",
+            ));
         }
         let charge = current.copy_attempts[position].stored_size;
-        ledger.charged_bytes = ledger
+        current_ledger.charged_bytes = current_ledger
             .charged_bytes
             .checked_sub(charge)
             .ok_or(RecoveryError::Conflict("quota ledger underflow"))?;
         current.copy_attempts[position].state = CopyAttemptState::Cleaned;
-        let mut batch = BatchBuilder::new();
-        append_assert(&mut batch, &manifest_key, Some(&manifest_bytes))?;
-        append_assert(&mut batch, &hold_key, Some(&hold_bytes))?;
-        append_assert_optional(
-            &mut batch,
-            &lifecycle_key,
-            lifecycle.as_ref().map(|(_, bytes)| bytes),
+        current_hold.pending_purges = 0;
+        current_lifecycle.lock = None;
+        let mut finalization = BatchBuilder::new();
+        append_assert(
+            &mut finalization,
+            &manifest_key,
+            Some(&current_manifest_bytes),
         )?;
-        append_assert(&mut batch, &ledger_key, Some(&ledger_bytes))?;
-        batch.with_account_id(0).set(
+        append_assert(&mut finalization, &hold_key, Some(&current_hold_bytes))?;
+        append_assert(
+            &mut finalization,
+            &lifecycle_key,
+            Some(&current_lifecycle_bytes),
+        )?;
+        append_assert(&mut finalization, &ledger_key, Some(&current_ledger_bytes))?;
+        finalization.with_account_id(0).set(
             value_class(&manifest_key),
-            encode_record(&current, next_record_revision(Some(&manifest_bytes))?)?,
+            encode_record(
+                &current,
+                next_record_revision(Some(&current_manifest_bytes))?,
+            )?,
         );
-        batch.with_account_id(0).set(
+        finalization.with_account_id(0).set(
+            value_class(&hold_key),
+            encode_record(
+                &current_hold,
+                next_record_revision(Some(&current_hold_bytes))?,
+            )?,
+        );
+        finalization.with_account_id(0).set(
+            value_class(&lifecycle_key),
+            encode_record(
+                &current_lifecycle,
+                next_record_revision(Some(&current_lifecycle_bytes))?,
+            )?,
+        );
+        finalization.with_account_id(0).set(
             value_class(&ledger_key),
-            encode_record(&ledger, next_record_revision(Some(&ledger_bytes))?)?,
+            encode_record(
+                &current_ledger,
+                next_record_revision(Some(&current_ledger_bytes))?,
+            )?,
         );
-        ensure_single_segment(&batch)?;
-        if let Err(error) = self.metadata.write_batch(&mut batch).await {
-            if self
-                .read::<Manifest>(&manifest_key)
-                .await?
-                .is_some_and(|(manifest, _)| {
-                    manifest.copy_attempts.iter().any(|attempt| {
-                        attempt.id == attempt_id && attempt.state == CopyAttemptState::Cleaned
-                    })
-                })
-            {
-                return Ok(());
+        ensure_single_segment(&finalization)?;
+        if let Err(error) = self.metadata.write_batch(&mut finalization).await {
+            let completed =
+                self.read::<Manifest>(&manifest_key)
+                    .await?
+                    .is_some_and(|(manifest, _)| {
+                        manifest.copy_attempts.iter().any(|attempt| {
+                            attempt.id == attempt_id && attempt.state == CopyAttemptState::Cleaned
+                        })
+                    });
+            if !completed {
+                return Err(error.into());
             }
-            return Err(error.into());
         }
         Ok(())
     }
@@ -1579,6 +1797,10 @@ fn purge_job_matches(job: &PurgeJob, request: &PurgeRequest, cleanup: bool) -> b
         && job.actor == request.actor
         && job.reason == request.reason
         && job.cleanup == cleanup
+}
+
+fn attempt_cleanup_operation_id(capture_id: &str, attempt_id: u8) -> String {
+    format!("attempt-cleanup-{capture_id}-{attempt_id}")
 }
 
 fn cleanup_operation_id(capture_id: &str) -> String {

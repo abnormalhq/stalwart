@@ -430,6 +430,7 @@ async fn file_sqlite_capture_state_survives_engine_restart() {
     prepared
         .append_to_delete_batch(&mut stale_delete, 20)
         .unwrap();
+    stale_delete.clear(ValueClass::Property(Field::ARCHIVE.into()));
     let abandoned_key_id = BlobFormat::of(&abandoned_bytes).unwrap().key_id.unwrap();
     let (after_late_completion, _) = restarted
         .finish_copy_attempt(&request.account.scope, &capture_id, 1, abandoned_key_id)
@@ -493,6 +494,10 @@ async fn file_sqlite_capture_state_survives_engine_restart() {
             .state,
         ManifestState::Staging
     );
+    assert_eq!(
+        email_payload(&restarted.metadata, request.source.document_id).await,
+        Some(1u64.to_be_bytes().to_vec())
+    );
 
     let current = restarted
         .prepare_capture(request.clone(), &source_blobs, &source_keys)
@@ -510,6 +515,7 @@ async fn file_sqlite_capture_state_survives_engine_restart() {
             ValueClass::Property(request.source.revision_property),
             store::write::assert::AssertValue::U64(999),
         );
+    late_assertion.clear(ValueClass::Property(Field::ARCHIVE.into()));
     assert!(
         restarted
             .metadata
@@ -526,9 +532,30 @@ async fn file_sqlite_capture_state_survives_engine_restart() {
             .state,
         ManifestState::Staging
     );
+    assert_eq!(
+        email_payload(&restarted.metadata, request.source.document_id).await,
+        Some(1u64.to_be_bytes().to_vec())
+    );
     let mut deletion = BatchBuilder::new();
     current.append_to_delete_batch(&mut deletion, 20).unwrap();
+    deletion.clear(ValueClass::Property(Field::ARCHIVE.into()));
     restarted.metadata.write_batch(&mut deletion).await.unwrap();
+    assert!(
+        email_payload(&restarted.metadata, request.source.document_id)
+            .await
+            .is_none()
+    );
+    let recovered = restarted
+        .get_payload(&request.account.scope, &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        source_keys
+            .decode_bounded(&source_blob_key, recovered, MAX_BLOB_BYTES)
+            .unwrap(),
+        expected_message
+    );
     let tombstone = match restarted
         .purge(PurgeRequest {
             now: 30,
@@ -599,8 +626,33 @@ async fn file_sqlite_concurrent_capture_claims_charge_once() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(manifest.copy_attempts.len(), 1);
-    assert!(manifest.selected_attempt_id.is_some());
+    assert!((1..=2).contains(&manifest.copy_attempts.len()));
+    let attempt_ids = manifest
+        .copy_attempts
+        .iter()
+        .map(|attempt| attempt.id)
+        .collect::<std::collections::HashSet<_>>();
+    let attempt_keys = manifest
+        .copy_attempts
+        .iter()
+        .map(|attempt| attempt.blob_key.clone())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(attempt_ids.len(), manifest.copy_attempts.len());
+    assert_eq!(attempt_keys.len(), manifest.copy_attempts.len());
+    assert_eq!(
+        manifest
+            .copy_attempts
+            .iter()
+            .filter(|attempt| attempt.state == CopyAttemptState::Selected)
+            .count(),
+        1
+    );
+    assert!(
+        manifest
+            .copy_attempts
+            .iter()
+            .any(|attempt| Some(attempt.id) == manifest.selected_attempt_id)
+    );
     let ledger = fixture
         .engine
         .read::<ScopeLedger>(&quota_key(&fixture.account.scope).unwrap())
@@ -609,7 +661,15 @@ async fn file_sqlite_concurrent_capture_claims_charge_once() {
         .unwrap()
         .0;
     assert_eq!(ledger.captures, vec![capture_id]);
-    assert_eq!(ledger.charged_bytes, manifest.copy_attempts[0].stored_size);
+    assert_eq!(
+        ledger.charged_bytes,
+        manifest
+            .copy_attempts
+            .iter()
+            .filter(|attempt| attempt.state != CopyAttemptState::Cleaned)
+            .map(|attempt| attempt.stored_size)
+            .sum::<u64>()
+    );
     drop(fixture);
 }
 
@@ -686,6 +746,322 @@ async fn file_sqlite_unknown_attempts_consume_capacity_and_quota() {
         charged
     );
     drop(fixture);
+}
+
+#[cfg(feature = "recovery-test-sqlite")]
+#[tokio::test]
+async fn file_sqlite_attempt_cleanup_reserves_hold_and_resumes_after_restart() {
+    let fixture = persistent_lifecycle_fixture().await;
+    let request = persistent_capture_request(&fixture, "sqlite-cleanup-race", 10);
+    fixture.engine.fail_after_next_attempt_upload();
+    assert!(matches!(
+        fixture
+            .engine
+            .prepare_capture(request.clone(), &fixture.source_blobs, &fixture.source_keys)
+            .await,
+        Err(RecoveryError::InProgress)
+    ));
+    let prepared = fixture
+        .engine
+        .prepare_capture(request.clone(), &fixture.source_blobs, &fixture.source_keys)
+        .await
+        .unwrap();
+    let mut source_delete = BatchBuilder::new();
+    prepared
+        .append_to_delete_batch(&mut source_delete, 11)
+        .unwrap();
+    source_delete
+        .with_account_id(request.source.account_id)
+        .with_collection(request.source.collection)
+        .with_document(request.source.document_id)
+        .clear(ValueClass::Property(Field::ARCHIVE.into()));
+    fixture
+        .metadata
+        .write_batch(&mut source_delete)
+        .await
+        .unwrap();
+    let capture_id = hash_hex(
+        &[
+            scope_hash(&request.account.scope).unwrap().as_bytes(),
+            request.metadata.operation_id.as_bytes(),
+        ]
+        .concat(),
+    );
+    let manifest = fixture
+        .engine
+        .get(&request.account.scope, &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let charged_before_cleanup = manifest
+        .copy_attempts
+        .iter()
+        .map(|attempt| attempt.stored_size)
+        .sum::<u64>();
+    let abandoned = manifest
+        .copy_attempts
+        .iter()
+        .find(|attempt| attempt.id == 1)
+        .unwrap();
+    let abandoned_key = abandoned.blob_key.clone();
+    let abandoned_key_id = BlobFormat::of(
+        &fixture
+            .recovery_blobs
+            .get_raw_blob(&abandoned_key)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap()
+    .key_id
+    .unwrap();
+    fixture.engine.fail_after_next_attempt_cleanup_reservation();
+    assert!(matches!(
+        fixture
+            .engine
+            .finish_copy_attempt(&request.account.scope, &capture_id, 1, abandoned_key_id,)
+            .await,
+        Err(RecoveryError::InProgress)
+    ));
+    let reserved = fixture
+        .engine
+        .get(&request.account.scope, &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reserved.copy_attempts[0].state, CopyAttemptState::Cleaning);
+    assert_eq!(
+        fixture
+            .engine
+            .lifecycle_summary(&request.account.scope, &capture_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .active_operation
+            .unwrap()
+            .kind,
+        LifecycleOperationKind::AttemptCleanup
+    );
+    assert!(matches!(
+        fixture
+            .engine
+            .purge(PurgeRequest {
+                scope: request.account.scope.clone(),
+                capture_id: capture_id.clone(),
+                operation_id: "cleanup-race-purge".into(),
+                actor: "test".into(),
+                reason: "race test".into(),
+                now: 12,
+            })
+            .await,
+        Err(RecoveryError::InProgress)
+    ));
+    let importer =
+        TestRestoreImporter::new(fixture.metadata.clone(), fixture.message.clone(), vec![11]);
+    fixture
+        .engine
+        .activate_account(&fixture.account)
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .engine
+            .restore(
+                restore_request(&fixture.account, &capture_id, "cleanup-race-restore"),
+                &fixture.source_keys,
+                &importer,
+            )
+            .await,
+        Err(RecoveryError::Conflict(_) | RecoveryError::InProgress | RecoveryError::Held)
+    ));
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 0);
+    let hold_key = scoped_key(b"hold", &request.account.scope, "").unwrap();
+    assert_eq!(
+        fixture
+            .engine
+            .read::<HoldControl>(&hold_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .pending_purges,
+        1
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .read::<ScopeLedger>(&quota_key(&request.account.scope).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .charged_bytes,
+        charged_before_cleanup
+    );
+    assert!(matches!(
+        fixture
+            .engine
+            .sync_hold(request.account.scope.clone(), 1, false)
+            .await,
+        Err(RecoveryError::InProgress)
+    ));
+    assert!(matches!(
+        fixture
+            .engine
+            .sync_hold(request.account.scope.clone(), 2, true)
+            .await,
+        Err(RecoveryError::InProgress)
+    ));
+
+    fixture.engine.fail_after_next_attempt_cleanup_delete();
+    let interrupted = fixture
+        .engine
+        .cleanup_expired(&request.account.scope, 20, 100, 100, None)
+        .await
+        .unwrap();
+    assert_eq!(interrupted.cleaned_attempts, 0);
+    assert_eq!(interrupted.skipped, 1);
+    assert!(
+        fixture
+            .recovery_blobs
+            .get_raw_blob(&abandoned_key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .read::<HoldControl>(&hold_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .pending_purges,
+        1
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .read::<ScopeLedger>(&quota_key(&request.account.scope).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .charged_bytes,
+        charged_before_cleanup
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .lifecycle_summary(&request.account.scope, &capture_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .active_operation
+            .unwrap()
+            .kind,
+        LifecycleOperationKind::AttemptCleanup
+    );
+
+    let PersistentLifecycleFixture {
+        root,
+        metadata_path,
+        recovery_path,
+        engine,
+        metadata,
+        source_blobs,
+        recovery_blobs,
+        recovery_key,
+        ..
+    } = fixture;
+    drop(engine);
+    drop(metadata);
+    drop(source_blobs);
+    drop(recovery_blobs);
+
+    let metadata = open_test_sqlite(&metadata_path).await;
+    let recovery_blobs = BlobStore::Store(open_test_sqlite(&recovery_path).await);
+    let restarted = RecoveryEngine::new(
+        metadata.clone(),
+        recovery_blobs.clone(),
+        BlobOpts::new(
+            CompressionAlgo::None,
+            BlobEncryption::Key(recovery_key.clone()),
+        ),
+        BlobKeyring::new(vec![recovery_key]),
+    )
+    .unwrap();
+    let resumed = restarted
+        .cleanup_expired(&request.account.scope, 20, 100, 100, None)
+        .await
+        .unwrap();
+    assert_eq!(resumed.cleaned_attempts, 1);
+    assert_eq!(resumed.skipped, 0);
+    assert_eq!(
+        restarted
+            .read::<HoldControl>(&hold_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .pending_purges,
+        0
+    );
+    assert!(
+        restarted
+            .lifecycle_summary(&request.account.scope, &capture_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .active_operation
+            .is_none()
+    );
+    restarted
+        .sync_hold(request.account.scope.clone(), 1, false)
+        .await
+        .unwrap();
+    let settled = restarted
+        .get(&request.account.scope, &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.copy_attempts[0].state, CopyAttemptState::Cleaned);
+    let ledger = restarted
+        .read::<ScopeLedger>(&quota_key(&request.account.scope).unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(
+        ledger.charged_bytes,
+        settled
+            .copy_attempts
+            .iter()
+            .find(|attempt| attempt.state == CopyAttemptState::Selected)
+            .unwrap()
+            .stored_size
+    );
+    let repeated = restarted
+        .cleanup_expired(&request.account.scope, 20, 100, 100, None)
+        .await
+        .unwrap();
+    assert_eq!(repeated.cleaned_attempts, 0);
+    assert_eq!(
+        restarted
+            .read::<ScopeLedger>(&quota_key(&request.account.scope).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .charged_bytes,
+        ledger.charged_bytes
+    );
+
+    drop(restarted);
+    drop(metadata);
+    drop(recovery_blobs);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 fn capture_request(fixture: &LifecycleFixture, operation_id: &str, now: u64) -> CaptureRequest {

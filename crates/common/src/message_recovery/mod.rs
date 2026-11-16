@@ -253,6 +253,7 @@ enum CopyAttemptState {
     Writing,
     Verified,
     Selected,
+    Cleaning,
     Cleaned,
 }
 
@@ -323,6 +324,10 @@ pub struct RecoveryEngine {
     read_count: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     fail_after_attempt_upload: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_after_attempt_cleanup_reservation: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_after_attempt_cleanup_delete: std::sync::atomic::AtomicBool,
 }
 
 struct RawBytes(Vec<u8>);
@@ -401,6 +406,10 @@ impl RecoveryEngine {
             read_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             fail_after_attempt_upload: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_after_attempt_cleanup_reservation: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_after_attempt_cleanup_delete: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -419,6 +428,18 @@ impl RecoveryEngine {
     #[cfg(test)]
     pub(crate) fn fail_after_next_attempt_upload(&self) {
         self.fail_after_attempt_upload
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_after_next_attempt_cleanup_reservation(&self) {
+        self.fail_after_attempt_cleanup_reservation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_after_next_attempt_cleanup_delete(&self) {
+        self.fail_after_attempt_cleanup_delete
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -934,78 +955,102 @@ impl RecoveryEngine {
         stored_key_id: u32,
     ) -> Result<(Manifest, Vec<u8>)> {
         let manifest_key = scoped_key(b"manifest", scope, capture_id)?;
-        let (mut manifest, manifest_bytes) = self
-            .read::<Manifest>(&manifest_key)
-            .await?
-            .ok_or(RecoveryError::NotFound)?;
-        let position = manifest
-            .copy_attempts
-            .iter()
-            .position(|attempt| attempt.id == attempt_id)
-            .ok_or(RecoveryError::Conflict("copy attempt is missing"))?;
-        if manifest.copy_attempts[position].state != CopyAttemptState::Writing {
-            return Ok((manifest, manifest_bytes));
-        }
-        if manifest.state == ManifestState::Purging {
-            return Err(RecoveryError::InProgress);
-        }
-        let select_winner = manifest.selected_attempt_id.is_none();
-        let mut batch = BatchBuilder::new();
-        append_record_assert(&mut batch, &manifest_key, Some(&manifest_bytes))?;
-        if select_winner {
-            if manifest.state != ManifestState::Copying {
-                return Err(RecoveryError::Conflict("copy winner state changed"));
-            }
-            let server_scope = server_scope(scope);
-            let policy_key = scoped_key(b"policy", &server_scope, "")?;
-            let hold_key = scoped_key(b"hold", scope, "")?;
-            let (policy, policy_bytes) = self
-                .read::<PolicyRecord>(&policy_key)
+        let mut completed = None;
+        for _ in 0..3 {
+            let (mut manifest, manifest_bytes) = self
+                .read::<Manifest>(&manifest_key)
                 .await?
-                .ok_or(RecoveryError::Conflict("copy policy disappeared"))?;
-            let (hold, hold_bytes) = self
-                .read::<HoldControl>(&hold_key)
-                .await?
-                .ok_or(RecoveryError::Conflict("copy hold disappeared"))?;
-            if policy.scope != server_scope
-                || policy.desired_revision != manifest.policy_revision
-                || policy.digest != manifest.policy_digest
-                || policy_digest(&policy.policy)? != policy.digest
-                || hold.scope != *scope
-                || hold.active
-                || hold.epoch != manifest.hold_epoch
-            {
-                return Err(RecoveryError::Conflict(
-                    "policy or hold changed before winner selection",
-                ));
+                .ok_or(RecoveryError::NotFound)?;
+            let position = manifest
+                .copy_attempts
+                .iter()
+                .position(|attempt| attempt.id == attempt_id)
+                .ok_or(RecoveryError::Conflict("copy attempt is missing"))?;
+            if manifest.copy_attempts[position].state != CopyAttemptState::Writing {
+                completed = Some((manifest, manifest_bytes));
+                break;
             }
-            append_record_assert(&mut batch, &policy_key, Some(&policy_bytes))?;
-            append_record_assert(&mut batch, &hold_key, Some(&hold_bytes))?;
-            manifest.selected_attempt_id = Some(attempt_id);
-            manifest.copy_attempts[position].state = CopyAttemptState::Selected;
-            manifest.recovery_blob_key = manifest.copy_attempts[position].blob_key.clone();
-            manifest.stored_size = manifest.copy_attempts[position].stored_size;
-            manifest.stored_recovery_key_id = Some(stored_key_id);
-            manifest.state = ManifestState::Staging;
-        } else {
-            if manifest.selected_attempt_id == Some(attempt_id) {
-                return Err(RecoveryError::Conflict("selected attempt is still writing"));
+            if manifest.state == ManifestState::Purging {
+                return Err(RecoveryError::InProgress);
             }
-            manifest.copy_attempts[position].state = CopyAttemptState::Verified;
+            let select_winner = manifest.selected_attempt_id.is_none();
+            let mut batch = BatchBuilder::new();
+            append_record_assert(&mut batch, &manifest_key, Some(&manifest_bytes))?;
+            if select_winner {
+                if manifest.state != ManifestState::Copying {
+                    return Err(RecoveryError::Conflict("copy winner state changed"));
+                }
+                let server_scope = server_scope(scope);
+                let policy_key = scoped_key(b"policy", &server_scope, "")?;
+                let hold_key = scoped_key(b"hold", scope, "")?;
+                let (policy, policy_bytes) = self
+                    .read::<PolicyRecord>(&policy_key)
+                    .await?
+                    .ok_or(RecoveryError::Conflict("copy policy disappeared"))?;
+                let (hold, hold_bytes) = self
+                    .read::<HoldControl>(&hold_key)
+                    .await?
+                    .ok_or(RecoveryError::Conflict("copy hold disappeared"))?;
+                if policy.scope != server_scope
+                    || policy.desired_revision != manifest.policy_revision
+                    || policy.digest != manifest.policy_digest
+                    || policy_digest(&policy.policy)? != policy.digest
+                    || hold.scope != *scope
+                    || hold.active
+                    || hold.epoch != manifest.hold_epoch
+                {
+                    return Err(RecoveryError::Conflict(
+                        "policy or hold changed before winner selection",
+                    ));
+                }
+                append_record_assert(&mut batch, &policy_key, Some(&policy_bytes))?;
+                append_record_assert(&mut batch, &hold_key, Some(&hold_bytes))?;
+                manifest.selected_attempt_id = Some(attempt_id);
+                manifest.copy_attempts[position].state = CopyAttemptState::Selected;
+                manifest.recovery_blob_key = manifest.copy_attempts[position].blob_key.clone();
+                manifest.stored_size = manifest.copy_attempts[position].stored_size;
+                manifest.stored_recovery_key_id = Some(stored_key_id);
+                manifest.state = ManifestState::Staging;
+            } else {
+                if manifest.selected_attempt_id == Some(attempt_id) {
+                    return Err(RecoveryError::Conflict("selected attempt is still writing"));
+                }
+                manifest.copy_attempts[position].state = CopyAttemptState::Verified;
+            }
+            batch.set(
+                value_class(&manifest_key),
+                encode_record(&manifest, next_record_revision(Some(&manifest_bytes))?)?,
+            );
+            if batch.has_commit_points() || batch.is_large_batch() {
+                return Err(RecoveryError::BatchTooLarge);
+            }
+            match self.metadata.write_batch(&mut batch).await {
+                Ok(_) => {
+                    completed = self.read::<Manifest>(&manifest_key).await?;
+                    break;
+                }
+                Err(error) => {
+                    let latest = self.read::<Manifest>(&manifest_key).await?;
+                    if latest.as_ref().is_some_and(|(latest, _)| {
+                        latest.copy_attempts.iter().any(|attempt| {
+                            attempt.id == attempt_id && attempt.state != CopyAttemptState::Writing
+                        })
+                    }) {
+                        completed = latest;
+                        break;
+                    }
+                    if latest.as_ref().is_some_and(|(latest, bytes)| {
+                        bytes != &manifest_bytes || latest.selected_attempt_id.is_some()
+                    }) {
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+            }
         }
-        batch.set(
-            value_class(&manifest_key),
-            encode_record(&manifest, next_record_revision(Some(&manifest_bytes))?)?,
-        );
-        if batch.has_commit_points() || batch.is_large_batch() {
-            return Err(RecoveryError::BatchTooLarge);
-        }
-        self.metadata.write_batch(&mut batch).await?;
-        let current = self
-            .read::<Manifest>(&manifest_key)
-            .await?
-            .ok_or(RecoveryError::Conflict("copy manifest disappeared"))?;
-        if current.0.selected_attempt_id != Some(attempt_id) {
+        let (current, current_bytes) = completed.ok_or(RecoveryError::InProgress)?;
+        let selected = current.selected_attempt_id == Some(attempt_id);
+        if !selected {
             self.cleanup_unselected_copy_attempts(scope, capture_id)
                 .await?;
             return self
@@ -1013,7 +1058,7 @@ impl RecoveryEngine {
                 .await?
                 .ok_or(RecoveryError::Conflict("copy manifest disappeared"));
         }
-        Ok(current)
+        Ok((current, current_bytes))
     }
 
     async fn verify_recovery_copy(
