@@ -313,7 +313,7 @@ fn escape_html(value: &str) -> String {
     escaped
 }
 
-fn substitute(template: &str, values: &PresentationValues) -> String {
+fn substitute(template: &str, values: &PresentationValues) -> Result<String, PresentationError> {
     let mut output = String::with_capacity(template.len());
     let mut remaining = template;
     while let Some(start) = remaining.find("{{") {
@@ -321,17 +321,17 @@ fn substitute(template: &str, values: &PresentationValues) -> String {
         let after_open = &remaining[start + 2..];
         let end = after_open
             .find("}}")
-            .expect("validated presentation placeholder");
+            .ok_or(PresentationError::InvalidTemplate)?;
         let name = &after_open[..end];
-        let placeholder =
-            PresentationPlaceholder::from_name(name).expect("validated presentation placeholder");
+        let placeholder = PresentationPlaceholder::from_name(name)
+            .ok_or(PresentationError::UnknownPlaceholder)?;
         if let Some(value) = values.get(&placeholder) {
             output.push_str(value);
         }
         remaining = &after_open[end + 2..];
     }
     output.push_str(remaining);
-    output
+    Ok(output)
 }
 
 pub fn logo_content_id(
@@ -362,9 +362,25 @@ pub fn render(
         }
     }
 
-    let title = substitute(&document.sections.title, values);
-    let intro = substitute(&document.sections.intro, values);
-    let footer = substitute(&document.sections.footer, values);
+    let title = substitute(&document.sections.title, values)?;
+    let intro_template = if !values
+        .get(&PresentationPlaceholder::EventTitle)
+        .is_some_and(|title| !title.trim().is_empty())
+    {
+        match (document.kind, document.sections.intro.as_str()) {
+            (PresentationKind::CalendarAlarm, "You have a reminder for {{eventTitle}}.") => {
+                "You have an upcoming event reminder."
+            }
+            (PresentationKind::Scheduling, "An event has been updated: {{eventTitle}}.") => {
+                "A calendar event has been updated."
+            }
+            _ => document.sections.intro.as_str(),
+        }
+    } else {
+        document.sections.intro.as_str()
+    };
+    let intro = substitute(intro_template, values)?;
+    let footer = substitute(&document.sections.footer, values)?;
     let display_name = document.brand.display_name.trim();
     let accent = document.brand.accent.to_ascii_lowercase();
     let text = [
@@ -437,14 +453,75 @@ pub fn fallback(kind: PresentationKind) -> PresentationDocument {
     }
 }
 
+fn fallback_values(kind: PresentationKind, values: &PresentationValues) -> PresentationValues {
+    let mut placeholders = allowed_placeholders(kind).to_vec();
+    if let Some(index) = placeholders
+        .iter()
+        .position(|placeholder| *placeholder == PresentationPlaceholder::EventTitle)
+    {
+        placeholders.remove(index);
+        placeholders.insert(0, PresentationPlaceholder::EventTitle);
+    }
+    let mut safe_values = BTreeMap::new();
+    let mut total_bytes = 0;
+    for placeholder in placeholders {
+        let Some(value) = values.get(&placeholder) else {
+            continue;
+        };
+        if total_bytes + value.len() > MAX_PLACEHOLDER_VALUES_BYTES {
+            continue;
+        }
+        let candidate = BTreeMap::from([(placeholder, value.clone())]);
+        if validate_values(kind, &candidate).is_ok() {
+            total_bytes += value.len();
+            safe_values.insert(placeholder, value.clone());
+        }
+    }
+    safe_values
+}
+
+fn fallback_for_values(
+    kind: PresentationKind,
+    values: &PresentationValues,
+) -> PresentationDocument {
+    let mut document = fallback(kind);
+    if values
+        .get(&PresentationPlaceholder::EventTitle)
+        .is_some_and(|title| !title.trim().is_empty())
+    {
+        document.sections.intro = match kind {
+            PresentationKind::CalendarAlarm => "You have a reminder for {{eventTitle}}.",
+            PresentationKind::Scheduling => "An event has been updated: {{eventTitle}}.",
+            PresentationKind::Branding => return document,
+        }
+        .to_string();
+    } else {
+        document.sections.intro = match kind {
+            PresentationKind::CalendarAlarm => "You have an upcoming event reminder.",
+            PresentationKind::Scheduling => "A calendar event has been updated.",
+            PresentationKind::Branding => return document,
+        }
+        .to_string();
+    }
+    document
+}
+
+fn static_safe_fallback() -> PresentationContent {
+    PresentationContent {
+        text: "Abnormal Mail\n\nCalendar event notification\n\nYou have an upcoming event reminder.\n\nSent with Abnormal Mail.".to_string(),
+        html: "<!doctype html><html><head><meta charset=\"utf-8\"></head><body style=\"margin:0;background:#f4f5f7;font-family:Arial,sans-serif;color:#20242c\"><main style=\"max-width:600px;margin:24px auto;padding:32px;background:#fff;border-top:4px solid #3659e3\"><p style=\"margin:0 0 24px;color:#3659e3;font-size:14px;font-weight:700\">Abnormal Mail</p><h1 style=\"margin:0 0 16px;font-size:24px;line-height:1.3\">Calendar event notification</h1><p style=\"margin:0 0 24px;white-space:pre-wrap;line-height:1.6\">You have an upcoming event reminder.</p><p style=\"margin:0;color:#606875;font-size:13px;white-space:pre-wrap\">Sent with Abnormal Mail.</p></main></body></html>".to_string(),
+    }
+}
+
 pub fn render_or_fallback(
     document: &PresentationDocument,
     values: &PresentationValues,
     logo_content_id: Option<&str>,
 ) -> PresentationContent {
     render(document, values, logo_content_id).unwrap_or_else(|_| {
-        let fallback = fallback(document.kind);
-        render(&fallback, &BTreeMap::new(), None).expect("built-in presentation is valid")
+        let safe_values = fallback_values(document.kind, values);
+        let fallback = fallback_for_values(document.kind, &safe_values);
+        render(&fallback, &safe_values, None).unwrap_or_else(|_| static_safe_fallback())
     })
 }
 
@@ -459,8 +536,9 @@ pub fn render_json_or_fallback(
             render_or_fallback(&document, values, logo_content_id)
         }
         _ => {
-            let fallback = fallback(kind);
-            render(&fallback, &BTreeMap::new(), None).expect("built-in presentation is valid")
+            let safe_values = fallback_values(kind, values);
+            let fallback = fallback_for_values(kind, &safe_values);
+            render(&fallback, &safe_values, None).unwrap_or_else(|_| static_safe_fallback())
         }
     }
 }
@@ -575,7 +653,10 @@ mod tests {
         );
         let rendered = render_or_fallback(&value, &values, None);
         assert!(rendered.html.len() <= MAX_OUTPUT_BYTES);
-        assert!(!rendered.html.contains("&amp;&amp;"));
+        assert_eq!(
+            rendered.html.matches("&amp;").count(),
+            MAX_PLACEHOLDER_VALUE_BYTES
+        );
     }
 
     #[test]
@@ -595,6 +676,48 @@ mod tests {
                 .unwrap()
                 .text
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn fallback_preserves_valid_titles_and_drops_invalid_values() {
+        let values = BTreeMap::from([
+            (
+                PresentationPlaceholder::EventTitle,
+                "Quarterly review".to_string(),
+            ),
+            (
+                PresentationPlaceholder::WorkspaceName,
+                "not allowed for calendar".to_string(),
+            ),
+        ]);
+        let rendered =
+            render_json_or_fallback(PresentationKind::CalendarAlarm, "{}", &values, None);
+        assert!(rendered.text.contains("Quarterly review"));
+        assert!(!rendered.text.contains("not allowed"));
+    }
+
+    #[test]
+    fn fallback_without_a_valid_title_uses_complete_generic_intros() {
+        let empty = render_json_or_fallback(
+            PresentationKind::CalendarAlarm,
+            "{}",
+            &BTreeMap::new(),
+            None,
+        );
+        assert!(empty.text.contains("You have an upcoming event reminder."));
+
+        let oversized = BTreeMap::from([(
+            PresentationPlaceholder::EventTitle,
+            "x".repeat(MAX_PLACEHOLDER_VALUE_BYTES + 1),
+        )]);
+        let rendered =
+            render_json_or_fallback(PresentationKind::Scheduling, "{}", &oversized, None);
+        assert!(rendered.text.contains("A calendar event has been updated."));
+        assert!(
+            !rendered
+                .text
+                .contains(&"x".repeat(MAX_PLACEHOLDER_VALUE_BYTES + 1))
         );
     }
 
