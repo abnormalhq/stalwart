@@ -310,26 +310,42 @@ fn normalize_values(
     Ok(normalized_values)
 }
 
-fn escape_html(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(character),
-        }
+fn append_bounded(output: &mut String, value: &str) -> Result<(), PresentationError> {
+    let remaining = MAX_OUTPUT_BYTES
+        .checked_sub(output.len())
+        .ok_or(PresentationError::OutputTooLarge)?;
+    if value.len() > remaining {
+        return Err(PresentationError::OutputTooLarge);
     }
-    escaped
+    output.push_str(value);
+    Ok(())
 }
 
-fn substitute(template: &str, values: &PresentationValues) -> Result<String, PresentationError> {
-    let mut output = String::with_capacity(template.len());
+fn append_html_escaped(output: &mut String, value: &str) -> Result<(), PresentationError> {
+    for character in value.chars() {
+        match character {
+            '&' => append_bounded(output, "&amp;")?,
+            '<' => append_bounded(output, "&lt;")?,
+            '>' => append_bounded(output, "&gt;")?,
+            '"' => append_bounded(output, "&quot;")?,
+            '\'' => append_bounded(output, "&#39;")?,
+            character => {
+                let mut encoded = [0; 4];
+                append_bounded(output, character.encode_utf8(&mut encoded))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn substitute_into(
+    output: &mut String,
+    template: &str,
+    values: &PresentationValues,
+) -> Result<(), PresentationError> {
     let mut remaining = template;
     while let Some(start) = remaining.find("{{") {
-        output.push_str(&remaining[..start]);
+        append_bounded(output, &remaining[..start])?;
         let after_open = &remaining[start + 2..];
         let end = after_open
             .find("}}")
@@ -338,11 +354,17 @@ fn substitute(template: &str, values: &PresentationValues) -> Result<String, Pre
         let placeholder = PresentationPlaceholder::from_name(name)
             .ok_or(PresentationError::UnknownPlaceholder)?;
         if let Some(value) = values.get(&placeholder) {
-            output.push_str(value);
+            append_bounded(output, value)?;
         }
         remaining = &after_open[end + 2..];
     }
-    output.push_str(remaining);
+    append_bounded(output, remaining)?;
+    Ok(())
+}
+
+fn substitute(template: &str, values: &PresentationValues) -> Result<String, PresentationError> {
+    let mut output = String::with_capacity(template.len());
+    substitute_into(&mut output, template, values)?;
     Ok(output)
 }
 
@@ -395,36 +417,59 @@ pub fn render(
     let footer = substitute(&document.sections.footer, &values)?;
     let display_name = document.brand.display_name.trim();
     let accent = document.brand.accent.to_ascii_lowercase();
-    let text = [
+    let mut text = String::new();
+    for section in [
         display_name,
         title.as_str(),
         intro.as_str(),
         footer.as_str(),
-    ]
-    .into_iter()
-    .filter(|section| !section.is_empty())
-    .collect::<Vec<_>>()
-    .join("\n\n");
+    ] {
+        if section.is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            append_bounded(&mut text, "\n\n")?;
+        }
+        append_bounded(&mut text, section)?;
+    }
 
-    let logo = logo_content_id
-        .map(|content_id| {
-            format!(
-                "<img src=\"cid:{}\" alt=\"{}\" style=\"display:block;max-width:160px;max-height:64px;margin:0 0 20px\">",
-                escape_html(content_id),
-                escape_html(display_name)
-            )
-        })
-        .unwrap_or_default();
-    let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"></head><body style=\"margin:0;background:#f4f5f7;font-family:Arial,sans-serif;color:#20242c\"><main style=\"max-width:600px;margin:24px auto;padding:32px;background:#fff;border-top:4px solid {}\">{}<p style=\"margin:0 0 24px;color:{};font-size:14px;font-weight:700\">{}</p><h1 style=\"margin:0 0 16px;font-size:24px;line-height:1.3\">{}</h1><p style=\"margin:0 0 24px;white-space:pre-wrap;line-height:1.6\">{}</p><p style=\"margin:0;color:#606875;font-size:13px;white-space:pre-wrap\">{}</p></main></body></html>",
-        accent,
-        logo,
-        accent,
-        escape_html(display_name),
-        escape_html(&title),
-        escape_html(&intro),
-        escape_html(&footer)
-    );
+    let mut html = String::new();
+    append_bounded(
+        &mut html,
+        "<!doctype html><html><head><meta charset=\"utf-8\"></head><body style=\"margin:0;background:#f4f5f7;font-family:Arial,sans-serif;color:#20242c\"><main style=\"max-width:600px;margin:24px auto;padding:32px;background:#fff;border-top:4px solid ",
+    )?;
+    append_bounded(&mut html, &accent)?;
+    append_bounded(&mut html, "\">")?;
+    if let Some(content_id) = logo_content_id {
+        append_bounded(&mut html, "<img src=\"cid:")?;
+        append_html_escaped(&mut html, content_id)?;
+        append_bounded(&mut html, "\" alt=\"")?;
+        append_html_escaped(&mut html, display_name)?;
+        append_bounded(
+            &mut html,
+            "\" style=\"display:block;max-width:160px;max-height:64px;margin:0 0 20px\">",
+        )?;
+    }
+    append_bounded(&mut html, "<p style=\"margin:0 0 24px;color:")?;
+    append_bounded(&mut html, &accent)?;
+    append_bounded(&mut html, ";font-size:14px;font-weight:700\">")?;
+    append_html_escaped(&mut html, display_name)?;
+    append_bounded(
+        &mut html,
+        "</p><h1 style=\"margin:0 0 16px;font-size:24px;line-height:1.3\">",
+    )?;
+    append_html_escaped(&mut html, &title)?;
+    append_bounded(
+        &mut html,
+        "</h1><p style=\"margin:0 0 24px;white-space:pre-wrap;line-height:1.6\">",
+    )?;
+    append_html_escaped(&mut html, &intro)?;
+    append_bounded(
+        &mut html,
+        "</p><p style=\"margin:0;color:#606875;font-size:13px;white-space:pre-wrap\">",
+    )?;
+    append_html_escaped(&mut html, &footer)?;
+    append_bounded(&mut html, "</p></main></body></html>")?;
     if text.len() > MAX_OUTPUT_BYTES || html.len() > MAX_OUTPUT_BYTES {
         return Err(PresentationError::OutputTooLarge);
     }
@@ -670,6 +715,75 @@ mod tests {
         assert_eq!(
             rendered.html.matches("&amp;").count(),
             MAX_PLACEHOLDER_VALUE_BYTES
+        );
+    }
+
+    #[test]
+    fn bounds_repeated_placeholder_expansion_before_oversized_append() {
+        let mut value = fallback(PresentationKind::CalendarAlarm);
+        value.sections.intro = "{{location}}".repeat(125);
+        assert_eq!(value.sections.intro.len(), 1_500);
+        let values = BTreeMap::from([(
+            PresentationPlaceholder::Location,
+            "&".repeat(MAX_PLACEHOLDER_VALUE_BYTES),
+        )]);
+        let normalized = normalize_values(value.kind, &values).unwrap();
+
+        let mut substituted = String::new();
+        assert_eq!(
+            substitute_into(&mut substituted, &value.sections.intro, &normalized),
+            Err(PresentationError::OutputTooLarge)
+        );
+        assert_eq!(substituted.len(), MAX_OUTPUT_BYTES);
+        assert!(substituted.bytes().all(|byte| byte == b'&'));
+        assert_eq!(
+            render(&value, &values, None),
+            Err(PresentationError::OutputTooLarge)
+        );
+
+        let fallback = render_or_fallback(&value, &values, None);
+        assert!(
+            fallback
+                .text
+                .contains("You have an upcoming event reminder.")
+        );
+        assert!(fallback.html.len() <= MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn bounds_composition_and_html_escaping_at_utf8_byte_boundaries() {
+        let multibyte_boundary = "é".repeat(MAX_OUTPUT_BYTES / 2);
+        let mut composed = String::new();
+        append_bounded(&mut composed, &multibyte_boundary).unwrap();
+        assert_eq!(composed.len(), MAX_OUTPUT_BYTES);
+        assert_eq!(
+            append_bounded(&mut composed, "é"),
+            Err(PresentationError::OutputTooLarge)
+        );
+        assert_eq!(composed.len(), MAX_OUTPUT_BYTES);
+
+        let mut escaped = String::new();
+        append_html_escaped(&mut escaped, &multibyte_boundary).unwrap();
+        assert_eq!(escaped, multibyte_boundary);
+        assert_eq!(
+            append_html_escaped(&mut escaped, "é"),
+            Err(PresentationError::OutputTooLarge)
+        );
+        assert_eq!(escaped.len(), MAX_OUTPUT_BYTES);
+
+        let ampersands = "&".repeat(MAX_OUTPUT_BYTES / "&amp;".len() + 1);
+        let mut escaped_ampersands = String::new();
+        assert_eq!(
+            append_html_escaped(&mut escaped_ampersands, &ampersands),
+            Err(PresentationError::OutputTooLarge)
+        );
+        assert_eq!(
+            escaped_ampersands.len(),
+            (MAX_OUTPUT_BYTES / "&amp;".len()) * "&amp;".len()
+        );
+        assert_eq!(
+            escaped_ampersands,
+            "&amp;".repeat(MAX_OUTPUT_BYTES / "&amp;".len())
         );
     }
 
