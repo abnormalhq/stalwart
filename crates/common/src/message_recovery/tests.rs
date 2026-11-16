@@ -299,6 +299,279 @@ fn persistent_capture_request(
 
 #[cfg(feature = "recovery-test-sqlite")]
 #[tokio::test]
+async fn file_sqlite_legacy_unmarked_source_bytes_survive_capture_payload_and_restore() {
+    let mut fixture = persistent_lifecycle_fixture().await;
+    fixture
+        .engine
+        .activate_account(&fixture.account)
+        .await
+        .unwrap();
+
+    let mut account_batch = BatchBuilder::new();
+    account_batch.with_account_id(0).set(
+        ValueClass::Registry(RegistryClass::Item {
+            object_id: ObjectType::Account.to_id(),
+            item_id: u64::from(fixture.account.store_account_id()),
+        }),
+        b"persistent registry account".to_vec(),
+    );
+    fixture
+        .metadata
+        .write_batch(&mut account_batch)
+        .await
+        .unwrap();
+
+    let legacy_source = fixture.message.clone();
+    let source_root = fixture.root.join("legacy-source");
+    let mut source_config = registry::schema::structs::FileSystemStore::default();
+    source_config.path = source_root.to_string_lossy().into_owned();
+    source_config.depth = 0;
+    fixture.source_blobs = store::backend::fs::FsStore::open(source_config)
+        .await
+        .unwrap();
+    let source_blob_path =
+        source_root.join(encodify::base32::STALWART.encode(&fixture.source_blob_key));
+    std::fs::write(&source_blob_path, &legacy_source).unwrap();
+    assert!(BlobFormat::of(&legacy_source).is_none());
+    assert_eq!(
+        fixture
+            .source_blobs
+            .get_raw_blob(&fixture.source_blob_key)
+            .await
+            .unwrap(),
+        Some(legacy_source.clone())
+    );
+
+    let capture_request = persistent_capture_request(&fixture, "legacy-unmarked-capture", 10);
+    let prepared = fixture
+        .engine
+        .prepare_capture(
+            capture_request.clone(),
+            &fixture.source_blobs,
+            &fixture.source_keys,
+        )
+        .await
+        .unwrap();
+    let capture_id = prepared.manifest().capture_id.clone();
+    let mut source_delete = BatchBuilder::new();
+    prepared
+        .append_to_delete_batch(&mut source_delete, 11)
+        .unwrap();
+    source_delete
+        .with_account_id(capture_request.source.account_id)
+        .with_collection(capture_request.source.collection)
+        .with_document(capture_request.source.document_id)
+        .clear(ValueClass::Property(Field::ARCHIVE.into()));
+    fixture
+        .metadata
+        .write_batch(&mut source_delete)
+        .await
+        .unwrap();
+    drop(prepared);
+
+    let manifest = fixture
+        .engine
+        .get(fixture.account.scope(), &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let stored_recovery_copy = fixture
+        .recovery_blobs
+        .get_raw_blob(&manifest.recovery_blob_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        BlobFormat::of(&stored_recovery_copy).unwrap().key_id,
+        Some(2)
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .get_payload(fixture.account.scope(), &capture_id)
+            .await
+            .unwrap(),
+        Some(legacy_source.clone())
+    );
+
+    let importer =
+        TestRestoreImporter::new(fixture.metadata.clone(), legacy_source.clone(), vec![0]);
+    let outcome = fixture
+        .engine
+        .restore(
+            restore_request(&fixture.account, &capture_id, "legacy-unmarked-restore"),
+            &fixture.source_keys,
+            &importer,
+        )
+        .await
+        .unwrap();
+    let RestoreOutcome::Completed { result } = outcome else {
+        panic!("restore did not complete")
+    };
+    assert_eq!(
+        email_payload(&fixture.metadata, result.document_id).await,
+        Some(legacy_source.clone())
+    );
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 1);
+
+    let mut restore_source_archive = BatchBuilder::new();
+    restore_source_archive
+        .with_account_id(capture_request.source.account_id)
+        .with_collection(capture_request.source.collection)
+        .with_document(capture_request.source.document_id)
+        .set(
+            ValueClass::Property(Field::ARCHIVE.into()),
+            1u64.to_be_bytes().to_vec(),
+        );
+    fixture
+        .metadata
+        .write_batch(&mut restore_source_archive)
+        .await
+        .unwrap();
+
+    fixture
+        .source_blobs
+        .put_blob(
+            &fixture.source_blob_key,
+            &legacy_source,
+            &BlobOpts::new(
+                CompressionAlgo::None,
+                BlobEncryption::Key(fixture.recovery_key.clone()),
+            ),
+        )
+        .await
+        .unwrap();
+    let same_key_source = fixture
+        .source_blobs
+        .get_raw_blob(&fixture.source_blob_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(BlobFormat::of(&same_key_source).unwrap().key_id, Some(2));
+    assert!(matches!(
+        fixture
+            .engine
+            .prepare_capture(
+                persistent_capture_request(&fixture, "same-recovery-key", 12),
+                &fixture.source_blobs,
+                &fixture.source_keys,
+            )
+            .await,
+        Err(RecoveryError::Invalid(
+            "recovery key must differ from source key"
+        ))
+    ));
+
+    let mut oversized_compressed = BlobOpts::compressed(CompressionAlgo::Lz4)
+        .encode(&fixture.source_blob_key, &vec![b'A'; 4096])
+        .unwrap();
+    oversized_compressed[..4]
+        .copy_from_slice(&u32::try_from(MAX_BLOB_BYTES + 1).unwrap().to_le_bytes());
+    let oversized_format = BlobFormat::of(&oversized_compressed).unwrap();
+    assert_eq!(oversized_format.compression, CompressionAlgo::Lz4);
+    assert_eq!(oversized_format.key_id, None);
+    assert!(oversized_compressed.len() < MAX_BLOB_BYTES);
+    std::fs::write(&source_blob_path, &oversized_compressed).unwrap();
+    assert!(matches!(
+        fixture
+            .engine
+            .prepare_capture(
+                persistent_capture_request(&fixture, "oversized-advertised-source", 13),
+                &fixture.source_blobs,
+                &fixture.source_keys,
+            )
+            .await,
+        Err(RecoveryError::Store(error))
+            if matches!(
+                error.event_type(),
+                trc::EventType::Store(trc::StoreEvent::DecompressError)
+            )
+    ));
+
+    let source_key = Arc::new(BlobKey::new(
+        1,
+        SymmetricCipher::Aes256Gcm,
+        &[1; BLOB_KEY_LEN],
+    ));
+    fixture
+        .source_blobs
+        .put_blob(
+            &fixture.source_blob_key,
+            &legacy_source,
+            &BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(source_key)),
+        )
+        .await
+        .unwrap();
+    let mut corrupted_encrypted_source = fixture
+        .source_blobs
+        .get_raw_blob(&fixture.source_blob_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        BlobFormat::of(&corrupted_encrypted_source).unwrap().key_id,
+        Some(1)
+    );
+    corrupted_encrypted_source[0] ^= 1;
+    assert_eq!(
+        BlobFormat::of(&corrupted_encrypted_source).unwrap().key_id,
+        Some(1)
+    );
+    std::fs::write(&source_blob_path, &corrupted_encrypted_source).unwrap();
+    assert!(matches!(
+        fixture
+            .engine
+            .prepare_capture(
+                persistent_capture_request(&fixture, "corrupted-encrypted-source", 14),
+                &fixture.source_blobs,
+                &fixture.source_keys,
+            )
+            .await,
+        Err(RecoveryError::Store(error))
+            if matches!(
+                error.event_type(),
+                trc::EventType::Store(trc::StoreEvent::DecryptError)
+            )
+    ));
+
+    let unavailable_key = Arc::new(BlobKey::new(
+        3,
+        SymmetricCipher::Aes256Gcm,
+        &[3; BLOB_KEY_LEN],
+    ));
+    let unavailable_key_source =
+        BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(unavailable_key))
+            .encode(&fixture.source_blob_key, &legacy_source)
+            .unwrap();
+    assert_eq!(
+        BlobFormat::of(&unavailable_key_source).unwrap().key_id,
+        Some(3)
+    );
+    std::fs::write(&source_blob_path, &unavailable_key_source).unwrap();
+    assert!(matches!(
+        fixture
+            .engine
+            .prepare_capture(
+                persistent_capture_request(&fixture, "unavailable-source-key", 15),
+                &fixture.source_blobs,
+                &fixture.source_keys,
+            )
+            .await,
+        Err(RecoveryError::Store(error))
+            if matches!(
+                error.event_type(),
+                trc::EventType::Store(trc::StoreEvent::DecryptError)
+            )
+    ));
+
+    let root = fixture.root.clone();
+    drop(importer);
+    drop(fixture);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "recovery-test-sqlite")]
+#[tokio::test]
 async fn file_sqlite_restore_retries_payload_read_after_reopen_without_duplicate_import() {
     let fixture = persistent_lifecycle_fixture().await;
     let capture_request = persistent_capture_request(&fixture, "sqlite-restore-capture", 10);
