@@ -429,7 +429,7 @@ async fn file_sqlite_restore_retries_payload_read_after_reopen_without_duplicate
         1
     );
 
-    let importer = TestRestoreImporter::new(metadata.clone(), message, vec![0]);
+    let importer = TestRestoreImporter::new(metadata.clone(), message.clone(), vec![0]);
     let outcome = engine
         .restore(request.clone(), &source_keys, &importer)
         .await
@@ -448,6 +448,12 @@ async fn file_sqlite_restore_retries_payload_read_after_reopen_without_duplicate
         importer.committed_results.lock().unwrap().as_slice(),
         &[result.clone()]
     );
+    assert_eq!(
+        email_payload(&metadata, result.document_id)
+            .await
+            .as_deref(),
+        Some(message.as_slice())
+    );
 
     let replay = engine
         .restore(request, &source_keys, &importer)
@@ -456,6 +462,11 @@ async fn file_sqlite_restore_retries_payload_read_after_reopen_without_duplicate
     assert_eq!(replay, outcome);
     assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 1);
     assert_eq!(importer.committed_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        email_payload(&metadata, result.document_id + 1)
+            .await
+            .is_none()
+    );
     assert_eq!(
         engine
             .account_lifecycle_status(account.scope())
@@ -2156,17 +2167,15 @@ async fn corrupt_recovery_copy_fails_restore_without_import_or_gate_leak() {
         .await
         .unwrap()
         .unwrap();
-    let wrong_key = Arc::new(BlobKey::new(
-        2,
-        SymmetricCipher::Aes256Gcm,
-        &[9; BLOB_KEY_LEN],
-    ));
     fixture
         .recovery_blobs
         .put_blob(
             &manifest.recovery_blob_key,
             b"corrupted recovery bytes",
-            &BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(wrong_key)),
+            &BlobOpts::new(
+                CompressionAlgo::None,
+                BlobEncryption::Key(fixture.recovery_key.clone()),
+            ),
         )
         .await
         .unwrap();
@@ -2217,6 +2226,119 @@ async fn corrupt_recovery_copy_fails_restore_without_import_or_gate_leak() {
                 .is_none()
         );
     }
+}
+
+#[tokio::test]
+async fn recovery_payload_authentication_failure_is_terminal_without_gate_leak() {
+    let fixture = lifecycle_fixture().await;
+    let capture_id = preserve_fixture_capture(&fixture, "restore-auth-failure", 100, 110).await;
+    let manifest = fixture
+        .engine
+        .get(fixture.account.scope(), &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let original_stored = fixture
+        .recovery_blobs
+        .get_raw_blob(&manifest.recovery_blob_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let original_format = BlobFormat::of(&original_stored).unwrap();
+    assert_eq!(original_stored.len() as u64, manifest.stored_size);
+    assert_eq!(original_format.key_id, manifest.stored_recovery_key_id);
+    let original_payload = fixture
+        .engine
+        .get_payload(fixture.account.scope(), &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fixture
+            .source_keys
+            .decode_bounded(
+                &manifest.original_blob_key,
+                original_payload.clone(),
+                MAX_BLOB_BYTES,
+            )
+            .unwrap(),
+        fixture.message
+    );
+
+    let wrong_key = Arc::new(BlobKey::new(
+        2,
+        SymmetricCipher::Aes256Gcm,
+        &[9; BLOB_KEY_LEN],
+    ));
+    fixture
+        .recovery_blobs
+        .put_blob(
+            &manifest.recovery_blob_key,
+            &original_payload,
+            &BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(wrong_key)),
+        )
+        .await
+        .unwrap();
+    let wrong_stored = fixture
+        .recovery_blobs
+        .get_raw_blob(&manifest.recovery_blob_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(wrong_stored.len() as u64, manifest.stored_size);
+    let wrong_format = BlobFormat::of(&wrong_stored).unwrap();
+    assert_eq!(wrong_format.key_id, original_format.key_id);
+    assert_eq!(wrong_format.key_id, Some(2));
+    assert!(matches!(
+        fixture
+            .engine
+            .keys
+            .decode_bounded(&manifest.recovery_blob_key, wrong_stored, MAX_BLOB_BYTES,)
+            .unwrap_err()
+            .event_type(),
+        trc::EventType::Store(trc::StoreEvent::DecryptError)
+    ));
+
+    let importer =
+        TestRestoreImporter::new(fixture.metadata.clone(), fixture.message.clone(), vec![11]);
+    let request = restore_request(&fixture.account, &capture_id, "restore-auth-failure-op");
+    assert!(matches!(
+        fixture
+            .engine
+            .restore(request.clone(), &fixture.source_keys, &importer)
+            .await,
+        Err(RecoveryError::BlobMismatch)
+    ));
+    assert!(matches!(
+        fixture
+            .engine
+            .restore(request, &fixture.source_keys, &importer)
+            .await
+            .unwrap(),
+        RestoreOutcome::Failed { .. }
+    ));
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(importer.committed_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .engine
+            .account_lifecycle_status(fixture.account.scope())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_restores,
+        0
+    );
+    assert!(matches!(
+        fixture
+            .engine
+            .lifecycle_summary(fixture.account.scope(), &capture_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .active_operation,
+        None
+    ));
 }
 
 #[tokio::test]

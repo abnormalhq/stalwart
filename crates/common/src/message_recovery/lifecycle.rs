@@ -209,8 +209,9 @@ pub trait RestoreImporter: Send + Sync {
     /// Decode the original payload with `source_keys.decode_bounded` before parsing RFC822, then
     /// append email_ingest_into operations. Map authentication, format, and checksum failures to
     /// `RecoveryError::BlobMismatch`; return `RecoveryError::Store` only for retryable backend I/O.
-    /// This method must not commit or perform external writes. Never use cached account() or
-    /// email_ingest.
+    /// Native staged blobs may be written only when safe to leave unreferenced if the caller batch
+    /// is discarded. Do not independently commit message, account, or receipt metadata, or perform
+    /// unfenced account/folder mutations. Never use cached account() or email_ingest.
     fn prepare<'a>(
         &'a self,
         payload: &'a [u8],
