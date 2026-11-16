@@ -94,6 +94,7 @@ pub mod i18n;
 pub mod ipc;
 pub mod mail_capabilities;
 pub mod manager;
+pub mod message_recovery;
 pub mod network;
 pub mod scripts;
 pub mod sharing;

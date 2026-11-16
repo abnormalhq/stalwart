@@ -15,8 +15,10 @@ use store::{
 };
 use types::{collection::Collection, field::Field};
 
+mod lifecycle;
 #[cfg(test)]
 mod tests;
+pub use lifecycle::*;
 
 const PREFIX: &[u8] = b"abnormal-retention:v1:";
 const MAX_RECORD_BYTES: usize = 1_048_576;
@@ -30,6 +32,9 @@ pub enum RecoveryError {
     Serialization(serde_json::Error),
     Invalid(&'static str),
     Conflict(&'static str),
+    InProgress,
+    NotFound,
+    BatchTooLarge,
     Held,
     QuotaExceeded,
     BlobMissing,
@@ -68,6 +73,14 @@ impl VerifiedAccountMapping {
             scope,
             store_account_id,
         })
+    }
+
+    pub fn scope(&self) -> &RecoveryScope {
+        &self.scope
+    }
+
+    pub fn store_account_id(&self) -> u32 {
+        self.store_account_id
     }
 }
 
@@ -186,13 +199,16 @@ impl CaptureMetadata {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ManifestState {
+    Copying,
     Staging,
     Preserved,
+    Purging,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
     pub capture_id: String,
+    pub capture_operation_id: String,
     pub scope: RecoveryScope,
     pub state: ManifestState,
     pub original_blob_key: Vec<u8>,
@@ -202,6 +218,8 @@ pub struct Manifest {
     pub source_document_id: u32,
     pub source_revision: u64,
     pub created_at: u64,
+    #[serde(default)]
+    pub deleted_at: Option<u64>,
     pub expires_at: u64,
     pub cause: String,
     pub folders: Vec<String>,
@@ -228,6 +246,8 @@ struct HoldControl {
     scope: RecoveryScope,
     epoch: u64,
     active: bool,
+    #[serde(default)]
+    pending_purges: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -261,6 +281,16 @@ pub struct RecoveryEngine {
     options: BlobOpts,
     keys: BlobKeyring,
     recovery_key_id: u32,
+    #[cfg(test)]
+    purge_finalization_fault: std::sync::atomic::AtomicBool,
+}
+
+struct RawBytes(Vec<u8>);
+
+impl store::Deserialize for RawBytes {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
+        Ok(Self(bytes.to_vec()))
+    }
 }
 
 impl RecoveryEngine {
@@ -272,6 +302,34 @@ impl RecoveryEngine {
         options: BlobOpts,
         keys: BlobKeyring,
     ) -> Result<Self> {
+        Self::new_inner(metadata, blobs, options, keys, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        metadata: Store,
+        blobs: BlobStore,
+        options: BlobOpts,
+        keys: BlobKeyring,
+    ) -> Result<Self> {
+        Self::new_inner(metadata, blobs, options, keys, true)
+    }
+
+    fn new_inner(
+        metadata: Store,
+        blobs: BlobStore,
+        options: BlobOpts,
+        keys: BlobKeyring,
+        allow_ephemeral: bool,
+    ) -> Result<Self> {
+        if metadata.is_none()
+            || !metadata.same_instance(&metadata)
+            || (!allow_ephemeral && matches!(&metadata, Store::Ephemeral(_)))
+        {
+            return Err(RecoveryError::Invalid(
+                "metadata store must support atomic transactions",
+            ));
+        }
         let key = match &options.encryption {
             BlobEncryption::Key(key) => key,
             BlobEncryption::None => {
@@ -297,7 +355,15 @@ impl RecoveryEngine {
             options,
             keys,
             recovery_key_id,
+            #[cfg(test)]
+            purge_finalization_fault: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_purge_finalization(&self) {
+        self.purge_finalization_fault
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub async fn set_policy(
@@ -353,6 +419,25 @@ impl RecoveryEngine {
         Ok(record)
     }
 
+    pub async fn policy_status(&self, scope: &TenantServerScope) -> Result<Option<PolicyRecord>> {
+        if !valid_server_scope(scope) {
+            return Err(RecoveryError::Invalid("policy scope"));
+        }
+        let key = scoped_key(b"policy", scope, "")?;
+        let Some((record, _)) = self.read::<PolicyRecord>(&key).await? else {
+            return Ok(None);
+        };
+        if record.scope != *scope
+            || record.desired_revision == 0
+            || record.desired_revision > MAX_SAFE_INTEGER
+            || !record.policy.validate().is_ok()
+            || policy_digest(&record.policy)? != record.digest
+        {
+            return Err(RecoveryError::Conflict("stored policy is invalid"));
+        }
+        Ok(Some(record))
+    }
+
     pub async fn sync_hold(&self, scope: RecoveryScope, epoch: u64, active: bool) -> Result<()> {
         if !valid_recovery_scope(&scope) {
             return Err(RecoveryError::Invalid("hold scope"));
@@ -367,9 +452,13 @@ impl RecoveryEngine {
                 scope: scope.clone(),
                 epoch: 0,
                 active: false,
+                pending_purges: 0,
             },
             |(h, _)| h.clone(),
         );
+        if hold.pending_purges != 0 {
+            return Err(RecoveryError::InProgress);
+        }
         if epoch == hold.epoch && active == hold.active {
             return Ok(());
         }
@@ -448,15 +537,13 @@ impl RecoveryEngine {
                 "recovery key must differ from source key",
             ));
         }
-        source_keys.decode(&request.original_blob_key, raw.clone())?;
+        source_keys.decode_bounded(&request.original_blob_key, raw.clone(), MAX_BLOB_BYTES)?;
         let checksum = digest_hex(&raw);
         let storage_key = recovery_blob_key(&scope, &request.metadata.operation_id)?;
         let encoded_size = self.options.encode(&storage_key, &raw)?.len() as u64;
-        let expires_at = request
-            .now
-            .checked_add(u64::from(policy.policy.recovery_days.unwrap()) * 86_400)
-            .filter(|expires_at| *expires_at <= MAX_SAFE_INTEGER)
-            .ok_or(RecoveryError::Invalid("recovery expiry overflow"))?;
+        let retention_days = policy.policy.recovery_days.ok_or(RecoveryError::Invalid(
+            "enabled policy has no retention period",
+        ))?;
         let capture_id = hash_hex(
             &[
                 scope_hash(&scope)?.as_bytes(),
@@ -465,10 +552,19 @@ impl RecoveryEngine {
             .concat(),
         );
         let manifest_key = scoped_key(b"manifest", &scope, &capture_id)?;
+        let tombstone_key = scoped_key(b"tombstone", &scope, &capture_id)?;
+        if self.read::<PurgeTombstone>(&tombstone_key).await?.is_some() {
+            return Err(RecoveryError::Conflict("capture was permanently purged"));
+        }
         let existing = self.read::<Manifest>(&manifest_key).await?;
+        let mut registered_writer = false;
         if let Some((manifest, _)) = &existing {
+            if manifest.state == ManifestState::Copying {
+                return Err(RecoveryError::InProgress);
+            }
             if manifest.state != ManifestState::Staging
                 || manifest.scope != scope
+                || manifest.capture_operation_id != request.metadata.operation_id
                 || manifest.original_blob_key != request.original_blob_key
                 || manifest.source_revision != request.source.revision
                 || manifest.source_account_id != request.source.account_id
@@ -490,6 +586,9 @@ impl RecoveryEngine {
                 ));
             }
         } else {
+            if self.blobs.get_raw_blob(&storage_key).await?.is_some() {
+                return Err(RecoveryError::Conflict("unowned recovery blob key exists"));
+            }
             let ledger_key = quota_key(&scope)?;
             let ledger_old = self.read::<ScopeLedger>(&ledger_key).await?;
             let mut ledger = ledger_old
@@ -511,8 +610,9 @@ impl RecoveryEngine {
             ledger.captures.push(capture_id.clone());
             let manifest = Manifest {
                 capture_id: capture_id.clone(),
+                capture_operation_id: request.metadata.operation_id.clone(),
                 scope: scope.clone(),
-                state: ManifestState::Staging,
+                state: ManifestState::Copying,
                 original_blob_key: request.original_blob_key.clone(),
                 recovery_blob_key: storage_key.clone(),
                 source_account_id: request.source.account_id,
@@ -520,7 +620,8 @@ impl RecoveryEngine {
                 source_document_id: request.source.document_id,
                 source_revision: request.source.revision,
                 created_at: request.now,
-                expires_at,
+                deleted_at: None,
+                expires_at: 0,
                 cause: request.metadata.cause.clone(),
                 folders: request.metadata.folders.clone(),
                 keywords: request.metadata.keywords.clone(),
@@ -553,12 +654,28 @@ impl RecoveryEngine {
             batch
                 .with_account_id(0)
                 .assert_value(value_class(&manifest_key), ());
+            batch
+                .with_account_id(0)
+                .assert_value(value_class(&tombstone_key), ());
             batch.set(
                 value_class(&ledger_key),
                 encode_record(&ledger, ledger_revision)?,
             );
             batch.set(value_class(&manifest_key), encode_record(&manifest, 1)?);
-            self.metadata.write_batch(&mut batch).await?;
+            if batch.has_commit_points() || batch.is_large_batch() {
+                return Err(RecoveryError::BatchTooLarge);
+            }
+            if let Err(error) = self.metadata.write_batch(&mut batch).await {
+                if self
+                    .read::<Manifest>(&manifest_key)
+                    .await?
+                    .is_some_and(|(current, _)| current.state == ManifestState::Copying)
+                {
+                    return Err(RecoveryError::InProgress);
+                }
+                return Err(error.into());
+            }
+            registered_writer = true;
         }
         let (staging, staging_bytes) = self
             .read::<Manifest>(&manifest_key)
@@ -572,7 +689,7 @@ impl RecoveryEngine {
                 "policy or hold changed after reservation",
             ));
         }
-        if self.blobs.get_raw_blob(&storage_key).await?.is_none() {
+        if registered_writer {
             self.blobs
                 .put_blob(&storage_key, &raw, &self.options)
                 .await?;
@@ -587,11 +704,38 @@ impl RecoveryEngine {
             return Err(RecoveryError::BlobMismatch);
         }
         let stored_size = stored.len() as u64;
-        let decoded = self.keys.decode(&storage_key, stored)?;
+        let decoded = self
+            .keys
+            .decode_bounded(&storage_key, stored, MAX_BLOB_BYTES)?;
         if stored_size != encoded_size || decoded != raw || digest_hex(&decoded) != checksum {
             return Err(RecoveryError::BlobMismatch);
         }
-        let mut ready = staging.clone();
+        let (mut ready, ready_bytes) = if registered_writer {
+            let mut staged = staging.clone();
+            staged.state = ManifestState::Staging;
+            let mut batch = BatchBuilder::new();
+            batch
+                .with_account_id(0)
+                .assert_value(value_class(&policy_key), record_revision(&policy_bytes)?)
+                .assert_value(value_class(&hold_key), record_revision(&hold_bytes)?)
+                .assert_value(value_class(&manifest_key), record_revision(&staging_bytes)?);
+            batch.with_account_id(0).set(
+                value_class(&manifest_key),
+                encode_record(&staged, next_record_revision(Some(&staging_bytes))?)?,
+            );
+            if batch.has_commit_points() || batch.is_large_batch() {
+                return Err(RecoveryError::BatchTooLarge);
+            }
+            self.metadata.write_batch(&mut batch).await?;
+            self.read::<Manifest>(&manifest_key)
+                .await?
+                .ok_or(RecoveryError::Conflict("staging manifest disappeared"))?
+        } else {
+            (staging, staging_bytes)
+        };
+        if ready.state != ManifestState::Staging {
+            return Err(RecoveryError::Conflict("capture is not verified staging"));
+        }
         ready.state = ManifestState::Preserved;
         Ok(PreparedCapture {
             policy_key,
@@ -599,9 +743,10 @@ impl RecoveryEngine {
             manifest_key,
             policy_record_revision: record_revision(&policy_bytes)?,
             hold_revision: record_revision(&hold_bytes)?,
-            manifest_revision: record_revision(&staging_bytes)?,
+            manifest_revision: record_revision(&ready_bytes)?,
             source: request.source,
             manifest: ready,
+            retention_days,
         })
     }
 
@@ -639,7 +784,9 @@ impl RecoveryEngine {
         if stored.len() as u64 != manifest.stored_size {
             return Err(RecoveryError::BlobMismatch);
         }
-        let decoded = self.keys.decode(&manifest.recovery_blob_key, stored)?;
+        let decoded =
+            self.keys
+                .decode_bounded(&manifest.recovery_blob_key, stored, MAX_BLOB_BYTES)?;
         if decoded.len() as u64 != manifest.size || digest_hex(&decoded) != manifest.sha256 {
             return Err(RecoveryError::BlobMismatch);
         }
@@ -683,7 +830,11 @@ impl RecoveryEngine {
     }
 
     async fn read<T: for<'de> Deserialize<'de>>(&self, key: &[u8]) -> Result<Option<(T, Vec<u8>)>> {
-        let raw = self.metadata.get_value::<Vec<u8>>(any_key(key)).await?;
+        let raw = self
+            .metadata
+            .get_value::<RawBytes>(any_key(key))
+            .await?
+            .map(|value| value.0);
         raw.map(|bytes| {
             let value = decode_record(&bytes)?;
             Ok((value, bytes))
@@ -733,6 +884,7 @@ pub struct PreparedCapture {
     manifest_revision: u64,
     source: SourceAssertion,
     manifest: Manifest,
+    retention_days: u16,
 }
 
 impl PreparedCapture {
@@ -741,12 +893,23 @@ impl PreparedCapture {
     }
 
     /// Append immediately before source destruction; callers must keep the complete deletion in this same segment.
-    pub fn append_to_delete_batch(&self, batch: &mut BatchBuilder) -> Result<()> {
-        if batch.is_large_batch() {
+    pub fn append_to_delete_batch(&self, batch: &mut BatchBuilder, deleted_at: u64) -> Result<()> {
+        if deleted_at == 0 || deleted_at > MAX_SAFE_INTEGER {
+            return Err(RecoveryError::Invalid("deletion timestamp"));
+        }
+        if batch.has_commit_points() || batch.is_large_batch() {
             return Err(RecoveryError::Conflict(
                 "append recovery barrier before batch reaches a commit split",
             ));
         }
+        let expires_at = deleted_at
+            .checked_add(u64::from(self.retention_days) * 86_400)
+            .filter(|expires_at| *expires_at <= MAX_SAFE_INTEGER)
+            .ok_or(RecoveryError::Invalid("recovery expiry overflow"))?;
+        let mut preserved = self.manifest.clone();
+        preserved.state = ManifestState::Preserved;
+        preserved.deleted_at = Some(deleted_at);
+        preserved.expires_at = expires_at;
         let preserved_revision = self
             .manifest_revision
             .checked_add(1)
@@ -771,7 +934,7 @@ impl PreparedCapture {
         }
         batch.with_account_id(0).set(
             value_class(&self.manifest_key),
-            encode_record(&self.manifest, preserved_revision)?,
+            encode_record(&preserved, preserved_revision)?,
         );
         if batch.is_large_batch() {
             return Err(RecoveryError::Conflict(

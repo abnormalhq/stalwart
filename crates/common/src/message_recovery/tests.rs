@@ -4,12 +4,24 @@
 
 use super::*;
 use registry::schema::enums::{CompressionAlgo, SymmetricCipher};
-use std::sync::Arc;
-use store::{
-    BlobStore, ValueKey,
-    backend::ephemeral::EphemeralStore,
-    write::blob_codec::{BLOB_KEY_LEN, BlobKey},
+use registry::{schema::prelude::ObjectType, types::EnumImpl};
+use std::{
+    future::Future,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
+use store::{
+    BlobStore, Store, ValueKey,
+    backend::ephemeral::EphemeralStore,
+    write::{
+        AssignedIds, PendingId, RegistryClass, Slot,
+        blob_codec::{BLOB_KEY_LEN, BlobKey},
+    },
+};
+use tokio::sync::{Notify, Semaphore, mpsc};
+use xxhash_rust::xxh3::xxh3_64;
 
 fn scope() -> RecoveryScope {
     RecoveryScope {
@@ -42,6 +54,1091 @@ async fn set_policy(
     engine
         .set_policy(scope, desired_revision, &digest, policy)
         .await
+}
+
+struct LifecycleFixture {
+    engine: Arc<RecoveryEngine>,
+    metadata: Store,
+    source_blobs: BlobStore,
+    recovery_blobs: BlobStore,
+    source_keys: Arc<BlobKeyring>,
+    recovery_key: Arc<BlobKey>,
+    account: VerifiedAccountMapping,
+    source_blob_key: Vec<u8>,
+    message: Vec<u8>,
+}
+
+async fn lifecycle_fixture() -> LifecycleFixture {
+    let metadata = EphemeralStore::open();
+    let source_blobs = BlobStore::Store(EphemeralStore::open());
+    let recovery_blobs = BlobStore::Store(EphemeralStore::open());
+    let source_key = Arc::new(BlobKey::new(
+        1,
+        SymmetricCipher::Aes256Gcm,
+        &[1; BLOB_KEY_LEN],
+    ));
+    let recovery_key = Arc::new(BlobKey::new(
+        2,
+        SymmetricCipher::Aes256Gcm,
+        &[2; BLOB_KEY_LEN],
+    ));
+    let source_keys = Arc::new(BlobKeyring::new(vec![source_key.clone()]));
+    let recovery_keys = BlobKeyring::new(vec![recovery_key.clone()]);
+    let message = b"From: restore@example.test\r\nTo: user@example.test\r\nSubject: recovery\r\n\r\nOriginal message.\r\n".to_vec();
+    let source_blob_key = b"source-message-key".to_vec();
+    source_blobs
+        .put_blob(
+            &source_blob_key,
+            &message,
+            &BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(source_key)),
+        )
+        .await
+        .unwrap();
+
+    let engine = Arc::new(
+        RecoveryEngine::new_for_test(
+            metadata.clone(),
+            recovery_blobs.clone(),
+            BlobOpts::new(
+                CompressionAlgo::None,
+                BlobEncryption::Key(recovery_key.clone()),
+            ),
+            recovery_keys,
+        )
+        .unwrap(),
+    );
+    let recovery_scope = scope();
+    let account = VerifiedAccountMapping::from_verified_binding(recovery_scope.clone(), 7).unwrap();
+    set_policy(&engine, server_scope(&recovery_scope), 1, enabled_policy())
+        .await
+        .unwrap();
+    engine
+        .sync_hold(recovery_scope.clone(), 1, false)
+        .await
+        .unwrap();
+    engine.activate_account(&account).await.unwrap();
+
+    let account_record = b"verified-registry-account-record".to_vec();
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(0)
+        .set(
+            ValueClass::Registry(RegistryClass::Item {
+                object_id: ObjectType::Account.to_id(),
+                item_id: 7,
+            }),
+            account_record,
+        )
+        .with_account_id(7)
+        .with_collection(Collection::Email)
+        .with_document(42)
+        .set(
+            ValueClass::Property(Field::ARCHIVE.into()),
+            1u64.to_be_bytes().to_vec(),
+        );
+    metadata.write_batch(&mut batch).await.unwrap();
+
+    LifecycleFixture {
+        engine,
+        metadata,
+        source_blobs,
+        recovery_blobs,
+        source_keys,
+        recovery_key,
+        account,
+        source_blob_key,
+        message,
+    }
+}
+
+fn capture_request(fixture: &LifecycleFixture, operation_id: &str, now: u64) -> CaptureRequest {
+    CaptureRequest {
+        account: fixture.account.clone(),
+        metadata: CaptureMetadata {
+            operation_id: operation_id.to_string(),
+            cause: "expunge".into(),
+            received_at: Some(9),
+            folders: vec!["Inbox".into()],
+            keywords: vec!["$seen".into()],
+        },
+        original_blob_key: fixture.source_blob_key.clone(),
+        source: SourceAssertion {
+            account_id: fixture.account.store_account_id(),
+            collection: Collection::Email,
+            document_id: 42,
+            revision_property: Field::ARCHIVE.into(),
+            revision: 1,
+        },
+        now,
+    }
+}
+
+async fn preserve_fixture_capture(
+    fixture: &LifecycleFixture,
+    operation_id: &str,
+    staging_at: u64,
+    deleted_at: u64,
+) -> String {
+    let prepared = fixture
+        .engine
+        .prepare_capture(
+            capture_request(fixture, operation_id, staging_at),
+            &fixture.source_blobs,
+            &fixture.source_keys,
+        )
+        .await
+        .unwrap();
+    let capture_id = prepared.manifest().capture_id.clone();
+    let mut batch = BatchBuilder::new();
+    prepared
+        .append_to_delete_batch(&mut batch, deleted_at)
+        .unwrap();
+    batch
+        .with_account_id(fixture.account.store_account_id())
+        .with_collection(Collection::Email)
+        .with_document(42)
+        .clear(ValueClass::Property(Field::ARCHIVE.into()));
+    fixture.metadata.write_batch(&mut batch).await.unwrap();
+    capture_id
+}
+
+struct TestRestoreImporter {
+    metadata: Store,
+    expected_message: Vec<u8>,
+    mailbox_ids: Vec<u32>,
+    prepare_calls: Arc<AtomicUsize>,
+    committed_calls: Arc<AtomicUsize>,
+    committed_results: Arc<Mutex<Vec<RestoreResult>>>,
+    stale_assertion: Arc<AtomicBool>,
+    panic_after_commit: Arc<AtomicBool>,
+    force_split: Arc<AtomicBool>,
+    prepare_gate: Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>,
+    live_assertion_gate: Option<(Arc<Notify>, Arc<Semaphore>)>,
+}
+
+struct TestRestorePending {
+    document_slot: Slot,
+    thread_slot: Slot,
+    mailbox_slots: Vec<(u32, Slot)>,
+    decoded_message: Vec<u8>,
+    committed_calls: Arc<AtomicUsize>,
+    committed_results: Arc<Mutex<Vec<RestoreResult>>>,
+    panic_after_commit: Arc<AtomicBool>,
+}
+
+impl TestRestoreImporter {
+    fn new(metadata: Store, expected_message: Vec<u8>, mailbox_ids: Vec<u32>) -> Self {
+        Self {
+            metadata,
+            expected_message,
+            mailbox_ids,
+            prepare_calls: Arc::new(AtomicUsize::new(0)),
+            committed_calls: Arc::new(AtomicUsize::new(0)),
+            committed_results: Arc::new(Mutex::new(Vec::new())),
+            stale_assertion: Arc::new(AtomicBool::new(false)),
+            panic_after_commit: Arc::new(AtomicBool::new(false)),
+            force_split: Arc::new(AtomicBool::new(false)),
+            prepare_gate: None,
+            live_assertion_gate: None,
+        }
+    }
+
+    fn stale_next_account_assertion(&self) {
+        self.stale_assertion.store(true, Ordering::SeqCst);
+    }
+}
+
+impl RestoreImporter for TestRestoreImporter {
+    type Pending = TestRestorePending;
+
+    fn live_account_assertion<'a>(
+        &'a self,
+        destination: &'a VerifiedAccountMapping,
+    ) -> impl Future<Output = Result<AuthoritativeAccountAssertion>> + Send {
+        async move {
+            if let Some((entered, gate)) = &self.live_assertion_gate {
+                entered.notify_one();
+                gate.acquire()
+                    .await
+                    .map_err(|_| RecoveryError::Conflict("test assertion gate closed"))?
+                    .forget();
+            }
+            let record = self
+                .metadata
+                .get_value::<RawBytes>(ValueKey::from(ValueClass::Registry(RegistryClass::Item {
+                    object_id: ObjectType::Account.to_id(),
+                    item_id: u64::from(destination.store_account_id()),
+                })))
+                .await?
+                .ok_or(RecoveryError::Invalid("live registry account is missing"))?;
+            let mut revision = xxh3_64(&record.0);
+            if self.stale_assertion.swap(false, Ordering::SeqCst) {
+                revision = revision.wrapping_add(1);
+            }
+            AuthoritativeAccountAssertion::new(destination.store_account_id(), revision)
+        }
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        payload: &'a [u8],
+        source_keys: &'a BlobKeyring,
+        manifest: &'a Manifest,
+        destination: &'a VerifiedAccountMapping,
+        batch: &'a mut BatchBuilder,
+    ) -> impl Future<Output = Result<(Self::Pending, PendingRestoreIds)>> + Send {
+        async move {
+            let decoded_message = source_keys.decode_bounded(
+                &manifest.original_blob_key,
+                payload.to_vec(),
+                MAX_BLOB_BYTES,
+            )?;
+            if decoded_message != self.expected_message {
+                return Err(RecoveryError::BlobMismatch);
+            }
+            self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((entered, gate)) = &self.prepare_gate {
+                let _ = entered.send(());
+                gate.acquire()
+                    .await
+                    .map_err(|_| RecoveryError::Conflict("test prepare gate closed"))?
+                    .forget();
+            }
+
+            let account_id = destination.store_account_id();
+            let document_slot = batch.reserve_document_id(account_id, Collection::Email);
+            let thread_slot = batch.reserve_document_id(account_id, Collection::Thread);
+            let uid_range = batch.reserve_uids(account_id, self.mailbox_ids.iter().copied());
+            let mailbox_slots = self
+                .mailbox_ids
+                .iter()
+                .copied()
+                .zip(uid_range.iter())
+                .collect::<Vec<_>>();
+
+            batch
+                .with_account_id(account_id)
+                .with_collection(Collection::Email)
+                .create_document(document_slot)
+                .set(
+                    ValueClass::Property(Field::ARCHIVE.into()),
+                    decoded_message.clone(),
+                );
+            batch
+                .with_account_id(account_id)
+                .with_collection(Collection::Thread)
+                .create_document(thread_slot);
+            if self.force_split.swap(false, Ordering::SeqCst) {
+                batch.add_commit_point();
+            }
+
+            let mailbox_uids = mailbox_slots
+                .iter()
+                .map(|(mailbox_id, slot)| PendingMailboxUid {
+                    mailbox_id: *mailbox_id,
+                    uid: PendingId::Slot(*slot),
+                })
+                .collect();
+            let pending_ids = PendingRestoreIds::new(
+                PendingId::Slot(document_slot),
+                PendingId::Slot(thread_slot),
+                mailbox_uids,
+            )?;
+            Ok((
+                TestRestorePending {
+                    document_slot,
+                    thread_slot,
+                    mailbox_slots,
+                    decoded_message,
+                    committed_calls: self.committed_calls.clone(),
+                    committed_results: self.committed_results.clone(),
+                    panic_after_commit: self.panic_after_commit.clone(),
+                },
+                pending_ids,
+            ))
+        }
+    }
+
+    fn committed<'a>(
+        &'a self,
+        pending: Self::Pending,
+        assigned_ids: &'a AssignedIds,
+    ) -> impl Future<Output = ()> + Send {
+        async move {
+            let result = RestoreResult {
+                document_id: PendingId::Slot(pending.document_slot).resolve(assigned_ids),
+                thread_id: PendingId::Slot(pending.thread_slot).resolve(assigned_ids),
+                mailbox_uids: pending
+                    .mailbox_slots
+                    .iter()
+                    .map(|(mailbox_id, slot)| RestoredMailboxUid {
+                        mailbox_id: *mailbox_id,
+                        uid: PendingId::Slot(*slot).resolve(assigned_ids),
+                    })
+                    .collect(),
+            };
+            assert!(result.document_id > 0);
+            assert!(result.thread_id > 0);
+            assert!(result.mailbox_uids.iter().all(|uid| uid.uid > 0));
+            assert!(!pending.decoded_message.is_empty());
+            pending.committed_results.lock().unwrap().push(result);
+            pending.committed_calls.fetch_add(1, Ordering::SeqCst);
+            if pending.panic_after_commit.swap(false, Ordering::SeqCst) {
+                panic!("injected post-commit callback panic");
+            }
+        }
+    }
+}
+
+fn restore_request(
+    account: &VerifiedAccountMapping,
+    capture_id: &str,
+    operation_id: &str,
+) -> RestoreRequest {
+    RestoreRequest {
+        source: account.clone(),
+        destination: account.clone(),
+        capture_id: capture_id.to_string(),
+        operation_id: operation_id.to_string(),
+        actor: "test-operator".into(),
+        reason: "requested restore test".into(),
+        now: 500,
+    }
+}
+
+fn purge_request(
+    scope: &RecoveryScope,
+    capture_id: &str,
+    operation_id: &str,
+    now: u64,
+) -> PurgeRequest {
+    PurgeRequest {
+        scope: scope.clone(),
+        capture_id: capture_id.to_string(),
+        operation_id: operation_id.to_string(),
+        actor: "test-operator".into(),
+        reason: "requested purge test".into(),
+        now,
+    }
+}
+
+async fn email_payload(metadata: &Store, document_id: u32) -> Option<Vec<u8>> {
+    metadata
+        .get_value::<RawBytes>(ValueKey {
+            account_id: 7,
+            collection: Collection::Email as u8,
+            document_id,
+            class: ValueClass::Property(Field::ARCHIVE.into()),
+        })
+        .await
+        .unwrap()
+        .map(|value| value.0)
+}
+
+fn synthetic_manifest(
+    scope: RecoveryScope,
+    capture_id: String,
+    state: ManifestState,
+    created_at: u64,
+    deleted_at: Option<u64>,
+    expires_at: u64,
+    stored_size: u64,
+) -> Manifest {
+    let source_account_id = scope.account_id.parse().unwrap();
+    Manifest {
+        capture_operation_id: format!("capture-op-{capture_id}"),
+        capture_id: capture_id.clone(),
+        scope,
+        state,
+        original_blob_key: format!("original-{capture_id}").into_bytes(),
+        recovery_blob_key: format!("recovery-{capture_id}").into_bytes(),
+        source_account_id,
+        source_collection: Collection::Email as u8,
+        source_document_id: 42,
+        source_revision: 1,
+        created_at,
+        deleted_at,
+        expires_at,
+        cause: "cleanup test".into(),
+        folders: vec!["Inbox".into()],
+        keywords: vec!["$seen".into()],
+        received_at: Some(1),
+        size: stored_size,
+        stored_size,
+        sha256: "a".repeat(64),
+        policy_revision: 1,
+        policy_digest: "b".repeat(64),
+        hold_epoch: 1,
+    }
+}
+
+#[tokio::test]
+async fn ephemeral_assertions_do_not_roll_back_earlier_mutations() {
+    let metadata = EphemeralStore::open();
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(91)
+        .with_collection(Collection::Email)
+        .with_document(1)
+        .set(ValueClass::Property(250), b"already applied".to_vec())
+        .assert_value(ValueClass::Property(251), AssertValue::Some);
+
+    assert!(metadata.write_batch(&mut batch).await.is_err());
+    assert_eq!(
+        metadata
+            .get_value::<RawBytes>(ValueKey {
+                account_id: 91,
+                collection: Collection::Email as u8,
+                document_id: 1,
+                class: ValueClass::Property(250),
+            })
+            .await
+            .unwrap()
+            .map(|value| value.0),
+        Some(b"already applied".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn restore_commits_new_email_uid_slots_and_durable_replay_receipt() {
+    let fixture = lifecycle_fixture().await;
+    let capture_id = preserve_fixture_capture(&fixture, "restore-capture", 100, 110).await;
+    let importer = TestRestoreImporter::new(
+        fixture.metadata.clone(),
+        fixture.message.clone(),
+        vec![11, 12],
+    );
+    let request = restore_request(&fixture.account, &capture_id, "restore-op-1");
+
+    let first = fixture
+        .engine
+        .restore(request.clone(), &fixture.source_keys, &importer)
+        .await
+        .unwrap();
+    let RestoreOutcome::Completed { result } = &first else {
+        panic!("restore did not complete")
+    };
+    assert!(result.document_id > 0);
+    assert!(result.thread_id > 0);
+    assert_eq!(
+        result
+            .mailbox_uids
+            .iter()
+            .map(|uid| uid.mailbox_id)
+            .collect::<Vec<_>>(),
+        vec![11, 12]
+    );
+    assert!(result.mailbox_uids.iter().all(|uid| uid.uid > 0));
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(importer.committed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        email_payload(&fixture.metadata, result.document_id).await,
+        Some(fixture.message.clone())
+    );
+
+    let replay = fixture
+        .engine
+        .restore(request, &fixture.source_keys, &importer)
+        .await
+        .unwrap();
+    assert_eq!(replay, first);
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(importer.committed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .engine
+            .account_lifecycle_status(fixture.account.scope())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_restores,
+        0
+    );
+}
+
+#[tokio::test]
+async fn pending_restore_resumes_after_interruption_without_double_counting_gate() {
+    let fixture = lifecycle_fixture().await;
+    let capture_id = preserve_fixture_capture(&fixture, "restore-pending", 100, 110).await;
+    let entered = Arc::new(Notify::new());
+    let gate = Arc::new(Semaphore::new(0));
+    let mut interrupted_mut =
+        TestRestoreImporter::new(fixture.metadata.clone(), fixture.message.clone(), vec![11]);
+    interrupted_mut.live_assertion_gate = Some((entered.clone(), gate));
+    let interrupted = Arc::new(interrupted_mut);
+    let request = restore_request(&fixture.account, &capture_id, "restore-resume");
+    let engine = fixture.engine.clone();
+    let keys = fixture.source_keys.clone();
+    let importer = interrupted.clone();
+    let notify = entered.notified();
+    let task = tokio::spawn(async move { engine.restore(request, &keys, importer.as_ref()).await });
+    notify.await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(interrupted.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .engine
+            .account_lifecycle_status(fixture.account.scope())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_restores,
+        1
+    );
+
+    let resumed =
+        TestRestoreImporter::new(fixture.metadata.clone(), fixture.message.clone(), vec![11]);
+    assert!(matches!(
+        fixture
+            .engine
+            .restore(
+                restore_request(&fixture.account, &capture_id, "restore-resume"),
+                &fixture.source_keys,
+                &resumed,
+            )
+            .await
+            .unwrap(),
+        RestoreOutcome::Completed { .. }
+    ));
+    assert_eq!(resumed.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .engine
+            .account_lifecycle_status(fixture.account.scope())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_restores,
+        0
+    );
+}
+
+#[tokio::test]
+async fn concurrent_restore_attempts_commit_only_one_import_and_retirement_is_fenced() {
+    let fixture = lifecycle_fixture().await;
+    let capture_id = preserve_fixture_capture(&fixture, "restore-concurrent", 100, 110).await;
+    let mut importer =
+        TestRestoreImporter::new(fixture.metadata.clone(), fixture.message.clone(), vec![11]);
+    let (prepare_entered, mut prepare_entered_rx) = mpsc::unbounded_channel();
+    let prepare_gate = Arc::new(Semaphore::new(0));
+    importer.prepare_gate = Some((prepare_entered, prepare_gate.clone()));
+    let importer = Arc::new(importer);
+    let request = restore_request(&fixture.account, &capture_id, "restore-concurrent-op");
+
+    let engine_one = fixture.engine.clone();
+    let keys_one = fixture.source_keys.clone();
+    let importer_one = importer.clone();
+    let request_one = request.clone();
+    let one = tokio::spawn(async move {
+        engine_one
+            .restore(request_one, &keys_one, importer_one.as_ref())
+            .await
+    });
+    let engine_two = fixture.engine.clone();
+    let keys_two = fixture.source_keys.clone();
+    let importer_two = importer.clone();
+    let request_two = request.clone();
+    let two = tokio::spawn(async move {
+        engine_two
+            .restore(request_two, &keys_two, importer_two.as_ref())
+            .await
+    });
+
+    prepare_entered_rx.recv().await.unwrap();
+    prepare_entered_rx.recv().await.unwrap();
+    assert!(matches!(
+        fixture.engine.retire_account(fixture.account.scope()).await,
+        Err(RecoveryError::InProgress)
+    ));
+    assert!(
+        fixture
+            .engine
+            .purge(PurgeRequest {
+                scope: fixture.account.scope().clone(),
+                capture_id: capture_id.clone(),
+                operation_id: "purge-racing-restore".into(),
+                actor: "test-operator".into(),
+                reason: "concurrency exclusion test".into(),
+                now: 120,
+            })
+            .await
+            .is_err()
+    );
+    let mut conflicting = restore_request(&fixture.account, &capture_id, "different-op");
+    conflicting.now = 120;
+    assert!(
+        fixture
+            .engine
+            .restore(conflicting, &fixture.source_keys, importer.as_ref())
+            .await
+            .is_err()
+    );
+    prepare_gate.add_permits(2);
+
+    let first = one.await.unwrap().unwrap();
+    let second = two.await.unwrap().unwrap();
+    assert_eq!(first, second);
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(importer.committed_calls.load(Ordering::SeqCst), 1);
+    let committed_results = importer.committed_results.lock().unwrap();
+    assert_eq!(committed_results.len(), 1);
+    let result = match first {
+        RestoreOutcome::Completed { result } => result,
+        _ => panic!("concurrent restore did not complete"),
+    };
+    let mut created_documents = Vec::new();
+    for document_id in 1..=8 {
+        if email_payload(&fixture.metadata, document_id)
+            .await
+            .is_some()
+        {
+            created_documents.push(document_id);
+        }
+    }
+    assert_eq!(created_documents, vec![result.document_id]);
+
+    fixture
+        .engine
+        .retire_account(fixture.account.scope())
+        .await
+        .unwrap();
+    let retired_attempt = restore_request(&fixture.account, &capture_id, "after-retirement");
+    assert!(
+        fixture
+            .engine
+            .restore(retired_attempt, &fixture.source_keys, importer.as_ref())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn account_generation_mismatch_and_stale_live_account_cas_do_not_import() {
+    let fixture = lifecycle_fixture().await;
+    let capture_id = preserve_fixture_capture(&fixture, "restore-scope-check", 100, 110).await;
+    let importer =
+        TestRestoreImporter::new(fixture.metadata.clone(), fixture.message.clone(), vec![11]);
+    let mut wrong_account = restore_request(&fixture.account, &capture_id, "wrong-account");
+    wrong_account.destination =
+        VerifiedAccountMapping::from_verified_binding(fixture.account.scope().clone(), 8).unwrap();
+    assert!(
+        fixture
+            .engine
+            .restore(wrong_account, &fixture.source_keys, &importer)
+            .await
+            .is_err()
+    );
+
+    let mut changed_generation = fixture.account.scope().clone();
+    changed_generation.server_generation += 1;
+    let mut wrong_generation = restore_request(&fixture.account, &capture_id, "wrong-generation");
+    wrong_generation.destination =
+        VerifiedAccountMapping::from_verified_binding(changed_generation, 7).unwrap();
+    assert!(
+        fixture
+            .engine
+            .restore(wrong_generation, &fixture.source_keys, &importer)
+            .await
+            .is_err()
+    );
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 0);
+
+    importer.stale_next_account_assertion();
+    assert!(
+        fixture
+            .engine
+            .restore(
+                restore_request(&fixture.account, &capture_id, "stale-account-cas"),
+                &fixture.source_keys,
+                &importer,
+            )
+            .await
+            .is_err()
+    );
+    let gate = fixture
+        .engine
+        .account_lifecycle_status(fixture.account.scope())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(gate.pending_restores, 1);
+    let summary = fixture
+        .engine
+        .lifecycle_summary(fixture.account.scope(), &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(summary.active_operation.unwrap().pending);
+    let mut created_documents = Vec::new();
+    for document_id in 1..=8 {
+        if email_payload(&fixture.metadata, document_id)
+            .await
+            .is_some()
+        {
+            created_documents.push(document_id);
+        }
+    }
+    assert!(created_documents.is_empty());
+}
+
+#[tokio::test]
+async fn restore_replay_after_postcommit_callback_panic_returns_durable_ids() {
+    let fixture = lifecycle_fixture().await;
+    let capture_id = preserve_fixture_capture(&fixture, "restore-callback-panic", 100, 110).await;
+    let importer = Arc::new(TestRestoreImporter::new(
+        fixture.metadata.clone(),
+        fixture.message.clone(),
+        vec![11],
+    ));
+    importer.panic_after_commit.store(true, Ordering::SeqCst);
+    let request = restore_request(&fixture.account, &capture_id, "callback-panic-op");
+    let engine = fixture.engine.clone();
+    let keys = fixture.source_keys.clone();
+    let callback_importer = importer.clone();
+    let callback_request = request.clone();
+    let task = tokio::spawn(async move {
+        engine
+            .restore(callback_request, &keys, callback_importer.as_ref())
+            .await
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(importer.committed_calls.load(Ordering::SeqCst), 1);
+
+    let replay = fixture
+        .engine
+        .restore(request, &fixture.source_keys, importer.as_ref())
+        .await
+        .unwrap();
+    assert!(matches!(replay, RestoreOutcome::Completed { .. }));
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(importer.committed_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn pending_restore_ids_require_fresh_slots_and_mailbox_uids() {
+    let mut batch = BatchBuilder::new();
+    let document_slot = batch.reserve_document_id(7, Collection::Email);
+    let thread_slot = batch.reserve_document_id(7, Collection::Thread);
+    let uid_slot = batch.reserve_uid(7, 11);
+    assert!(
+        PendingRestoreIds::new(
+            PendingId::Assigned(1),
+            PendingId::Assigned(2),
+            vec![PendingMailboxUid {
+                mailbox_id: 11,
+                uid: PendingId::Assigned(3),
+            }],
+        )
+        .is_err()
+    );
+    assert!(
+        PendingRestoreIds::new(
+            PendingId::Slot(document_slot),
+            PendingId::Slot(thread_slot),
+            Vec::new(),
+        )
+        .is_err()
+    );
+    assert!(
+        PendingRestoreIds::new(
+            PendingId::Slot(document_slot),
+            PendingId::Slot(thread_slot),
+            vec![PendingMailboxUid {
+                mailbox_id: 11,
+                uid: PendingId::Slot(uid_slot),
+            }],
+        )
+        .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn corrupt_recovery_copy_fails_restore_without_import_or_gate_leak() {
+    let fixture = lifecycle_fixture().await;
+    let capture_id = preserve_fixture_capture(&fixture, "restore-corrupt", 100, 110).await;
+    let manifest = fixture
+        .engine
+        .get(fixture.account.scope(), &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .recovery_blobs
+        .put_blob(
+            &manifest.recovery_blob_key,
+            b"corrupted recovery bytes",
+            &BlobOpts::new(
+                CompressionAlgo::None,
+                BlobEncryption::Key(fixture.recovery_key.clone()),
+            ),
+        )
+        .await
+        .unwrap();
+    let importer =
+        TestRestoreImporter::new(fixture.metadata.clone(), fixture.message.clone(), vec![11]);
+
+    assert!(
+        fixture
+            .engine
+            .restore(
+                restore_request(&fixture.account, &capture_id, "corrupt-restore-op"),
+                &fixture.source_keys,
+                &importer,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .engine
+            .account_lifecycle_status(fixture.account.scope())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_restores,
+        0
+    );
+    assert!(matches!(
+        fixture
+            .engine
+            .lifecycle_summary(fixture.account.scope(), &capture_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .active_operation,
+        None
+    ));
+    for document_id in 1..=8 {
+        assert!(
+            email_payload(&fixture.metadata, document_id)
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn restore_rejects_split_import_batch_before_any_document_write() {
+    let fixture = lifecycle_fixture().await;
+    let capture_id = preserve_fixture_capture(&fixture, "restore-split", 100, 110).await;
+    let importer =
+        TestRestoreImporter::new(fixture.metadata.clone(), fixture.message.clone(), vec![11]);
+    importer.force_split.store(true, Ordering::SeqCst);
+    let request = restore_request(&fixture.account, &capture_id, "split-restore-op");
+
+    assert!(matches!(
+        fixture
+            .engine
+            .restore(request.clone(), &fixture.source_keys, &importer)
+            .await,
+        Err(RecoveryError::BatchTooLarge)
+    ));
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(importer.committed_calls.load(Ordering::SeqCst), 0);
+    for document_id in 1..=8 {
+        assert!(
+            email_payload(&fixture.metadata, document_id)
+                .await
+                .is_none()
+        );
+    }
+    assert_eq!(
+        fixture
+            .engine
+            .account_lifecycle_status(fixture.account.scope())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_restores,
+        0
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .restore(request, &fixture.source_keys, &importer)
+            .await
+            .unwrap(),
+        RestoreOutcome::Failed {
+            code: "restore_batch_too_large".into(),
+        }
+    );
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn active_hold_rejects_purge_without_erasing_the_copy() {
+    let fixture = lifecycle_fixture().await;
+    let capture_id = preserve_fixture_capture(&fixture, "purge-held", 100, 110).await;
+    let manifest = fixture
+        .engine
+        .get(fixture.account.scope(), &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .engine
+        .sync_hold(fixture.account.scope().clone(), 2, true)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        fixture
+            .engine
+            .purge(purge_request(
+                fixture.account.scope(),
+                &capture_id,
+                "held-purge-op",
+                120,
+            ))
+            .await,
+        Err(RecoveryError::Held)
+    ));
+    assert_eq!(
+        fixture
+            .engine
+            .get(fixture.account.scope(), &capture_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ManifestState::Preserved
+    );
+    assert!(
+        fixture
+            .recovery_blobs
+            .get_raw_blob(&manifest.recovery_blob_key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn purge_retries_after_blob_deletion_and_releases_quota_once() {
+    let fixture = lifecycle_fixture().await;
+    let capture_id = preserve_fixture_capture(&fixture, "purge-retry", 100, 110).await;
+    let manifest = fixture
+        .engine
+        .get(fixture.account.scope(), &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let request = purge_request(fixture.account.scope(), &capture_id, "purge-retry-op", 120);
+    let ledger_key = quota_key(fixture.account.scope()).unwrap();
+    let before = fixture
+        .engine
+        .read::<ScopeLedger>(&ledger_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(before.captures, vec![capture_id.clone()]);
+    let charged_before = before.charged_bytes;
+
+    fixture.engine.fail_next_purge_finalization();
+    assert!(fixture.engine.purge(request.clone()).await.is_err());
+    assert!(
+        fixture
+            .recovery_blobs
+            .get_raw_blob(&manifest.recovery_blob_key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .get(fixture.account.scope(), &capture_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ManifestState::Purging
+    );
+    let pending_hold = fixture
+        .engine
+        .read::<HoldControl>(&scoped_key(b"hold", fixture.account.scope(), "").unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(pending_hold.pending_purges, 1);
+    assert!(matches!(
+        fixture
+            .engine
+            .sync_hold(fixture.account.scope().clone(), 2, true)
+            .await,
+        Err(RecoveryError::InProgress)
+    ));
+    assert_eq!(
+        fixture
+            .engine
+            .read::<ScopeLedger>(&ledger_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .charged_bytes,
+        charged_before
+    );
+
+    let PurgeOutcome::Purged { tombstone } = fixture.engine.purge(request.clone()).await.unwrap();
+    assert_eq!(tombstone.capture_id, capture_id);
+    assert_eq!(tombstone.deleted_at, Some(110));
+    assert!(
+        fixture
+            .engine
+            .read::<Manifest>(
+                &scoped_key(b"manifest", fixture.account.scope(), &capture_id).unwrap()
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let after = fixture
+        .engine
+        .read::<ScopeLedger>(&ledger_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    assert!(after.captures.is_empty());
+    assert_eq!(after.charged_bytes, 0);
+    assert_eq!(
+        fixture
+            .engine
+            .read::<HoldControl>(&scoped_key(b"hold", fixture.account.scope(), "").unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .pending_purges,
+        0
+    );
+
+    let serialized_tombstone = serde_json::to_string(&tombstone).unwrap();
+    assert!(!serialized_tombstone.contains("source-message-key"));
+    assert!(!serialized_tombstone.contains("Original message"));
+    assert!(!serialized_tombstone.contains("Inbox"));
+    assert!(!serialized_tombstone.contains("$seen"));
+    assert_eq!(
+        fixture.engine.purge(request).await.unwrap(),
+        PurgeOutcome::Purged { tombstone }
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .read::<ScopeLedger>(&ledger_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .charged_bytes,
+        0
+    );
 }
 
 #[test]
@@ -85,7 +1182,7 @@ async fn policy_desired_revision_replay_skip_and_conflicts_are_explicit() {
         &[2; BLOB_KEY_LEN],
     ));
     let keys = BlobKeyring::new(vec![key.clone()]);
-    let engine = RecoveryEngine::new(
+    let engine = RecoveryEngine::new_for_test(
         metadata,
         blobs,
         BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(key)),
@@ -186,7 +1283,7 @@ async fn encrypted_capture_is_staged_then_appended_with_source_revision_barrier(
         .put_blob(&source_key_bytes, payload, &source_opts)
         .await
         .unwrap();
-    let engine = RecoveryEngine::new(
+    let engine = RecoveryEngine::new_for_test(
         metadata.clone(),
         recovery_blobs.clone(),
         recovery_opts,
@@ -232,7 +1329,9 @@ async fn encrypted_capture_is_staged_then_appended_with_source_revision_barrier(
         .await
         .unwrap();
     let mut delete_batch = BatchBuilder::new();
-    prepared.append_to_delete_batch(&mut delete_batch).unwrap();
+    prepared
+        .append_to_delete_batch(&mut delete_batch, 105)
+        .unwrap();
     delete_batch.clear(ValueClass::Property(request.source.revision_property));
     metadata.write_batch(&mut delete_batch).await.unwrap();
     assert_eq!(
@@ -260,7 +1359,7 @@ async fn encrypted_capture_is_staged_then_appended_with_source_revision_barrier(
     metadata.danger_destroy_account(7).await.unwrap();
     assert!(
         metadata
-            .get_value::<Vec<u8>>(ValueKey {
+            .get_value::<RawBytes>(ValueKey {
                 account_id: 7,
                 collection: Collection::Email as u8,
                 document_id: 42,
@@ -287,7 +1386,7 @@ async fn encrypted_capture_is_staged_then_appended_with_source_revision_barrier(
             .unwrap(),
         raw_source
     );
-    let missing_copy = RecoveryEngine::new(
+    let missing_copy = RecoveryEngine::new_for_test(
         metadata.clone(),
         BlobStore::Store(EphemeralStore::open()),
         BlobOpts::new(
@@ -343,7 +1442,7 @@ async fn a_hold_epoch_change_invalidates_a_prepared_delete() {
     )
     .await
     .unwrap();
-    let e = RecoveryEngine::new(
+    let e = RecoveryEngine::new_for_test(
         metadata.clone(),
         dst,
         BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(b)),
@@ -388,7 +1487,7 @@ async fn a_hold_epoch_change_invalidates_a_prepared_delete() {
     let prepared = e.prepare_capture(request, &src, &ak).await.unwrap();
     e.sync_hold(s, 2, true).await.unwrap();
     let mut batch = BatchBuilder::new();
-    prepared.append_to_delete_batch(&mut batch).unwrap();
+    prepared.append_to_delete_batch(&mut batch, 11).unwrap();
     assert!(metadata.write_batch(&mut batch).await.is_err());
 }
 
@@ -402,7 +1501,7 @@ async fn disabled_policy_rejects_capture_before_source_access() {
         &[2; BLOB_KEY_LEN],
     ));
     let recovery_keys = BlobKeyring::new(vec![recovery_key.clone()]);
-    let engine = RecoveryEngine::new(
+    let engine = RecoveryEngine::new_for_test(
         metadata,
         recovery_blobs,
         BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(recovery_key)),
@@ -443,6 +1542,68 @@ async fn disabled_policy_rejects_capture_before_source_access() {
 }
 
 #[tokio::test]
+async fn account_gate_requires_activation_and_never_reactivates_retired_generation() {
+    let metadata = EphemeralStore::open();
+    let key = Arc::new(BlobKey::new(
+        2,
+        SymmetricCipher::Aes256Gcm,
+        &[2; BLOB_KEY_LEN],
+    ));
+    let engine = RecoveryEngine::new_for_test(
+        metadata,
+        BlobStore::Store(EphemeralStore::open()),
+        BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(key.clone())),
+        BlobKeyring::new(vec![key]),
+    )
+    .unwrap();
+    let scope = scope();
+    let mapping = VerifiedAccountMapping::from_verified_binding(scope.clone(), 7).unwrap();
+
+    assert!(engine.retire_account(&scope).await.is_err());
+    engine.activate_account(&mapping).await.unwrap();
+    engine.retire_account(&scope).await.unwrap();
+    assert!(engine.activate_account(&mapping).await.is_err());
+    let status = engine
+        .account_lifecycle_status(&scope)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.state, AccountLifecycleState::Retired);
+    assert_eq!(status.pending_restores, 0);
+}
+
+#[tokio::test]
+async fn hold_sync_replay_and_activation_are_rejected_while_a_purge_is_pending() {
+    let metadata = EphemeralStore::open();
+    let key = Arc::new(BlobKey::new(
+        2,
+        SymmetricCipher::Aes256Gcm,
+        &[2; BLOB_KEY_LEN],
+    ));
+    let engine = RecoveryEngine::new_for_test(
+        metadata,
+        BlobStore::Store(EphemeralStore::open()),
+        BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(key.clone())),
+        BlobKeyring::new(vec![key]),
+    )
+    .unwrap();
+    let scope = scope();
+    engine.sync_hold(scope.clone(), 1, false).await.unwrap();
+    let key = scoped_key(b"hold", &scope, "").unwrap();
+    let (mut hold, bytes) = engine.read::<HoldControl>(&key).await.unwrap().unwrap();
+    hold.pending_purges = 1;
+    engine.cas_write(&key, Some(&bytes), &hold).await.unwrap();
+    assert!(matches!(
+        engine.sync_hold(scope.clone(), 1, false).await,
+        Err(RecoveryError::InProgress)
+    ));
+    assert!(matches!(
+        engine.sync_hold(scope, 2, true).await,
+        Err(RecoveryError::InProgress)
+    ));
+}
+
+#[tokio::test]
 async fn source_cas_conflict_keeps_the_recovery_manifest_staging() {
     let metadata = EphemeralStore::open();
     let source = BlobStore::Store(EphemeralStore::open());
@@ -468,7 +1629,7 @@ async fn source_cas_conflict_keeps_the_recovery_manifest_staging() {
         )
         .await
         .unwrap();
-    let engine = RecoveryEngine::new(
+    let engine = RecoveryEngine::new_for_test(
         metadata.clone(),
         destination,
         BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(recovery_key)),
@@ -541,7 +1702,9 @@ async fn source_cas_conflict_keeps_the_recovery_manifest_staging() {
         );
     metadata.write_batch(&mut changed).await.unwrap();
     let mut delete_batch = BatchBuilder::new();
-    prepared.append_to_delete_batch(&mut delete_batch).unwrap();
+    prepared
+        .append_to_delete_batch(&mut delete_batch, 11)
+        .unwrap();
     assert!(metadata.write_batch(&mut delete_batch).await.is_err());
     assert_eq!(
         engine
@@ -582,7 +1745,7 @@ fn unencrypted_or_unavailable_recovery_keys_are_rejected() {
     let metadata = EphemeralStore::open();
     let blobs = BlobStore::Store(EphemeralStore::open());
     assert!(
-        RecoveryEngine::new(
+        RecoveryEngine::new_for_test(
             metadata.clone(),
             blobs.clone(),
             BlobOpts::PLAIN,
@@ -591,7 +1754,7 @@ fn unencrypted_or_unavailable_recovery_keys_are_rejected() {
         .is_err()
     );
     assert!(
-        RecoveryEngine::new(
+        RecoveryEngine::new_for_test(
             metadata,
             blobs,
             BlobOpts::new(CompressionAlgo::None, BlobEncryption::Unavailable(9)),
@@ -599,4 +1762,362 @@ fn unencrypted_or_unavailable_recovery_keys_are_rejected() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn recovery_engine_rejects_nontransactional_metadata_stores() {
+    let key = Arc::new(BlobKey::new(
+        2,
+        SymmetricCipher::Aes256Gcm,
+        &[2; BLOB_KEY_LEN],
+    ));
+    let options = BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(key.clone()));
+    let keys = BlobKeyring::new(vec![key]);
+
+    assert!(
+        RecoveryEngine::new(
+            Store::None,
+            BlobStore::Store(EphemeralStore::open()),
+            options.clone(),
+            keys.clone(),
+        )
+        .is_err()
+    );
+    assert!(
+        RecoveryEngine::new(
+            EphemeralStore::open(),
+            BlobStore::Store(EphemeralStore::open()),
+            options,
+            keys,
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn delayed_same_operation_capture_retry_starts_retention_at_deletion_barrier() {
+    let fixture = lifecycle_fixture().await;
+    let first = fixture
+        .engine
+        .prepare_capture(
+            capture_request(&fixture, "delayed-delete", 10),
+            &fixture.source_blobs,
+            &fixture.source_keys,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.manifest().created_at, 10);
+    assert_eq!(first.manifest().deleted_at, None);
+    assert_eq!(first.manifest().expires_at, 0);
+
+    let retry = fixture
+        .engine
+        .prepare_capture(
+            capture_request(&fixture, "delayed-delete", 100),
+            &fixture.source_blobs,
+            &fixture.source_keys,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.manifest().created_at, 10);
+    assert_eq!(retry.manifest().expires_at, 0);
+    let capture_id = retry.manifest().capture_id.clone();
+
+    let mut batch = BatchBuilder::new();
+    retry.append_to_delete_batch(&mut batch, 200).unwrap();
+    batch
+        .with_account_id(fixture.account.store_account_id())
+        .with_collection(Collection::Email)
+        .with_document(42)
+        .clear(ValueClass::Property(Field::ARCHIVE.into()));
+    fixture.metadata.write_batch(&mut batch).await.unwrap();
+
+    let preserved = fixture
+        .engine
+        .get(fixture.account.scope(), &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(preserved.created_at, 10);
+    assert_eq!(preserved.deleted_at, Some(200));
+    assert_eq!(preserved.expires_at, 200 + 30 * 86_400);
+}
+
+#[tokio::test]
+async fn old_staging_cleanup_cas_invalidates_prepared_source_deletion() {
+    let fixture = lifecycle_fixture().await;
+    let prepared = fixture
+        .engine
+        .prepare_capture(
+            capture_request(&fixture, "staging-cleanup", 10),
+            &fixture.source_blobs,
+            &fixture.source_keys,
+        )
+        .await
+        .unwrap();
+    let capture_id = prepared.manifest().capture_id.clone();
+
+    let report = fixture
+        .engine
+        .cleanup_expired(fixture.account.scope(), 20, 5, 100, None)
+        .await
+        .unwrap();
+    assert_eq!(report.purged_capture_ids, vec![capture_id.clone()]);
+    assert!(
+        fixture
+            .engine
+            .get(fixture.account.scope(), &capture_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let mut prepared_delete = BatchBuilder::new();
+    prepared
+        .append_to_delete_batch(&mut prepared_delete, 21)
+        .unwrap();
+    prepared_delete
+        .with_account_id(fixture.account.store_account_id())
+        .with_collection(Collection::Email)
+        .with_document(42)
+        .clear(ValueClass::Property(Field::ARCHIVE.into()));
+    assert!(
+        fixture
+            .metadata
+            .write_batch(&mut prepared_delete)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .metadata
+            .get_value::<RawBytes>(ValueKey {
+                account_id: fixture.account.store_account_id(),
+                collection: Collection::Email as u8,
+                document_id: 42,
+                class: ValueClass::Property(Field::ARCHIVE.into()),
+            })
+            .await
+            .unwrap()
+            .map(|value| value.0),
+        Some(1u64.to_be_bytes().to_vec())
+    );
+}
+
+#[tokio::test]
+async fn cleanup_skips_copying_and_expired_preserved_records_under_hold() {
+    let fixture = lifecycle_fixture().await;
+    let scope = fixture.account.scope().clone();
+    let copying_id = "1".repeat(64);
+    let copying = synthetic_manifest(
+        scope.clone(),
+        copying_id.clone(),
+        ManifestState::Copying,
+        1,
+        None,
+        0,
+        50,
+    );
+    fixture
+        .engine
+        .cas_write(
+            &scoped_key(b"manifest", &scope, &copying_id).unwrap(),
+            None,
+            &copying,
+        )
+        .await
+        .unwrap();
+    let ledger_key = quota_key(&scope).unwrap();
+    fixture
+        .engine
+        .cas_write(
+            &ledger_key,
+            None,
+            &ScopeLedger {
+                charged_bytes: 50,
+                captures: vec![copying_id.clone()],
+            },
+        )
+        .await
+        .unwrap();
+
+    let copying_report = fixture
+        .engine
+        .cleanup_expired(&scope, 1000, 5, 100, None)
+        .await
+        .unwrap();
+    assert_eq!(copying_report.skipped, 1);
+    assert!(copying_report.purged_capture_ids.is_empty());
+    assert_eq!(
+        fixture
+            .engine
+            .read::<ScopeLedger>(&ledger_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .charged_bytes,
+        50
+    );
+
+    let held_id = "2".repeat(64);
+    let expired = synthetic_manifest(
+        scope.clone(),
+        held_id.clone(),
+        ManifestState::Preserved,
+        1,
+        Some(10),
+        20,
+        75,
+    );
+    fixture
+        .engine
+        .cas_write(
+            &scoped_key(b"manifest", &scope, &held_id).unwrap(),
+            None,
+            &expired,
+        )
+        .await
+        .unwrap();
+    let (_, ledger_bytes) = fixture
+        .engine
+        .read::<ScopeLedger>(&ledger_key)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .engine
+        .cas_write(
+            &ledger_key,
+            Some(&ledger_bytes),
+            &ScopeLedger {
+                charged_bytes: 125,
+                captures: vec![copying_id.clone(), held_id.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .engine
+        .sync_hold(scope.clone(), 2, true)
+        .await
+        .unwrap();
+
+    let held_report = fixture
+        .engine
+        .cleanup_expired(&scope, 1000, 5, 100, None)
+        .await
+        .unwrap();
+    assert_eq!(held_report.skipped, 2);
+    assert!(held_report.purged_capture_ids.is_empty());
+    assert_eq!(
+        fixture
+            .engine
+            .get(&scope, &held_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ManifestState::Preserved
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .read::<ScopeLedger>(&ledger_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .charged_bytes,
+        125
+    );
+}
+
+#[tokio::test]
+async fn cleanup_cursor_reaches_old_expired_records_and_skips_mixed_scopes() {
+    let fixture = lifecycle_fixture().await;
+    let scope = fixture.account.scope().clone();
+    let mut captures = Vec::new();
+    for index in 0..230 {
+        let capture_id = format!("{index:064x}");
+        let mut record_scope = scope.clone();
+        if index == 10 {
+            record_scope.account_id = "8".into();
+        }
+        let (deleted_at, expires_at) = if index < 120 {
+            (Some(100), 200)
+        } else {
+            (Some(1000), 2000)
+        };
+        let manifest = synthetic_manifest(
+            record_scope.clone(),
+            capture_id.clone(),
+            ManifestState::Preserved,
+            50,
+            deleted_at,
+            expires_at,
+            1,
+        );
+        fixture
+            .engine
+            .cas_write(
+                &scoped_key(b"manifest", &record_scope, &capture_id).unwrap(),
+                None,
+                &manifest,
+            )
+            .await
+            .unwrap();
+        captures.push(capture_id);
+    }
+    fixture
+        .engine
+        .cas_write(
+            &quota_key(&scope).unwrap(),
+            None,
+            &ScopeLedger {
+                charged_bytes: 230,
+                captures,
+            },
+        )
+        .await
+        .unwrap();
+
+    let first = fixture
+        .engine
+        .cleanup_expired(&scope, 1000, 10, 100, None)
+        .await
+        .unwrap();
+    assert_eq!(first.examined, 100);
+    assert_eq!(first.purged_capture_ids.len(), 99);
+    assert_eq!(first.skipped, 1);
+    assert!(first.has_more);
+    assert_eq!(
+        first.next_cursor.as_deref(),
+        Some(format!("{:064x}", 99).as_str())
+    );
+
+    let second = fixture
+        .engine
+        .cleanup_expired(&scope, 1000, 10, 100, first.next_cursor.as_deref())
+        .await
+        .unwrap();
+    assert_eq!(second.examined, 100);
+    assert_eq!(second.purged_capture_ids.len(), 20);
+    assert_eq!(second.skipped, 80);
+    assert!(second.has_more);
+    assert_eq!(
+        second.next_cursor.as_deref(),
+        Some(format!("{:064x}", 199).as_str())
+    );
+
+    let last = fixture
+        .engine
+        .cleanup_expired(&scope, 1000, 10, 100, second.next_cursor.as_deref())
+        .await
+        .unwrap();
+    assert_eq!(last.examined, 30);
+    assert!(last.purged_capture_ids.is_empty());
+    assert_eq!(last.skipped, 30);
+    assert!(!last.has_more);
+    assert_eq!(last.next_cursor, None);
 }
