@@ -48,6 +48,33 @@ impl From<trc::Error> for RecoveryError {
     }
 }
 
+impl RecoveryError {
+    fn is_retryable_storage_failure(&self) -> bool {
+        let Self::Store(error) = self else {
+            return false;
+        };
+
+        matches!(
+            error.event_type(),
+            trc::EventType::Store(
+                trc::StoreEvent::FoundationdbError
+                    | trc::StoreEvent::MysqlError
+                    | trc::StoreEvent::PostgresqlError
+                    | trc::StoreEvent::RocksdbError
+                    | trc::StoreEvent::SqliteError
+                    | trc::StoreEvent::RedisError
+                    | trc::StoreEvent::KeepError
+                    | trc::StoreEvent::S3Error
+                    | trc::StoreEvent::AzureError
+                    | trc::StoreEvent::FilesystemError
+                    | trc::StoreEvent::PoolError
+                    | trc::StoreEvent::HttpStoreError
+                    | trc::StoreEvent::BlobRead
+            )
+        )
+    }
+}
+
 impl From<serde_json::Error> for RecoveryError {
     fn from(value: serde_json::Error) -> Self {
         Self::Serialization(value)
@@ -328,6 +355,8 @@ pub struct RecoveryEngine {
     fail_after_attempt_cleanup_reservation: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_after_attempt_cleanup_delete: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_restore_payload_read: std::sync::atomic::AtomicBool,
 }
 
 struct RawBytes(Vec<u8>);
@@ -410,12 +439,20 @@ impl RecoveryEngine {
             fail_after_attempt_cleanup_reservation: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_after_attempt_cleanup_delete: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_restore_payload_read: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     #[cfg(test)]
     pub(crate) fn fail_next_purge_finalization(&self) {
         self.purge_finalization_fault
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_restore_payload_read(&self) {
+        self.fail_next_restore_payload_read
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1120,6 +1157,15 @@ impl RecoveryEngine {
                 "recovery payload exceeds retrieval bound",
             ));
         }
+        #[cfg(test)]
+        if self
+            .fail_next_restore_payload_read
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RecoveryError::Store(
+                trc::StoreEvent::SqliteError.reason("injected payload read I/O failure"),
+            ));
+        }
         let stored = self
             .blobs
             .get_raw_blob(&manifest.recovery_blob_key)
@@ -1137,9 +1183,10 @@ impl RecoveryEngine {
         if stored.len() as u64 != manifest.stored_size {
             return Err(RecoveryError::BlobMismatch);
         }
-        let decoded =
-            self.keys
-                .decode_bounded(&manifest.recovery_blob_key, stored, MAX_BLOB_BYTES)?;
+        let decoded = self
+            .keys
+            .decode_bounded(&manifest.recovery_blob_key, stored, MAX_BLOB_BYTES)
+            .map_err(|_| RecoveryError::BlobMismatch)?;
         if decoded.len() as u64 != manifest.size || digest_hex(&decoded) != manifest.sha256 {
             return Err(RecoveryError::BlobMismatch);
         }

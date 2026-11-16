@@ -299,6 +299,183 @@ fn persistent_capture_request(
 
 #[cfg(feature = "recovery-test-sqlite")]
 #[tokio::test]
+async fn file_sqlite_restore_retries_payload_read_after_reopen_without_duplicate_import() {
+    let fixture = persistent_lifecycle_fixture().await;
+    let capture_request = persistent_capture_request(&fixture, "sqlite-restore-capture", 10);
+    fixture
+        .engine
+        .activate_account(&fixture.account)
+        .await
+        .unwrap();
+
+    let mut account_batch = BatchBuilder::new();
+    account_batch.with_account_id(0).set(
+        ValueClass::Registry(RegistryClass::Item {
+            object_id: ObjectType::Account.to_id(),
+            item_id: u64::from(fixture.account.store_account_id()),
+        }),
+        b"persistent registry account".to_vec(),
+    );
+    fixture
+        .metadata
+        .write_batch(&mut account_batch)
+        .await
+        .unwrap();
+
+    let prepared = fixture
+        .engine
+        .prepare_capture(
+            capture_request.clone(),
+            &fixture.source_blobs,
+            &fixture.source_keys,
+        )
+        .await
+        .unwrap();
+    let capture_id = prepared.manifest().capture_id.clone();
+    let mut source_delete = BatchBuilder::new();
+    prepared
+        .append_to_delete_batch(&mut source_delete, 11)
+        .unwrap();
+    source_delete
+        .with_account_id(capture_request.source.account_id)
+        .with_collection(capture_request.source.collection)
+        .with_document(capture_request.source.document_id)
+        .clear(ValueClass::Property(Field::ARCHIVE.into()));
+    fixture
+        .metadata
+        .write_batch(&mut source_delete)
+        .await
+        .unwrap();
+    drop(prepared);
+
+    let request = restore_request(&fixture.account, &capture_id, "sqlite-restore-op");
+    let importer =
+        TestRestoreImporter::new(fixture.metadata.clone(), fixture.message.clone(), vec![0]);
+    fixture.engine.fail_next_restore_payload_read();
+    assert!(matches!(
+        fixture
+            .engine
+            .restore(request.clone(), &fixture.source_keys, &importer)
+            .await,
+        Err(RecoveryError::InProgress)
+    ));
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(importer.committed_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .engine
+            .account_lifecycle_status(fixture.account.scope())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_restores,
+        1
+    );
+    let pending_operation = fixture
+        .engine
+        .lifecycle_summary(fixture.account.scope(), &capture_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .active_operation
+        .unwrap();
+    assert_eq!(pending_operation.kind, LifecycleOperationKind::Restore);
+    assert!(pending_operation.pending);
+
+    let root = fixture.root.clone();
+    let metadata_path = fixture.metadata_path.clone();
+    let source_path = fixture.source_path.clone();
+    let recovery_path = fixture.recovery_path.clone();
+    let source_blob_key = fixture.source_blob_key.clone();
+    let account = fixture.account.clone();
+    let message = fixture.message.clone();
+    let source_keys = fixture.source_keys.clone();
+    let recovery_key = fixture.recovery_key.clone();
+    drop(importer);
+    drop(fixture.engine);
+    drop(fixture.metadata);
+    drop(fixture.source_blobs);
+    drop(fixture.recovery_blobs);
+
+    let metadata = open_test_sqlite(&metadata_path).await;
+    let source_blobs = BlobStore::Store(open_test_sqlite(&source_path).await);
+    let recovery_blobs = BlobStore::Store(open_test_sqlite(&recovery_path).await);
+    assert!(
+        source_blobs
+            .get_raw_blob(&source_blob_key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let engine = Arc::new(
+        RecoveryEngine::new(
+            metadata.clone(),
+            recovery_blobs.clone(),
+            BlobOpts::new(
+                CompressionAlgo::None,
+                BlobEncryption::Key(recovery_key.clone()),
+            ),
+            BlobKeyring::new(vec![recovery_key]),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        engine
+            .account_lifecycle_status(account.scope())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_restores,
+        1
+    );
+
+    let importer = TestRestoreImporter::new(metadata.clone(), message, vec![0]);
+    let outcome = engine
+        .restore(request.clone(), &source_keys, &importer)
+        .await
+        .unwrap();
+    let RestoreOutcome::Completed { result } = outcome.clone() else {
+        panic!("restore did not complete after the backing stores reopened")
+    };
+    assert!(result.document_id > 0);
+    assert!(result.thread_id > 0);
+    assert_eq!(result.mailbox_uids.len(), 1);
+    assert_eq!(result.mailbox_uids[0].mailbox_id, 0);
+    assert!(result.mailbox_uids[0].uid > 0);
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(importer.committed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        importer.committed_results.lock().unwrap().as_slice(),
+        &[result.clone()]
+    );
+
+    let replay = engine
+        .restore(request, &source_keys, &importer)
+        .await
+        .unwrap();
+    assert_eq!(replay, outcome);
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(importer.committed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        engine
+            .account_lifecycle_status(account.scope())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_restores,
+        0
+    );
+
+    drop(importer);
+    drop(engine);
+    drop(metadata);
+    drop(source_blobs);
+    drop(recovery_blobs);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "recovery-test-sqlite")]
+#[tokio::test]
 async fn file_sqlite_capture_state_survives_engine_restart() {
     let fixture = persistent_lifecycle_fixture().await;
     let request = persistent_capture_request(&fixture, "sqlite-restart", 10);
@@ -1123,6 +1300,8 @@ struct TestRestoreImporter {
     committed_calls: Arc<AtomicUsize>,
     committed_results: Arc<Mutex<Vec<RestoreResult>>>,
     stale_assertion: Arc<AtomicBool>,
+    fail_next_live_assertion: AtomicBool,
+    fail_next_prepare: AtomicBool,
     panic_after_commit: Arc<AtomicBool>,
     force_split: Arc<AtomicBool>,
     prepare_gate: Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>,
@@ -1149,6 +1328,8 @@ impl TestRestoreImporter {
             committed_calls: Arc::new(AtomicUsize::new(0)),
             committed_results: Arc::new(Mutex::new(Vec::new())),
             stale_assertion: Arc::new(AtomicBool::new(false)),
+            fail_next_live_assertion: AtomicBool::new(false),
+            fail_next_prepare: AtomicBool::new(false),
             panic_after_commit: Arc::new(AtomicBool::new(false)),
             force_split: Arc::new(AtomicBool::new(false)),
             prepare_gate: None,
@@ -1158,6 +1339,14 @@ impl TestRestoreImporter {
 
     fn stale_next_account_assertion(&self) {
         self.stale_assertion.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_next_live_account_read(&self) {
+        self.fail_next_live_assertion.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_next_prepare_read(&self) {
+        self.fail_next_prepare.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1175,6 +1364,11 @@ impl RestoreImporter for TestRestoreImporter {
                     .await
                     .map_err(|_| RecoveryError::Conflict("test assertion gate closed"))?
                     .forget();
+            }
+            if self.fail_next_live_assertion.swap(false, Ordering::SeqCst) {
+                return Err(RecoveryError::Store(
+                    trc::StoreEvent::SqliteError.reason("injected registry read I/O failure"),
+                ));
             }
             let record = self
                 .metadata
@@ -1201,15 +1395,22 @@ impl RestoreImporter for TestRestoreImporter {
         batch: &'a mut BatchBuilder,
     ) -> impl Future<Output = Result<(Self::Pending, PendingRestoreIds)>> + Send {
         async move {
-            let decoded_message = source_keys.decode_bounded(
-                &manifest.original_blob_key,
-                payload.to_vec(),
-                MAX_BLOB_BYTES,
-            )?;
+            self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_next_prepare.swap(false, Ordering::SeqCst) {
+                return Err(RecoveryError::Store(
+                    trc::StoreEvent::SqliteError.reason("injected importer read I/O failure"),
+                ));
+            }
+            let decoded_message = source_keys
+                .decode_bounded(
+                    &manifest.original_blob_key,
+                    payload.to_vec(),
+                    MAX_BLOB_BYTES,
+                )
+                .map_err(|_| RecoveryError::BlobMismatch)?;
             if decoded_message != self.expected_message {
                 return Err(RecoveryError::BlobMismatch);
             }
-            self.prepare_calls.fetch_add(1, Ordering::SeqCst);
             if let Some((entered, gate)) = &self.prepare_gate {
                 let _ = entered.send(());
                 gate.acquire()
@@ -1811,6 +2012,140 @@ fn pending_restore_ids_require_fresh_slots_and_mailbox_uids() {
     );
 }
 
+#[test]
+fn retryable_storage_classification_excludes_corruption_and_codec_errors() {
+    assert!(
+        RecoveryError::Store(trc::StoreEvent::SqliteError.reason("injected read failure"))
+            .is_retryable_storage_failure()
+    );
+    assert!(
+        RecoveryError::Store(trc::StoreEvent::BlobRead.reason("injected blob read failure"))
+            .is_retryable_storage_failure()
+    );
+    assert!(
+        !RecoveryError::Store(trc::StoreEvent::DataCorruption.reason("corrupt metadata"))
+            .is_retryable_storage_failure()
+    );
+    assert!(
+        !RecoveryError::Store(trc::StoreEvent::DecryptError.reason("invalid authentication tag"))
+            .is_retryable_storage_failure()
+    );
+    assert!(
+        !RecoveryError::Store(
+            trc::StoreEvent::DecompressError.reason("invalid compressed payload")
+        )
+        .is_retryable_storage_failure()
+    );
+    assert!(
+        !RecoveryError::Store(trc::StoreEvent::DeserializeError.reason("invalid metadata"))
+            .is_retryable_storage_failure()
+    );
+    assert!(
+        !RecoveryError::Serialization(serde_json::from_str::<u8>("invalid").unwrap_err())
+            .is_retryable_storage_failure()
+    );
+}
+
+#[tokio::test]
+async fn transient_live_account_read_failure_keeps_restore_pending_for_retry() {
+    let fixture = lifecycle_fixture().await;
+    let capture_id = preserve_fixture_capture(&fixture, "restore-live-read-retry", 100, 110).await;
+    let importer =
+        TestRestoreImporter::new(fixture.metadata.clone(), fixture.message.clone(), vec![0]);
+    importer.fail_next_live_account_read();
+    let request = restore_request(&fixture.account, &capture_id, "restore-live-read-retry-op");
+
+    assert!(matches!(
+        fixture
+            .engine
+            .restore(request.clone(), &fixture.source_keys, &importer)
+            .await,
+        Err(RecoveryError::InProgress)
+    ));
+    assert_eq!(
+        fixture
+            .engine
+            .account_lifecycle_status(fixture.account.scope())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_restores,
+        1
+    );
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 0);
+
+    assert!(matches!(
+        fixture
+            .engine
+            .restore(request, &fixture.source_keys, &importer)
+            .await
+            .unwrap(),
+        RestoreOutcome::Completed { .. }
+    ));
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(importer.committed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .engine
+            .account_lifecycle_status(fixture.account.scope())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_restores,
+        0
+    );
+}
+
+#[tokio::test]
+async fn transient_import_prepare_failure_keeps_restore_pending_for_retry() {
+    let fixture = lifecycle_fixture().await;
+    let capture_id = preserve_fixture_capture(&fixture, "restore-prepare-retry", 100, 110).await;
+    let importer =
+        TestRestoreImporter::new(fixture.metadata.clone(), fixture.message.clone(), vec![0]);
+    importer.fail_next_prepare_read();
+    let request = restore_request(&fixture.account, &capture_id, "restore-prepare-retry-op");
+
+    assert!(matches!(
+        fixture
+            .engine
+            .restore(request.clone(), &fixture.source_keys, &importer)
+            .await,
+        Err(RecoveryError::InProgress)
+    ));
+    assert_eq!(
+        fixture
+            .engine
+            .account_lifecycle_status(fixture.account.scope())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_restores,
+        1
+    );
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 1);
+
+    assert!(matches!(
+        fixture
+            .engine
+            .restore(request, &fixture.source_keys, &importer)
+            .await
+            .unwrap(),
+        RestoreOutcome::Completed { .. }
+    ));
+    assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(importer.committed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .engine
+            .account_lifecycle_status(fixture.account.scope())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_restores,
+        0
+    );
+}
+
 #[tokio::test]
 async fn corrupt_recovery_copy_fails_restore_without_import_or_gate_leak() {
     let fixture = lifecycle_fixture().await;
@@ -1821,32 +2156,39 @@ async fn corrupt_recovery_copy_fails_restore_without_import_or_gate_leak() {
         .await
         .unwrap()
         .unwrap();
+    let wrong_key = Arc::new(BlobKey::new(
+        2,
+        SymmetricCipher::Aes256Gcm,
+        &[9; BLOB_KEY_LEN],
+    ));
     fixture
         .recovery_blobs
         .put_blob(
             &manifest.recovery_blob_key,
             b"corrupted recovery bytes",
-            &BlobOpts::new(
-                CompressionAlgo::None,
-                BlobEncryption::Key(fixture.recovery_key.clone()),
-            ),
+            &BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(wrong_key)),
         )
         .await
         .unwrap();
     let importer =
         TestRestoreImporter::new(fixture.metadata.clone(), fixture.message.clone(), vec![11]);
+    let request = restore_request(&fixture.account, &capture_id, "corrupt-restore-op");
 
-    assert!(
+    assert!(matches!(
         fixture
             .engine
-            .restore(
-                restore_request(&fixture.account, &capture_id, "corrupt-restore-op"),
-                &fixture.source_keys,
-                &importer,
-            )
+            .restore(request.clone(), &fixture.source_keys, &importer)
+            .await,
+        Err(RecoveryError::BlobMismatch)
+    ));
+    assert!(matches!(
+        fixture
+            .engine
+            .restore(request, &fixture.source_keys, &importer)
             .await
-            .is_err()
-    );
+            .unwrap(),
+        RestoreOutcome::Failed { .. }
+    ));
     assert_eq!(importer.prepare_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         fixture

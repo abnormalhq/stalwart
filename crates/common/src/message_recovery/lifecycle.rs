@@ -198,14 +198,19 @@ pub trait RestoreImporter: Send + Sync {
     type Pending: Send;
 
     /// Read registry Account from the same transactional Store and return its exact revision
-    /// assertion. Return an error if that same-store relationship cannot be verified.
+    /// assertion. Return `RecoveryError::Store` for retryable backend I/O failures; the restore
+    /// remains pending and the caller receives a sanitized in-progress error. Missing, stale, or
+    /// invalid accounts are terminal failures.
     fn live_account_assertion<'a>(
         &'a self,
         destination: &'a VerifiedAccountMapping,
     ) -> impl Future<Output = Result<AuthoritativeAccountAssertion>> + Send;
 
     /// Decode the original payload with `source_keys.decode_bounded` before parsing RFC822, then
-    /// append email_ingest_into operations. Never use cached account() or email_ingest.
+    /// append email_ingest_into operations. Map authentication, format, and checksum failures to
+    /// `RecoveryError::BlobMismatch`; return `RecoveryError::Store` only for retryable backend I/O.
+    /// This method must not commit or perform external writes. Never use cached account() or
+    /// email_ingest.
     fn prepare<'a>(
         &'a self,
         payload: &'a [u8],
@@ -658,6 +663,9 @@ impl RecoveryEngine {
                     return Err(RecoveryError::Conflict("account assertion mismatch"));
                 }
                 Err(error) => {
+                    if error.is_retryable_storage_failure() {
+                        return Err(RecoveryError::InProgress);
+                    }
                     self.abort_restore(&request, "account_unavailable").await?;
                     return Err(error);
                 }
@@ -671,6 +679,9 @@ impl RecoveryEngine {
                 return Err(RecoveryError::BlobMissing);
             }
             Err(error) => {
+                if error.is_retryable_storage_failure() {
+                    return Err(RecoveryError::InProgress);
+                }
                 self.abort_restore(&request, "payload_unavailable").await?;
                 return Err(error);
             }
@@ -687,6 +698,9 @@ impl RecoveryEngine {
         {
             Ok(prepared) => prepared,
             Err(error) => {
+                if error.is_retryable_storage_failure() {
+                    return Err(RecoveryError::InProgress);
+                }
                 self.abort_restore(&request, "import_prepare_failed")
                     .await?;
                 return Err(error);
