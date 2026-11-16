@@ -29,6 +29,10 @@ Upstream v1.1.1 changes the Netcup DNS API to key-only authentication. Existing 
 
 ## Preserved and deferred licensing boundaries
 
-The still-SEL `crates/common/src/enterprise/mod.rs`, `crates/common/src/enterprise/masked.rs`, and `crates/smtp/src/queue/tenant.rs` remain untouched. Existing still-SEL snippets remain byte-for-byte as they were on the Abnormal baseline; scheduler SEL changes are excluded. Mixed generated schema changes are selective rather than whole-file replacements. Only the `itip_add_uninvited_attendee` / `ItipOrigin` forwarded-invitation interface and its paired email-ingest integration remain deferred. The independent RSVP-preservation fix in `crates/groupware/src/scheduling/inbound.rs` and first-RRULE-wins fix in `crates/groupware/src/calendar/itip.rs` are included.
+The still-SEL `crates/common/src/enterprise/mod.rs`, `crates/common/src/enterprise/masked.rs`, and `crates/smtp/src/queue/tenant.rs` remain untouched. Existing still-SEL snippets remain byte-for-byte as they were on the Abnormal baseline; scheduler SEL changes are excluded. Mixed generated schema changes are selective rather than whole-file replacements. Within the calendar changes, the `itip_add_uninvited_attendee` / `ItipOrigin` forwarded-invitation interface and its paired email-ingest integration remain deferred. The independent RSVP-preservation fix in `crates/groupware/src/scheduling/inbound.rs` and first-RRULE-wins fix in `crates/groupware/src/calendar/itip.rs` are included.
 
 The v1.1.1 update does not modify the Mail repository, rewrite stored aliases, or change the Mail 14/27 policy.
+
+## DAV concurrent creates (excluded)
+
+The v1.1.1 DAV create-lock subpatch is excluded. Calendar, card, and file creates retain the PR1 `commit_batch` path. This deferral does **not** fix the baseline concurrent-create race: simultaneous requests can still pass the path-existence check and create duplicate resources. No concurrency-safety claim is made; remediation requires a separately reviewed, correctly fenced design across supported stores.

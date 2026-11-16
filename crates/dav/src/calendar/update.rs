@@ -12,7 +12,6 @@ use crate::{
     DavError, DavErrorCondition, DavMethod,
     calendar::ItipPrecondition,
     common::{
-        create::CreateLockHandler,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
     },
@@ -849,18 +848,7 @@ impl CalendarUpdateRequestHandler for Server {
                     .queue(&mut batch)
                     .caused_by(trc::location!())?;
             }
-            let lock = self
-                .lock_create(
-                    access_token,
-                    account_id,
-                    SyncCollection::Calendar,
-                    resource_name,
-                    headers,
-                )
-                .await?;
-            self.commit_create(lock, batch)
-                .await
-                .caused_by(trc::location!())?;
+            self.commit_batch(batch).await.caused_by(trc::location!())?;
 
             Ok(HttpResponse::new(StatusCode::CREATED)
                 .with_etag_opt(serves_submitted_ical.then_some(etag))
