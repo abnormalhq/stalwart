@@ -3,16 +3,16 @@
  */
 
 use crate::{DavError, Result};
-use common::{GroupwareResources, Server, auth::AccessToken};
+use common::{
+    GroupwareResources, Server, auth::AccessToken, storage::groupware::GroupwareCreateGeneration,
+};
 use groupware::cache::GroupwareCache;
 use std::{future::Future, sync::Arc};
 use store::{
-    Store, Subspace,
-    write::{AnyClass, AnyKey, AssignedIds, BatchBuilder, ValueClass},
+    Store,
+    write::{AssignedIds, BatchBuilder},
 };
 use types::collection::SyncCollection;
-
-const DAV_FENCE_PREFIX: [u8; 5] = [0x02, b'D', b'A', b'V', 0x01];
 
 #[cfg(test)]
 static TEST_PREPARE_BARRIER: std::sync::Mutex<
@@ -50,8 +50,7 @@ async fn wait_test_prepare_barrier() {
 }
 
 pub(crate) struct DavCreateFence {
-    key: Vec<u8>,
-    generation: Option<u64>,
+    generation: GroupwareCreateGeneration,
 }
 
 impl DavCreateFence {
@@ -78,15 +77,10 @@ impl DavCreateFence {
     }
 
     async fn read(store: &Store, account_id: u32, collection: SyncCollection) -> trc::Result<Self> {
-        let key = fence_key(account_id, collection);
-        let generation = store
-            .get_value::<u64>(AnyKey {
-                subspace: Subspace::System,
-                key: key.clone(),
-            })
-            .await?;
-
-        Ok(Self { key, generation })
+        Ok(Self {
+            generation: GroupwareCreateGeneration::read_primary(store, account_id, collection)
+                .await?,
+        })
     }
 
     pub(crate) async fn commit(&self, server: &Server, batch: BatchBuilder) -> Result<AssignedIds> {
@@ -107,24 +101,9 @@ impl DavCreateFence {
             ));
         }
 
-        let next_generation = self
-            .generation
-            .unwrap_or_default()
-            .checked_add(1)
-            .ok_or_else(|| {
-                trc::StoreEvent::UnexpectedError
-                    .into_err()
-                    .details("DAV namespace fence overflow")
-            })?;
-        let class = ValueClass::Any(AnyClass {
-            subspace: Subspace::System,
-            key: self.key.clone(),
-        });
-        match self.generation {
-            Some(generation) => batch.assert_value(class.clone(), generation),
-            None => batch.assert_value(class.clone(), ()),
-        };
-        batch.set(class, next_generation.to_be_bytes());
+        self.generation
+            .append_to_batch(&mut batch)
+            .map_err(DavError::Internal)?;
 
         match commit(batch).await {
             Ok(assigned_ids) => Ok(assigned_ids),
@@ -132,14 +111,6 @@ impl DavCreateFence {
             Err(err) => Err(err.into()),
         }
     }
-}
-
-fn fence_key(account_id: u32, collection: SyncCollection) -> Vec<u8> {
-    let mut key = Vec::with_capacity(DAV_FENCE_PREFIX.len() + 5);
-    key.extend_from_slice(&DAV_FENCE_PREFIX);
-    key.extend_from_slice(&account_id.to_be_bytes());
-    key.push(u8::from(collection));
-    key
 }
 
 #[cfg(test)]
@@ -159,7 +130,7 @@ mod tests {
         time::Duration,
     };
     use store::{
-        ValueKey,
+        Subspace, ValueKey,
         query::log::Query,
         write::{AnyClass, BatchBuilder, LogCollection, ValueClass},
     };
@@ -480,7 +451,8 @@ mod tests {
                 DavCreateFence::read(&store, account_id, SyncCollection::Calendar)
                     .await
                     .expect("read committed fence")
-                    .generation,
+                    .generation
+                    .current_generation(),
                 Some(1)
             );
         })
@@ -588,7 +560,8 @@ mod tests {
                 DavCreateFence::read(&store, account_id, SyncCollection::Calendar)
                     .await
                     .expect("read winning generation")
-                    .generation,
+                    .generation
+                    .current_generation(),
                 Some(1)
             );
         })
@@ -685,7 +658,7 @@ mod tests {
             let reloaded = DavCreateFence::read(&store, account_id, SyncCollection::Calendar)
                 .await
                 .expect("read reopened fence");
-            assert_eq!(reloaded.generation, Some(1));
+            assert_eq!(reloaded.generation.current_generation(), Some(1));
             let archive = ValueKey::archive(account_id, Collection::CalendarEvent, document_id);
             let mut delete = BatchBuilder::new();
             delete
@@ -731,7 +704,8 @@ mod tests {
                 DavCreateFence::read(&store, account_id, SyncCollection::Calendar)
                     .await
                     .expect("read recreated fence")
-                    .generation,
+                    .generation
+                    .current_generation(),
                 Some(2)
             );
         })
@@ -788,7 +762,8 @@ mod tests {
                     DavCreateFence::read(&store, account_id, collection)
                         .await
                         .expect("read independent generation")
-                        .generation,
+                        .generation
+                        .current_generation(),
                     Some(1)
                 );
             }
@@ -806,7 +781,12 @@ mod tests {
             let document_id = db.id(81);
             let class = ValueClass::Any(AnyClass {
                 subspace: Subspace::System,
-                key: fence_key(account_id, SyncCollection::Calendar),
+                key: {
+                    let mut key = vec![0x02, b'D', b'A', b'V', 0x01];
+                    key.extend_from_slice(&account_id.to_be_bytes());
+                    key.push(u8::from(SyncCollection::Calendar));
+                    key
+                },
             });
             let mut seed = BatchBuilder::new();
             seed.set(class, u64::MAX.to_be_bytes());
@@ -846,7 +826,8 @@ mod tests {
                 DavCreateFence::read(&store, account_id, SyncCollection::Calendar)
                     .await
                     .expect("read unchanged max generation")
-                    .generation,
+                    .generation
+                    .current_generation(),
                 Some(u64::MAX)
             );
         })

@@ -42,6 +42,7 @@ use common::{
     DavName, Server,
     auth::{AccessToken, AccountInfo, oauth::GrantType},
     i18n,
+    storage::groupware::GroupwareCreateGeneration,
 };
 use compact_str::ToCompactString;
 use registry::schema::enums::{Permission, StorageQuota};
@@ -52,7 +53,7 @@ use store::{
 };
 use trc::AddContext;
 use types::{
-    collection::Collection,
+    collection::{Collection, SyncCollection},
     field::{CalendarEventField, ContactField},
 };
 const MAX_RSVP_COMMENT_LEN: usize = 512;
@@ -95,6 +96,49 @@ fn ensure_forward_uid_available(uid_exists: bool) -> Result<(), ItipError> {
 #[cfg(stalwart_tests)]
 pub static ITIP_MERGE_BARRIER: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Barrier>>> =
     std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static ITIP_CREATE_BARRIER: std::sync::Mutex<
+    Option<(Vec<String>, std::sync::Arc<tokio::sync::Barrier>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static ITIP_CREATE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+async fn wait_itip_create_barrier(uid: &str) {
+    let barrier = ITIP_CREATE_BARRIER.lock().ok().and_then(|slot| {
+        slot.as_ref().and_then(|(expected_uids, barrier)| {
+            expected_uids
+                .iter()
+                .any(|expected_uid| expected_uid == uid)
+                .then(|| barrier.clone())
+        })
+    });
+    if let Some(barrier) = barrier {
+        let is_leader = tokio::time::timeout(Duration::from_secs(20), barrier.wait())
+            .await
+            .expect("timed out waiting for iTIP create test barrier")
+            .is_leader();
+        if is_leader
+            && let Ok(mut slot) = ITIP_CREATE_BARRIER.lock()
+            && slot.as_ref().is_some_and(|(expected_uids, current)| {
+                expected_uids.iter().any(|expected_uid| expected_uid == uid)
+                    && std::sync::Arc::ptr_eq(current, &barrier)
+            })
+        {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn set_itip_create_barrier(uids: &[&str], participants: usize) {
+    *ITIP_CREATE_BARRIER.lock().expect("iTIP test barrier mutex") = Some((
+        uids.iter().map(|uid| (*uid).to_string()).collect(),
+        std::sync::Arc::new(tokio::sync::Barrier::new(participants)),
+    ));
+}
 
 pub enum ItipIngestError {
     Message(ItipError),
@@ -166,6 +210,7 @@ pub trait ItipIngest: Sync + Send {
     fn itip_create_event(
         &self,
         account_info: &AccountInfo,
+        generation: GroupwareCreateGeneration,
         ical: ICalendar,
         itip: ICalendar,
         changed_by: ChangedBy,
@@ -561,6 +606,12 @@ impl ItipIngest for Server {
 
         // Find event by UID
         let account_id = account_info.account_id();
+        let generation = GroupwareCreateGeneration::read_primary(
+            self.store(),
+            account_id,
+            SyncCollection::Calendar,
+        )
+        .await?;
         let document_id = self
             .document_ids_matching(
                 account_id,
@@ -654,8 +705,18 @@ impl ItipIngest for Server {
             let mut ical = itip.clone();
             itip_import_message(&mut ical)?;
 
-            self.itip_create_event(account_info, ical, itip, changed_by, itip_message)
-                .await?;
+            #[cfg(test)]
+            wait_itip_create_barrier(&itip_snapshots.uid).await;
+
+            self.itip_create_event(
+                account_info,
+                generation,
+                ical,
+                itip,
+                changed_by,
+                itip_message,
+            )
+            .await?;
             Ok(None)
         }
     }
@@ -680,6 +741,12 @@ impl ItipIngest for Server {
             sender,
             self.account_id_from_email(sender, true).await?,
         )?;
+        let generation = GroupwareCreateGeneration::read_primary(
+            self.store(),
+            account_info.account_id(),
+            SyncCollection::Calendar,
+        )
+        .await?;
         let uid_exists = self
             .document_exists(
                 account_info.account_id(),
@@ -694,8 +761,12 @@ impl ItipIngest for Server {
         let mut ical = itip.clone();
         itip_import_message(&mut ical)?;
         itip_add_uninvited_attendee(&mut ical, recipient);
+        #[cfg(test)]
+        wait_itip_create_barrier(&sender_snapshots.uid).await;
+
         self.itip_create_event(
             account_info,
+            generation,
             ical,
             itip.clone(),
             ChangedBy::PrincipalId(sender_id),
@@ -710,6 +781,7 @@ impl ItipIngest for Server {
     async fn itip_create_event(
         &self,
         account_info: &AccountInfo,
+        generation: GroupwareCreateGeneration,
         ical: ICalendar,
         itip: ICalendar,
         changed_by: ChangedBy,
@@ -785,7 +857,7 @@ impl ItipIngest for Server {
             current: Some(current),
         };
 
-        let mut batch = BatchBuilder::new();
+        let mut batch = BatchBuilder::new_atomic();
         batch.with_account_id(account_id);
         self.limit_disk_quota(&mut batch, &account);
         self.limit_object_quota(&mut batch, &account, StorageQuota::MaxCalendarEvents);
@@ -824,6 +896,9 @@ impl ItipIngest for Server {
                 )
                 .caused_by(trc::location!())?;
         }
+        generation
+            .append_to_batch(&mut batch)
+            .caused_by(trc::location!())?;
         self.commit_batch(batch).await.caused_by(trc::location!())?;
 
         Ok(())
@@ -1828,6 +1903,7 @@ mod forwarding_tests {
 #[cfg(test)]
 mod server_ingest_tests {
     use super::*;
+    use crate::DestroyArchive;
     use common::{auth::AccountInfo, test_utils::ServerFixture};
     use std::future::Future;
 
@@ -1907,6 +1983,143 @@ mod server_ingest_tests {
         .expect("query persisted iTIP UID")
         .iter()
         .count()
+    }
+
+    async fn seed_race_accounts(fixture: &ServerFixture) -> (u32, u32, u32) {
+        let organizer_id = bounded(
+            fixture.create_user_account("organizer", DOMAIN),
+            "seed race organizer account",
+        )
+        .await;
+        let attendee_id = bounded(
+            fixture.create_user_account("attendee", DOMAIN),
+            "seed race attendee account",
+        )
+        .await;
+        let recipient_id = bounded(
+            fixture.create_user_account("recipient", DOMAIN),
+            "seed race recipient account",
+        )
+        .await;
+        (organizer_id, attendee_id, recipient_id)
+    }
+
+    async fn account_info(server: &Server, account_id: u32) -> AccountInfo {
+        bounded(server.account_info(account_id), "load race account info")
+            .await
+            .expect("load race account info")
+    }
+
+    async fn prepare_default_calendar(server: &Server, account_info: &AccountInfo) {
+        bounded(
+            server.get_or_create_default_calendar(account_info.account(), account_info.account()),
+            "prepare race default calendar",
+        )
+        .await
+        .expect("prepare race default calendar")
+        .expect("default calendar exists");
+    }
+
+    async fn shared_recipient_servers()
+    -> (ServerFixture, ServerFixture, u32, AccountInfo, AccountInfo) {
+        let first = bounded(ServerFixture::new(), "build first race fixture").await;
+        let second = bounded(
+            first.new_with_shared_primary(),
+            "build independent race fixture",
+        )
+        .await;
+        let account_ids = seed_race_accounts(&first).await;
+
+        let first_recipient = account_info(&first.server, account_ids.2).await;
+        let second_recipient = account_info(&second.server, account_ids.2).await;
+        prepare_default_calendar(&first.server, &first_recipient).await;
+        prepare_default_calendar(&second.server, &second_recipient).await;
+
+        (
+            first,
+            second,
+            account_ids.2,
+            first_recipient,
+            second_recipient,
+        )
+    }
+
+    async fn namespace_generation(server: &Server, account_id: u32) -> Option<u64> {
+        bounded(
+            GroupwareCreateGeneration::read_primary(
+                server.store(),
+                account_id,
+                SyncCollection::Calendar,
+            ),
+            "read Calendar create generation",
+        )
+        .await
+        .expect("read Calendar create generation")
+        .current_generation()
+    }
+
+    async fn delete_event(server: &Server, account_info: &AccountInfo, uid: &str) {
+        let account_id = account_info.account_id();
+        let document_id = bounded(
+            server.document_ids_matching(
+                account_id,
+                Collection::CalendarEvent,
+                CalendarEventField::Uid,
+                uid.as_bytes(),
+            ),
+            "find iTIP event for deletion",
+        )
+        .await
+        .expect("find iTIP event for deletion")
+        .iter()
+        .next()
+        .expect("iTIP event exists before deletion");
+        let (event_archive, content_archive) = bounded(
+            server.archive_and_field(
+                account_id,
+                Collection::CalendarEvent,
+                document_id,
+                CalendarEventField::Content.field(),
+            ),
+            "read iTIP event for deletion",
+        )
+        .await
+        .expect("read iTIP event for deletion");
+        let event_archive = event_archive.expect("event archive exists");
+        let event = event_archive
+            .unarchive::<CalendarEvent>()
+            .expect("unarchive iTIP event for deletion");
+        let calendar_id = event
+            .names
+            .iter()
+            .next()
+            .map(|name| name.parent_id())
+            .expect("event has a calendar name");
+        let event_archive = Archive {
+            inner: event,
+            version: event_archive.version,
+        };
+        let mut batch = BatchBuilder::new();
+        bounded(
+            DestroyArchive(event_archive).delete(
+                server,
+                account_info,
+                account_id,
+                document_id,
+                calendar_id,
+                content_archive,
+                None,
+                false,
+                &mut batch,
+            ),
+            "build iTIP event deletion",
+        )
+        .await
+        .expect("build iTIP event deletion");
+        bounded(server.commit_batch(batch), "commit iTIP event deletion")
+            .await
+            .expect("commit iTIP event deletion");
+        assert_eq!(stored_event_count(server, account_id, uid).await, 0);
     }
 
     fn attendee_status<'a>(
@@ -2221,5 +2434,289 @@ mod server_ingest_tests {
             attendee_status(&replied.data.event, &organizer_info, &attendee_address),
             Some(ICalendarParticipationStatus::Accepted)
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forwarded_same_uid_race_creates_one_event_across_servers() {
+        let (first, second, recipient_id, first_info, second_info) =
+            shared_recipient_servers().await;
+        let organizer_address = format!("organizer@{DOMAIN}");
+        let attendee_address = format!("attendee@{DOMAIN}");
+        let recipient_address = format!("recipient@{DOMAIN}");
+        let uid = "forwarded-same-uid-race";
+        let message = request(
+            uid,
+            "REQUEST",
+            &organizer_address,
+            &attendee_address,
+            "Forwarded race",
+        );
+
+        let _barrier_lock = ITIP_CREATE_TEST_LOCK.lock().await;
+        set_itip_create_barrier(&[uid], 2);
+        let (first_result, second_result) = bounded(
+            async {
+                tokio::join!(
+                    ingest(
+                        &first.server,
+                        &first_info,
+                        &attendee_address,
+                        ItipOrigin::Submission,
+                        &recipient_address,
+                        &message,
+                    ),
+                    ingest(
+                        &second.server,
+                        &second_info,
+                        &attendee_address,
+                        ItipOrigin::Submission,
+                        &recipient_address,
+                        &message,
+                    ),
+                )
+            },
+            "race same-UID forwarded invitations",
+        )
+        .await;
+
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+        let loser = if first_result.is_err() {
+            first_result
+        } else {
+            second_result
+        };
+        assert!(matches!(
+            loser,
+            Err(ItipIngestError::Message(ItipError::SenderIsNotOrganizer))
+        ));
+        assert_eq!(
+            stored_event_count(&first.server, recipient_id, uid).await,
+            1
+        );
+        assert_eq!(
+            stored_event_count(&second.server, recipient_id, uid).await,
+            1
+        );
+        assert_eq!(
+            namespace_generation(&first.server, recipient_id).await,
+            Some(1)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn normal_and_forwarded_create_race_creates_one_event() {
+        let (first, second, recipient_id, first_info, second_info) =
+            shared_recipient_servers().await;
+        let organizer_address = format!("organizer@{DOMAIN}");
+        let attendee_address = format!("attendee@{DOMAIN}");
+        let recipient_address = format!("recipient@{DOMAIN}");
+        let uid = "normal-forward-create-race";
+        let normal = request(
+            uid,
+            "REQUEST",
+            &organizer_address,
+            &recipient_address,
+            "Normal invitation",
+        );
+        let forwarded = request(
+            uid,
+            "REQUEST",
+            &organizer_address,
+            &attendee_address,
+            "Forwarded invitation",
+        );
+
+        let _barrier_lock = ITIP_CREATE_TEST_LOCK.lock().await;
+        set_itip_create_barrier(&[uid], 2);
+        let (normal_result, forwarded_result) = bounded(
+            async {
+                tokio::join!(
+                    ingest(
+                        &first.server,
+                        &first_info,
+                        &organizer_address,
+                        ItipOrigin::Delivery,
+                        &recipient_address,
+                        &normal,
+                    ),
+                    ingest(
+                        &second.server,
+                        &second_info,
+                        &attendee_address,
+                        ItipOrigin::Submission,
+                        &recipient_address,
+                        &forwarded,
+                    ),
+                )
+            },
+            "race normal and forwarded invitations",
+        )
+        .await;
+
+        assert!(normal_result.is_ok());
+        assert!(
+            forwarded_result.is_ok()
+                || matches!(
+                    forwarded_result,
+                    Err(ItipIngestError::Message(ItipError::SenderIsNotOrganizer))
+                )
+        );
+        assert_eq!(
+            stored_event_count(&first.server, recipient_id, uid).await,
+            1
+        );
+        assert_eq!(
+            stored_event_count(&second.server, recipient_id, uid).await,
+            1
+        );
+        assert_eq!(
+            namespace_generation(&first.server, recipient_id).await,
+            Some(1)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn different_uid_generation_conflict_retries_and_succeeds() {
+        let (first, second, recipient_id, first_info, second_info) =
+            shared_recipient_servers().await;
+        let organizer_address = format!("organizer@{DOMAIN}");
+        let attendee_address = format!("attendee@{DOMAIN}");
+        let recipient_address = format!("recipient@{DOMAIN}");
+        let first_uid = "different-uid-race-first";
+        let second_uid = "different-uid-race-second";
+        let first_message = request(
+            first_uid,
+            "REQUEST",
+            &organizer_address,
+            &attendee_address,
+            "First different UID",
+        );
+        let second_message = request(
+            second_uid,
+            "REQUEST",
+            &organizer_address,
+            &attendee_address,
+            "Second different UID",
+        );
+
+        let _barrier_lock = ITIP_CREATE_TEST_LOCK.lock().await;
+        set_itip_create_barrier(&[first_uid, second_uid], 2);
+        let (first_result, second_result) = bounded(
+            async {
+                tokio::join!(
+                    ingest(
+                        &first.server,
+                        &first_info,
+                        &attendee_address,
+                        ItipOrigin::Submission,
+                        &recipient_address,
+                        &first_message,
+                    ),
+                    ingest(
+                        &second.server,
+                        &second_info,
+                        &attendee_address,
+                        ItipOrigin::Submission,
+                        &recipient_address,
+                        &second_message,
+                    ),
+                )
+            },
+            "race different-UID forwarded invitations",
+        )
+        .await;
+
+        assert!(first_result.is_ok());
+        assert!(second_result.is_ok());
+        assert_eq!(
+            stored_event_count(&first.server, recipient_id, first_uid).await,
+            1
+        );
+        assert_eq!(
+            stored_event_count(&first.server, recipient_id, second_uid).await,
+            1
+        );
+        assert_eq!(
+            namespace_generation(&first.server, recipient_id).await,
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_event_uid_can_be_recreated_without_resetting_generation() {
+        let fixture = bounded(ServerFixture::new(), "build delete/recreate fixture").await;
+        let (_organizer_id, _attendee_id, recipient_id) = seed_race_accounts(&fixture).await;
+        let recipient_info = account_info(&fixture.server, recipient_id).await;
+        prepare_default_calendar(&fixture.server, &recipient_info).await;
+        let organizer_address = format!("organizer@{DOMAIN}");
+        let recipient_address = format!("recipient@{DOMAIN}");
+        let uid = "delete-recreate-same-uid";
+
+        let first = request(
+            uid,
+            "REQUEST",
+            &organizer_address,
+            &recipient_address,
+            "Original invitation",
+        );
+        assert!(
+            ingest(
+                &fixture.server,
+                &recipient_info,
+                &organizer_address,
+                ItipOrigin::Delivery,
+                &recipient_address,
+                &first,
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(
+            namespace_generation(&fixture.server, recipient_id).await,
+            Some(1)
+        );
+
+        delete_event(&fixture.server, &recipient_info, uid).await;
+        assert_eq!(
+            namespace_generation(&fixture.server, recipient_id).await,
+            Some(1)
+        );
+
+        let recreated = request(
+            uid,
+            "REQUEST",
+            &organizer_address,
+            &recipient_address,
+            "Recreated invitation",
+        );
+        assert!(
+            ingest(
+                &fixture.server,
+                &recipient_info,
+                &organizer_address,
+                ItipOrigin::Delivery,
+                &recipient_address,
+                &recreated,
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(
+            stored_event_count(&fixture.server, recipient_id, uid).await,
+            1
+        );
+        assert_eq!(
+            summary(
+                &stored_event(&fixture.server, recipient_id, uid)
+                    .await
+                    .data
+                    .event
+            ),
+            Some("Recreated invitation")
+        );
+        assert_eq!(
+            namespace_generation(&fixture.server, recipient_id).await,
+            Some(2)
+        );
     }
 }
