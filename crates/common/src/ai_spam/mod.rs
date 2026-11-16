@@ -204,8 +204,12 @@ impl AiEvidence {
 fn evidence(cap: u8, result: ModelResult) -> AiEvidence {
     let points = if result.verdict == Verdict::Spam
         && result.confidence >= SPAM_CONFIDENCE_THRESHOLD
+        && cap > 0
     {
-        (u16::from(cap.min(MAX_SCORE_POINTS)) * u16::from(result.confidence.min(100)) / 100) as u8
+        let scaled =
+            (u16::from(cap.min(MAX_SCORE_POINTS)) * u16::from(result.confidence.min(100)) / 100)
+                as u8;
+        scaled.max(1)
     } else {
         0
     };

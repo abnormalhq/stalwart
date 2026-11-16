@@ -3,7 +3,8 @@
  */
 
 use super::{
-    AiEvidence, AiSpamRuntime, ClassifyOutcome, MAX_CONCURRENT_CLASSIFICATIONS, NeutralReason,
+    AiEvidence, AiSpamRuntime, ClassifyOutcome, MAX_CONCURRENT_CLASSIFICATIONS, MAX_SCORE_POINTS,
+    NeutralReason,
     config,
     config::{
         Budgets, ConfigError, DataScope, EndpointMode, OperatorConfig, Pricing, ProviderCredential,
@@ -606,6 +607,74 @@ fn score_helper_preserves_native_scores_and_caps_only_ai_contribution() {
     assert_eq!(
         AiEvidence(5).add_to_score(f32::NEG_INFINITY),
         f32::NEG_INFINITY
+    );
+}
+
+#[test]
+fn spam_evidence_is_bounded_monotonic_and_additive() {
+    let cases = [
+        (79, [0, 0, 0, 0, 0, 0]),
+        (80, [0, 1, 1, 2, 3, 4]),
+        (99, [0, 1, 1, 2, 3, 4]),
+        (100, [0, 1, 2, 3, 4, 5]),
+    ];
+    let mut scores = [[0; 6]; 4];
+
+    for (confidence_index, (confidence, expected_by_cap)) in cases.into_iter().enumerate() {
+        for (cap_index, expected_points) in expected_by_cap.into_iter().enumerate() {
+            let cap = cap_index as u8;
+            let points = evidence(
+                cap,
+                ModelResult {
+                    verdict: Verdict::Spam,
+                    confidence,
+                },
+            )
+            .points();
+            assert_eq!(points, expected_points, "confidence {confidence}, cap {cap}");
+            assert!(points <= cap.min(MAX_SCORE_POINTS));
+            scores[confidence_index][cap_index] = points;
+        }
+    }
+
+    for cap in 0usize..=5 {
+        assert!(scores.windows(2).all(|pair| pair[0][cap] <= pair[1][cap]));
+    }
+    for confidence_scores in &scores {
+        assert!(confidence_scores.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    let minimum = evidence(
+        1,
+        ModelResult {
+            verdict: Verdict::Spam,
+            confidence: 80,
+        },
+    );
+    assert_eq!(minimum.points(), 1);
+    assert_eq!(minimum.add_to_score(-4.0), -3.0);
+    assert_eq!(minimum.add_to_score(4.0), 5.0);
+    assert_eq!(
+        evidence(
+            1,
+            ModelResult {
+                verdict: Verdict::Ham,
+                confidence: 100,
+            }
+        )
+        .points(),
+        0
+    );
+    assert_eq!(
+        evidence(
+            1,
+            ModelResult {
+                verdict: Verdict::Uncertain,
+                confidence: 100,
+            }
+        )
+        .points(),
+        0
     );
 }
 
