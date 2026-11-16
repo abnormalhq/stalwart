@@ -288,6 +288,9 @@ fn normalize_values(
         if !allowed.contains(name) {
             return Err(PresentationError::InvalidValue);
         }
+        if value.len() > MAX_PLACEHOLDER_VALUE_BYTES * 2 {
+            return Err(PresentationError::InvalidValue);
+        }
         let normalized = value.replace("\r\n", "\n");
         if normalized
             .chars()
@@ -773,6 +776,67 @@ mod tests {
         assert_eq!(
             validate_subject("safe\r\nBcc: injected@example.invalid"),
             Err(PresentationError::UnsafeSubject)
+        );
+    }
+
+    #[test]
+    fn bounds_raw_placeholder_bytes_before_crlf_normalization() {
+        let mut document = fallback(PresentationKind::CalendarAlarm);
+        document.sections.intro = "{{eventTitle}} {{eventDescription}}".to_string();
+        let crlf_boundary = "\r\n".repeat(MAX_PLACEHOLDER_VALUE_BYTES);
+        let boundary_values = BTreeMap::from([
+            (
+                PresentationPlaceholder::EventTitle,
+                "Exact boundary".to_string(),
+            ),
+            (
+                PresentationPlaceholder::EventDescription,
+                crlf_boundary.clone(),
+            ),
+        ]);
+        let rendered = render(&document, &boundary_values, None).unwrap();
+        assert!(rendered.text.contains("Exact boundary"));
+        assert!(
+            rendered
+                .text
+                .contains("\n".repeat(MAX_PLACEHOLDER_VALUE_BYTES).as_str())
+        );
+        assert!(!rendered.text.contains('\r'));
+
+        let oversized = format!("{crlf_boundary}\n");
+        let oversized_values = BTreeMap::from([
+            (
+                PresentationPlaceholder::EventTitle,
+                "Preserved title".to_string(),
+            ),
+            (PresentationPlaceholder::EventDescription, oversized.clone()),
+        ]);
+        assert_eq!(
+            render(&document, &oversized_values, None),
+            Err(PresentationError::InvalidValue)
+        );
+        let fallback = render_or_fallback(&document, &oversized_values, None);
+        assert!(fallback.text.contains("Preserved title"));
+        assert!(!fallback.text.contains('\r'));
+
+        let utf8_boundary = "é".repeat(MAX_PLACEHOLDER_VALUE_BYTES / 2);
+        let utf8_values = BTreeMap::from([(
+            PresentationPlaceholder::EventDescription,
+            utf8_boundary.clone(),
+        )]);
+        assert!(
+            render(&document, &utf8_values, None)
+                .unwrap()
+                .text
+                .contains(utf8_boundary.as_str())
+        );
+
+        let utf8_oversized = "é".repeat(MAX_PLACEHOLDER_VALUE_BYTES / 2 + 1);
+        let utf8_oversized_values =
+            BTreeMap::from([(PresentationPlaceholder::EventDescription, utf8_oversized)]);
+        assert_eq!(
+            render(&document, &utf8_oversized_values, None),
+            Err(PresentationError::InvalidValue)
         );
     }
 
