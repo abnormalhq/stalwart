@@ -946,6 +946,150 @@ impl RecoveryEngine {
         Ok(report)
     }
 
+    pub(super) async fn cleanup_unselected_copy_attempts(
+        &self,
+        scope: &RecoveryScope,
+        capture_id: &str,
+    ) -> Result<()> {
+        loop {
+            let key = scoped_key(b"manifest", scope, capture_id)?;
+            let Some((manifest, _)) = self.read::<Manifest>(&key).await? else {
+                return Ok(());
+            };
+            let Some(attempt) = manifest.copy_attempts.iter().find(|attempt| {
+                attempt.state == CopyAttemptState::Verified
+                    && manifest.selected_attempt_id != Some(attempt.id)
+            }) else {
+                return Ok(());
+            };
+            self.cleanup_unselected_copy_attempt(scope, capture_id, attempt.id)
+                .await?;
+        }
+    }
+
+    async fn cleanup_unselected_copy_attempt(
+        &self,
+        scope: &RecoveryScope,
+        capture_id: &str,
+        attempt_id: u8,
+    ) -> Result<()> {
+        let manifest_key = scoped_key(b"manifest", scope, capture_id)?;
+        let hold_key = scoped_key(b"hold", scope, "")?;
+        let lifecycle_key = capture_lifecycle_key(scope, capture_id)?;
+        let ledger_key = quota_key(scope)?;
+        let (manifest, _) = self
+            .read::<Manifest>(&manifest_key)
+            .await?
+            .ok_or(RecoveryError::NotFound)?;
+        let attempt = manifest
+            .copy_attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or(RecoveryError::Conflict("copy attempt is missing"))?;
+        if attempt.state == CopyAttemptState::Cleaned {
+            return Ok(());
+        }
+        if attempt.state == CopyAttemptState::Writing {
+            return Err(RecoveryError::InProgress);
+        }
+        if attempt.state != CopyAttemptState::Verified
+            || manifest.selected_attempt_id == Some(attempt_id)
+            || manifest.state == ManifestState::Purging
+        {
+            return Err(RecoveryError::Conflict("copy attempt is not cleanable"));
+        }
+        let (hold, _) = self
+            .read::<HoldControl>(&hold_key)
+            .await?
+            .ok_or(RecoveryError::Conflict("hold state disappeared"))?;
+        if hold.active || hold.pending_purges != 0 {
+            return Err(RecoveryError::Held);
+        }
+        if self
+            .read::<CaptureLifecycleControl>(&lifecycle_key)
+            .await?
+            .is_some_and(|(lifecycle, _)| lifecycle.lock.is_some())
+        {
+            return Err(RecoveryError::InProgress);
+        }
+        self.blobs.delete_blob(&attempt.blob_key).await?;
+        if self.blobs.get_raw_blob(&attempt.blob_key).await?.is_some() {
+            return Err(RecoveryError::InProgress);
+        }
+
+        let (mut current, manifest_bytes) = self
+            .read::<Manifest>(&manifest_key)
+            .await?
+            .ok_or(RecoveryError::NotFound)?;
+        let (current_hold, hold_bytes) = self
+            .read::<HoldControl>(&hold_key)
+            .await?
+            .ok_or(RecoveryError::Conflict("hold state disappeared"))?;
+        let lifecycle = self.read::<CaptureLifecycleControl>(&lifecycle_key).await?;
+        let (mut ledger, ledger_bytes) = self
+            .read::<ScopeLedger>(&ledger_key)
+            .await?
+            .ok_or(RecoveryError::Conflict("quota ledger disappeared"))?;
+        let position = current
+            .copy_attempts
+            .iter()
+            .position(|attempt| attempt.id == attempt_id)
+            .ok_or(RecoveryError::Conflict("copy attempt disappeared"))?;
+        if current.copy_attempts[position].state == CopyAttemptState::Cleaned {
+            return Ok(());
+        }
+        if current.copy_attempts[position].state != CopyAttemptState::Verified
+            || current.selected_attempt_id == Some(attempt_id)
+            || current.state == ManifestState::Purging
+            || current_hold.active
+            || current_hold.pending_purges != 0
+            || lifecycle
+                .as_ref()
+                .is_some_and(|(control, _)| control.lock.is_some())
+        {
+            return Err(RecoveryError::Conflict("copy cleanup fence changed"));
+        }
+        let charge = current.copy_attempts[position].stored_size;
+        ledger.charged_bytes = ledger
+            .charged_bytes
+            .checked_sub(charge)
+            .ok_or(RecoveryError::Conflict("quota ledger underflow"))?;
+        current.copy_attempts[position].state = CopyAttemptState::Cleaned;
+        let mut batch = BatchBuilder::new();
+        append_assert(&mut batch, &manifest_key, Some(&manifest_bytes))?;
+        append_assert(&mut batch, &hold_key, Some(&hold_bytes))?;
+        append_assert_optional(
+            &mut batch,
+            &lifecycle_key,
+            lifecycle.as_ref().map(|(_, bytes)| bytes),
+        )?;
+        append_assert(&mut batch, &ledger_key, Some(&ledger_bytes))?;
+        batch.with_account_id(0).set(
+            value_class(&manifest_key),
+            encode_record(&current, next_record_revision(Some(&manifest_bytes))?)?,
+        );
+        batch.with_account_id(0).set(
+            value_class(&ledger_key),
+            encode_record(&ledger, next_record_revision(Some(&ledger_bytes))?)?,
+        );
+        ensure_single_segment(&batch)?;
+        if let Err(error) = self.metadata.write_batch(&mut batch).await {
+            if self
+                .read::<Manifest>(&manifest_key)
+                .await?
+                .is_some_and(|(manifest, _)| {
+                    manifest.copy_attempts.iter().any(|attempt| {
+                        attempt.id == attempt_id && attempt.state == CopyAttemptState::Cleaned
+                    })
+                })
+            {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     async fn purge_internal(
         &self,
         request: PurgeRequest,
@@ -976,6 +1120,13 @@ impl RecoveryEngine {
                 .ok_or(RecoveryError::NotFound)?;
             if manifest.scope != request.scope || manifest.capture_id != request.capture_id {
                 return Err(RecoveryError::Conflict("purge capture scope mismatch"));
+            }
+            if manifest
+                .copy_attempts
+                .iter()
+                .any(|attempt| attempt.state == CopyAttemptState::Writing)
+            {
+                return Err(RecoveryError::InProgress);
             }
             let (index, _) = self.required_account_capture_index(scope).await?;
             if !index.captures.contains(&request.capture_id) {
@@ -1122,17 +1273,34 @@ impl RecoveryEngine {
                     operation_id: request.operation_id.clone(),
                 })
             || !purge_job_matches(&job, &request, cleanup)
+            || manifest
+                .copy_attempts
+                .iter()
+                .any(|attempt| attempt.state == CopyAttemptState::Writing)
         {
             return Err(RecoveryError::Conflict("purge reservation changed"));
         }
-        self.blobs.delete_blob(&manifest.recovery_blob_key).await?;
-        if self
-            .blobs
-            .get_raw_blob(&manifest.recovery_blob_key)
-            .await?
-            .is_some()
-        {
-            return Err(RecoveryError::BlobMismatch);
+        if manifest.copy_attempts.is_empty() {
+            self.blobs.delete_blob(&manifest.recovery_blob_key).await?;
+            if self
+                .blobs
+                .get_raw_blob(&manifest.recovery_blob_key)
+                .await?
+                .is_some()
+            {
+                return Err(RecoveryError::BlobMismatch);
+            }
+        } else {
+            for attempt in manifest
+                .copy_attempts
+                .iter()
+                .filter(|attempt| attempt.state != CopyAttemptState::Cleaned)
+            {
+                self.blobs.delete_blob(&attempt.blob_key).await?;
+                if self.blobs.get_raw_blob(&attempt.blob_key).await?.is_some() {
+                    return Err(RecoveryError::BlobMismatch);
+                }
+            }
         }
         self.finish_purge(&request, &manifest, &job_key, &tombstone_key)
             .await
@@ -1175,6 +1343,11 @@ impl RecoveryEngine {
         if current_manifest.state != ManifestState::Purging
             || current_manifest.capture_id != manifest.capture_id
             || current_manifest.recovery_blob_key != manifest.recovery_blob_key
+            || current_manifest.copy_attempts != manifest.copy_attempts
+            || current_manifest
+                .copy_attempts
+                .iter()
+                .any(|attempt| attempt.state == CopyAttemptState::Writing)
             || lifecycle.lock
                 != Some(LifecycleLock::Purge {
                     operation_id: request.operation_id.clone(),
@@ -1212,9 +1385,19 @@ impl RecoveryEngine {
                 "account capture index count mismatch",
             ));
         }
+        let charged_attempt_bytes = if current_manifest.copy_attempts.is_empty() {
+            current_manifest.stored_size
+        } else {
+            current_manifest
+                .copy_attempts
+                .iter()
+                .filter(|attempt| attempt.state != CopyAttemptState::Cleaned)
+                .try_fold(0_u64, |sum, attempt| sum.checked_add(attempt.stored_size))
+                .ok_or(RecoveryError::Conflict("quota charge overflow"))?
+        };
         ledger.charged_bytes = ledger
             .charged_bytes
-            .checked_sub(current_manifest.stored_size)
+            .checked_sub(charged_attempt_bytes)
             .ok_or(RecoveryError::Conflict("quota ledger underflow"))?;
         hold.pending_purges -= 1;
         lifecycle.lock = None;

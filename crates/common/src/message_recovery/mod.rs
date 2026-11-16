@@ -24,6 +24,7 @@ const PREFIX: &[u8] = b"abnormal-retention:v1:";
 const MAX_RECORD_BYTES: usize = 1_048_576;
 const MAX_BLOB_BYTES: usize = 134_217_728;
 const MAX_ITEMS_PER_SCOPE: usize = 4096;
+const MAX_COPY_ATTEMPTS: usize = 3;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug)]
@@ -233,6 +234,26 @@ pub struct Manifest {
     pub policy_revision: u64,
     pub policy_digest: String,
     pub hold_epoch: u64,
+    #[serde(default)]
+    pub copy_attempts: Vec<RecoveryCopyAttempt>,
+    #[serde(default)]
+    pub selected_attempt_id: Option<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryCopyAttempt {
+    id: u8,
+    blob_key: Vec<u8>,
+    stored_size: u64,
+    state: CopyAttemptState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum CopyAttemptState {
+    Writing,
+    Verified,
+    Selected,
+    Cleaned,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -300,6 +321,8 @@ pub struct RecoveryEngine {
     purge_finalization_fault: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     read_count: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    fail_after_attempt_upload: std::sync::atomic::AtomicBool,
 }
 
 struct RawBytes(Vec<u8>);
@@ -376,6 +399,8 @@ impl RecoveryEngine {
             purge_finalization_fault: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             read_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_after_attempt_upload: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -389,6 +414,12 @@ impl RecoveryEngine {
     pub(crate) fn reset_read_count(&self) {
         self.read_count
             .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_after_next_attempt_upload(&self) {
+        self.fail_after_attempt_upload
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -569,8 +600,6 @@ impl RecoveryEngine {
         }
         source_keys.decode_bounded(&request.original_blob_key, raw.clone(), MAX_BLOB_BYTES)?;
         let checksum = digest_hex(&raw);
-        let storage_key = recovery_blob_key(&scope, &request.metadata.operation_id)?;
-        let encoded_size = self.options.encode(&storage_key, &raw)?.len() as u64;
         let retention_days = policy.policy.recovery_days.ok_or(RecoveryError::Invalid(
             "enabled policy has no retention period",
         ))?;
@@ -586,26 +615,147 @@ impl RecoveryEngine {
         if self.read::<PurgeTombstone>(&tombstone_key).await?.is_some() {
             return Err(RecoveryError::Conflict("capture was permanently purged"));
         }
-        let existing = self.read::<Manifest>(&manifest_key).await?;
-        let account_index = self.account_capture_index(&scope).await?;
-        if let Some((index, _)) = &account_index {
-            if index.captures.contains(&capture_id) != existing.is_some() {
+        if let Some((manifest, manifest_bytes)) = self.read::<Manifest>(&manifest_key).await? {
+            let (index, _) = self.required_account_capture_index(&scope).await?;
+            if !index.captures.contains(&capture_id) {
                 return Err(RecoveryError::Conflict(
-                    "capture manifest and account index disagree",
+                    "existing capture is missing its account index",
                 ));
             }
-        } else if existing.is_some() {
+            if manifest.state == ManifestState::Staging {
+                if manifest.scope != scope
+                    || manifest.capture_operation_id != request.metadata.operation_id
+                    || manifest.original_blob_key != request.original_blob_key
+                    || manifest.source_revision != request.source.revision
+                    || manifest.source_account_id != request.source.account_id
+                    || manifest.source_collection != request.source.collection as u8
+                    || manifest.source_document_id != request.source.document_id
+                    || manifest.cause != request.metadata.cause
+                    || manifest.received_at != request.metadata.received_at
+                    || manifest.folders != request.metadata.folders
+                    || manifest.keywords != request.metadata.keywords
+                    || manifest.policy_revision != policy.desired_revision
+                    || manifest.policy_digest != policy.digest
+                    || manifest.hold_epoch != hold.epoch
+                    || manifest.sha256 != checksum
+                    || manifest.size != raw.len() as u64
+                {
+                    return Err(RecoveryError::Conflict(
+                        "capture already has a different manifest",
+                    ));
+                }
+                self.verify_recovery_copy(&manifest, &raw, &checksum)
+                    .await?;
+                let mut ready = manifest;
+                ready.state = ManifestState::Preserved;
+                return Ok(PreparedCapture {
+                    policy_key,
+                    hold_key,
+                    manifest_key,
+                    policy_record_revision: record_revision(&policy_bytes)?,
+                    hold_revision: record_revision(&hold_bytes)?,
+                    manifest_revision: record_revision(&manifest_bytes)?,
+                    source: request.source,
+                    manifest: ready,
+                    retention_days,
+                });
+            }
+            if manifest.state != ManifestState::Copying {
+                return Err(RecoveryError::Conflict("capture is not staging"));
+            }
+        }
+        let attempt = self
+            .reserve_copy_attempt(
+                &request,
+                &policy,
+                &policy_bytes,
+                &hold,
+                &hold_bytes,
+                &raw,
+                &checksum,
+                &capture_id,
+            )
+            .await?;
+        if self.blobs.get_raw_blob(&attempt.blob_key).await?.is_some() {
             return Err(RecoveryError::Conflict(
-                "existing capture is missing its account index",
+                "immutable attempt key already exists",
             ));
         }
-        let mut registered_writer = false;
-        if let Some((manifest, _)) = &existing {
-            if manifest.state == ManifestState::Copying {
-                return Err(RecoveryError::InProgress);
-            }
-            if manifest.state != ManifestState::Staging
-                || manifest.scope != scope
+        self.blobs
+            .put_blob(&attempt.blob_key, &raw, &self.options)
+            .await?;
+        let stored = self
+            .blobs
+            .get_raw_blob(&attempt.blob_key)
+            .await?
+            .ok_or(RecoveryError::BlobMissing)?;
+        let format = BlobFormat::of(&stored).ok_or(RecoveryError::BlobMismatch)?;
+        let stored_key_id = format.key_id.ok_or(RecoveryError::BlobMismatch)?;
+        if self.keys.get(stored_key_id).is_none()
+            || stored.len() as u64 != attempt.stored_size
+            || self
+                .keys
+                .decode_bounded(&attempt.blob_key, stored, MAX_BLOB_BYTES)?
+                != raw
+        {
+            return Err(RecoveryError::BlobMismatch);
+        }
+        #[cfg(test)]
+        if self
+            .fail_after_attempt_upload
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RecoveryError::InProgress);
+        }
+        let (mut ready, ready_bytes) = self
+            .finish_copy_attempt(&scope, &capture_id, attempt.id, stored_key_id)
+            .await?;
+        if ready.state != ManifestState::Staging
+            || ready.selected_attempt_id.is_none()
+            || ready.deleted_at.is_some()
+        {
+            return Err(RecoveryError::Conflict("capture is not verified staging"));
+        }
+        self.verify_recovery_copy(&ready, &raw, &checksum).await?;
+        ready.state = ManifestState::Preserved;
+        Ok(PreparedCapture {
+            policy_key,
+            hold_key,
+            manifest_key,
+            policy_record_revision: record_revision(&policy_bytes)?,
+            hold_revision: record_revision(&hold_bytes)?,
+            manifest_revision: record_revision(&ready_bytes)?,
+            source: request.source,
+            manifest: ready,
+            retention_days,
+        })
+    }
+
+    async fn reserve_copy_attempt(
+        &self,
+        request: &CaptureRequest,
+        policy: &PolicyRecord,
+        policy_bytes: &[u8],
+        hold: &HoldControl,
+        hold_bytes: &[u8],
+        raw: &[u8],
+        checksum: &str,
+        capture_id: &str,
+    ) -> Result<RecoveryCopyAttempt> {
+        let scope = request.account.scope();
+        let manifest_key = scoped_key(b"manifest", scope, capture_id)?;
+        let index_key = account_capture_index_key(scope)?;
+        let ledger_key = quota_key(scope)?;
+        let tombstone_key = scoped_key(b"tombstone", scope, capture_id)?;
+        if self.read::<PurgeTombstone>(&tombstone_key).await?.is_some() {
+            return Err(RecoveryError::Conflict("capture was permanently purged"));
+        }
+        let existing = self.read::<Manifest>(&manifest_key).await?;
+        let account_index = self.account_capture_index(scope).await?;
+        let is_new = existing.is_none();
+        let mut manifest = if let Some((manifest, _)) = &existing {
+            if manifest.state != ManifestState::Copying
+                || manifest.scope != *scope
                 || manifest.capture_operation_id != request.metadata.operation_id
                 || manifest.original_blob_key != request.original_blob_key
                 || manifest.source_revision != request.source.revision
@@ -620,61 +770,29 @@ impl RecoveryEngine {
                 || manifest.policy_digest != policy.digest
                 || manifest.hold_epoch != hold.epoch
                 || manifest.sha256 != checksum
-                || manifest.recovery_blob_key != storage_key
-                || manifest.stored_size != encoded_size
+                || manifest.size != raw.len() as u64
+                || manifest.selected_attempt_id.is_some()
             {
                 return Err(RecoveryError::Conflict(
                     "capture already has a terminal or different manifest",
                 ));
             }
+            if manifest.copy_attempts.is_empty() {
+                return Err(RecoveryError::InProgress);
+            }
+            if manifest.copy_attempts.len() >= MAX_COPY_ATTEMPTS {
+                return Err(RecoveryError::InProgress);
+            }
+            manifest.clone()
         } else {
-            if self.blobs.get_raw_blob(&storage_key).await?.is_some() {
-                return Err(RecoveryError::Conflict("unowned recovery blob key exists"));
-            }
-            let index_key = account_capture_index_key(&scope)?;
-            let (mut index, index_bytes) = account_index.clone().unwrap_or_else(|| {
-                (
-                    ScopeCaptureIndex {
-                        scope: scope.clone(),
-                        captures: Vec::new(),
-                    },
-                    Vec::new(),
-                )
-            });
-            if index.captures.contains(&capture_id) {
-                return Err(RecoveryError::Conflict(
-                    "capture already exists in account index",
-                ));
-            }
-            let ledger_key = quota_key(&scope)?;
-            let ledger_old = self.read::<ScopeLedger>(&ledger_key).await?;
-            let mut ledger = ledger_old
-                .as_ref()
-                .map_or_else(ScopeLedger::default, |(v, _)| v.clone());
-            let quota = policy
-                .policy
-                .quota_bytes
-                .ok_or(RecoveryError::Invalid("enabled policy has no quota"))?;
-            if encoded_size > quota.saturating_sub(ledger.charged_bytes)
-                || ledger.captures.len() >= MAX_ITEMS_PER_SCOPE
-            {
-                return Err(RecoveryError::QuotaExceeded);
-            }
-            ledger.charged_bytes = ledger
-                .charged_bytes
-                .checked_add(encoded_size)
-                .ok_or(RecoveryError::QuotaExceeded)?;
-            ledger.captures.push(capture_id.clone());
-            index.captures.push(capture_id.clone());
-            index.captures.sort_unstable();
-            let manifest = Manifest {
-                capture_id: capture_id.clone(),
+            Manifest {
+                capture_id: capture_id.to_string(),
                 capture_operation_id: request.metadata.operation_id.clone(),
                 scope: scope.clone(),
                 state: ManifestState::Copying,
                 original_blob_key: request.original_blob_key.clone(),
-                recovery_blob_key: storage_key.clone(),
-                stored_recovery_key_id: Some(self.recovery_key_id),
+                recovery_blob_key: Vec::new(),
+                stored_recovery_key_id: None,
                 source_account_id: request.source.account_id,
                 source_collection: request.source.collection as u8,
                 source_document_id: request.source.document_id,
@@ -687,148 +805,252 @@ impl RecoveryEngine {
                 keywords: request.metadata.keywords.clone(),
                 received_at: request.metadata.received_at,
                 size: raw.len() as u64,
-                stored_size: encoded_size,
-                sha256: checksum.clone(),
+                stored_size: 0,
+                sha256: checksum.to_string(),
                 policy_revision: policy.desired_revision,
                 policy_digest: policy.digest.clone(),
                 hold_epoch: hold.epoch,
-            };
-            let mut batch = BatchBuilder::new();
-            batch
-                .with_account_id(0)
-                .assert_value(value_class(&policy_key), record_revision(&policy_bytes)?);
-            batch
-                .with_account_id(0)
-                .assert_value(value_class(&hold_key), record_revision(&hold_bytes)?);
-            batch.with_account_id(0);
-            if index_bytes.is_empty() {
-                batch.assert_value(value_class(&index_key), ());
-            } else {
-                batch.assert_value(value_class(&index_key), record_revision(&index_bytes)?);
+                copy_attempts: Vec::new(),
+                selected_attempt_id: None,
             }
-            let old_ledger_bytes = ledger_old.as_ref().map(|(_, bytes)| bytes.as_slice());
-            let ledger_revision = next_record_revision(old_ledger_bytes)?;
-            if let Some(bytes) = old_ledger_bytes {
-                batch
-                    .with_account_id(0)
-                    .assert_value(value_class(&ledger_key), record_revision(bytes)?);
-            } else {
-                batch
-                    .with_account_id(0)
-                    .assert_value(value_class(&ledger_key), ());
+        };
+        let (mut index, index_bytes) = match account_index {
+            Some((index, bytes)) => (index, Some(bytes)),
+            None if is_new => (
+                ScopeCaptureIndex {
+                    scope: scope.clone(),
+                    captures: Vec::new(),
+                },
+                None,
+            ),
+            None => {
+                return Err(RecoveryError::Conflict(
+                    "existing capture is missing its account index",
+                ));
             }
-            batch
-                .with_account_id(0)
-                .assert_value(value_class(&manifest_key), ());
-            batch
-                .with_account_id(0)
-                .assert_value(value_class(&tombstone_key), ());
-            batch.set(
-                value_class(&ledger_key),
-                encode_record(&ledger, ledger_revision)?,
-            );
-            batch.set(
-                value_class(&index_key),
-                encode_record(
-                    &index,
-                    next_record_revision(
-                        (!index_bytes.is_empty()).then_some(index_bytes.as_slice()),
-                    )?,
-                )?,
-            );
-            batch.set(value_class(&manifest_key), encode_record(&manifest, 1)?);
-            if batch.has_commit_points() || batch.is_large_batch() {
-                return Err(RecoveryError::BatchTooLarge);
-            }
-            if let Err(error) = self.metadata.write_batch(&mut batch).await {
-                if self
-                    .read::<Manifest>(&manifest_key)
-                    .await?
-                    .is_some_and(|(current, _)| current.state == ManifestState::Copying)
-                {
-                    return Err(RecoveryError::InProgress);
-                }
-                return Err(error.into());
-            }
-            registered_writer = true;
-        }
-        let (staging, staging_bytes) = self
-            .read::<Manifest>(&manifest_key)
-            .await?
-            .ok_or(RecoveryError::Conflict("staging manifest disappeared"))?;
-        if staging.policy_revision != policy.desired_revision
-            || staging.policy_digest != policy.digest
-            || staging.hold_epoch != hold.epoch
+        };
+        if index.scope != *scope
+            || (is_new && index.captures.contains(&capture_id.to_string()))
+            || (!is_new && !index.captures.contains(&capture_id.to_string()))
         {
             return Err(RecoveryError::Conflict(
-                "policy or hold changed after reservation",
+                "capture manifest and account index disagree",
             ));
         }
-        if registered_writer {
-            self.blobs
-                .put_blob(&storage_key, &raw, &self.options)
+        let ledger_old = self.read::<ScopeLedger>(&ledger_key).await?;
+        let mut ledger = ledger_old
+            .as_ref()
+            .map_or_else(ScopeLedger::default, |(ledger, _)| ledger.clone());
+        if is_new {
+            if ledger.captures.len() >= MAX_ITEMS_PER_SCOPE
+                || ledger.captures.contains(&capture_id.to_string())
+            {
+                return Err(RecoveryError::QuotaExceeded);
+            }
+            ledger.captures.push(capture_id.to_string());
+        } else if ledger
+            .captures
+            .iter()
+            .filter(|id| id.as_str() == capture_id)
+            .count()
+            != 1
+        {
+            return Err(RecoveryError::Conflict(
+                "capture is missing its quota reservation",
+            ));
+        }
+
+        let attempt_id = u8::try_from(manifest.copy_attempts.len() + 1)
+            .map_err(|_| RecoveryError::InProgress)?;
+        let blob_key =
+            recovery_attempt_blob_key(scope, &request.metadata.operation_id, attempt_id)?;
+        let stored_size = self.options.encode(&blob_key, raw)?.len() as u64;
+        let quota = policy
+            .policy
+            .quota_bytes
+            .ok_or(RecoveryError::Invalid("enabled policy has no quota"))?;
+        if stored_size > quota.saturating_sub(ledger.charged_bytes) {
+            return Err(RecoveryError::QuotaExceeded);
+        }
+        ledger.charged_bytes = ledger
+            .charged_bytes
+            .checked_add(stored_size)
+            .ok_or(RecoveryError::QuotaExceeded)?;
+        if is_new {
+            index.captures.push(capture_id.to_string());
+            index.captures.sort_unstable();
+        }
+        let attempt = RecoveryCopyAttempt {
+            id: attempt_id,
+            blob_key,
+            stored_size,
+            state: CopyAttemptState::Writing,
+        };
+        manifest.copy_attempts.push(attempt.clone());
+
+        let mut batch = BatchBuilder::new();
+        append_record_assert(
+            &mut batch,
+            &scoped_key(b"policy", &server_scope(scope), "")?,
+            Some(policy_bytes),
+        )?;
+        append_record_assert(
+            &mut batch,
+            &scoped_key(b"hold", scope, "")?,
+            Some(hold_bytes),
+        )?;
+        append_record_assert(&mut batch, &index_key, index_bytes.as_deref())?;
+        let ledger_bytes = ledger_old.as_ref().map(|(_, bytes)| bytes.as_slice());
+        append_record_assert(&mut batch, &ledger_key, ledger_bytes)?;
+        let manifest_bytes = existing.as_ref().map(|(_, bytes)| bytes.as_slice());
+        append_record_assert(&mut batch, &manifest_key, manifest_bytes)?;
+        append_record_assert(&mut batch, &tombstone_key, None)?;
+        if is_new {
+            batch.set(
+                value_class(&index_key),
+                encode_record(&index, next_record_revision(index_bytes.as_deref())?)?,
+            );
+        }
+        batch.set(
+            value_class(&ledger_key),
+            encode_record(&ledger, next_record_revision(ledger_bytes)?)?,
+        );
+        batch.set(
+            value_class(&manifest_key),
+            encode_record(&manifest, next_record_revision(manifest_bytes)?)?,
+        );
+        if batch.has_commit_points() || batch.is_large_batch() {
+            return Err(RecoveryError::BatchTooLarge);
+        }
+        self.metadata.write_batch(&mut batch).await?;
+        Ok(attempt)
+    }
+
+    async fn finish_copy_attempt(
+        &self,
+        scope: &RecoveryScope,
+        capture_id: &str,
+        attempt_id: u8,
+        stored_key_id: u32,
+    ) -> Result<(Manifest, Vec<u8>)> {
+        let manifest_key = scoped_key(b"manifest", scope, capture_id)?;
+        let (mut manifest, manifest_bytes) = self
+            .read::<Manifest>(&manifest_key)
+            .await?
+            .ok_or(RecoveryError::NotFound)?;
+        let position = manifest
+            .copy_attempts
+            .iter()
+            .position(|attempt| attempt.id == attempt_id)
+            .ok_or(RecoveryError::Conflict("copy attempt is missing"))?;
+        if manifest.copy_attempts[position].state != CopyAttemptState::Writing {
+            return Ok((manifest, manifest_bytes));
+        }
+        if manifest.state == ManifestState::Purging {
+            return Err(RecoveryError::InProgress);
+        }
+        let select_winner = manifest.selected_attempt_id.is_none();
+        let mut batch = BatchBuilder::new();
+        append_record_assert(&mut batch, &manifest_key, Some(&manifest_bytes))?;
+        if select_winner {
+            if manifest.state != ManifestState::Copying {
+                return Err(RecoveryError::Conflict("copy winner state changed"));
+            }
+            let server_scope = server_scope(scope);
+            let policy_key = scoped_key(b"policy", &server_scope, "")?;
+            let hold_key = scoped_key(b"hold", scope, "")?;
+            let (policy, policy_bytes) = self
+                .read::<PolicyRecord>(&policy_key)
+                .await?
+                .ok_or(RecoveryError::Conflict("copy policy disappeared"))?;
+            let (hold, hold_bytes) = self
+                .read::<HoldControl>(&hold_key)
+                .await?
+                .ok_or(RecoveryError::Conflict("copy hold disappeared"))?;
+            if policy.scope != server_scope
+                || policy.desired_revision != manifest.policy_revision
+                || policy.digest != manifest.policy_digest
+                || policy_digest(&policy.policy)? != policy.digest
+                || hold.scope != *scope
+                || hold.active
+                || hold.epoch != manifest.hold_epoch
+            {
+                return Err(RecoveryError::Conflict(
+                    "policy or hold changed before winner selection",
+                ));
+            }
+            append_record_assert(&mut batch, &policy_key, Some(&policy_bytes))?;
+            append_record_assert(&mut batch, &hold_key, Some(&hold_bytes))?;
+            manifest.selected_attempt_id = Some(attempt_id);
+            manifest.copy_attempts[position].state = CopyAttemptState::Selected;
+            manifest.recovery_blob_key = manifest.copy_attempts[position].blob_key.clone();
+            manifest.stored_size = manifest.copy_attempts[position].stored_size;
+            manifest.stored_recovery_key_id = Some(stored_key_id);
+            manifest.state = ManifestState::Staging;
+        } else {
+            if manifest.selected_attempt_id == Some(attempt_id) {
+                return Err(RecoveryError::Conflict("selected attempt is still writing"));
+            }
+            manifest.copy_attempts[position].state = CopyAttemptState::Verified;
+        }
+        batch.set(
+            value_class(&manifest_key),
+            encode_record(&manifest, next_record_revision(Some(&manifest_bytes))?)?,
+        );
+        if batch.has_commit_points() || batch.is_large_batch() {
+            return Err(RecoveryError::BatchTooLarge);
+        }
+        self.metadata.write_batch(&mut batch).await?;
+        let current = self
+            .read::<Manifest>(&manifest_key)
+            .await?
+            .ok_or(RecoveryError::Conflict("copy manifest disappeared"))?;
+        if current.0.selected_attempt_id != Some(attempt_id) {
+            self.cleanup_unselected_copy_attempts(scope, capture_id)
                 .await?;
+            return self
+                .read::<Manifest>(&manifest_key)
+                .await?
+                .ok_or(RecoveryError::Conflict("copy manifest disappeared"));
+        }
+        Ok(current)
+    }
+
+    async fn verify_recovery_copy(
+        &self,
+        manifest: &Manifest,
+        raw: &[u8],
+        checksum: &str,
+    ) -> Result<u32> {
+        if manifest.recovery_blob_key.is_empty()
+            || manifest.stored_size > MAX_BLOB_BYTES as u64 + 65_536
+            || manifest.size != raw.len() as u64
+            || manifest.sha256 != checksum
+        {
+            return Err(RecoveryError::BlobMismatch);
         }
         let stored = self
             .blobs
-            .get_raw_blob(&storage_key)
+            .get_raw_blob(&manifest.recovery_blob_key)
             .await?
             .ok_or(RecoveryError::BlobMissing)?;
         let format = BlobFormat::of(&stored).ok_or(RecoveryError::BlobMismatch)?;
-        let stored_key_id = format.key_id.ok_or(RecoveryError::BlobMismatch)?;
-        if staging
+        let key_id = format.key_id.ok_or(RecoveryError::BlobMismatch)?;
+        if manifest
             .stored_recovery_key_id
-            .is_some_and(|key_id| key_id != stored_key_id)
-            || self.keys.get(stored_key_id).is_none()
+            .is_some_and(|stored_key_id| stored_key_id != key_id)
+            || self.keys.get(key_id).is_none()
+            || stored.len() as u64 != manifest.stored_size
         {
             return Err(RecoveryError::BlobMismatch);
         }
-        let stored_size = stored.len() as u64;
-        let decoded = self
-            .keys
-            .decode_bounded(&storage_key, stored, MAX_BLOB_BYTES)?;
-        if stored_size != encoded_size || decoded != raw || digest_hex(&decoded) != checksum {
+        let decoded =
+            self.keys
+                .decode_bounded(&manifest.recovery_blob_key, stored, MAX_BLOB_BYTES)?;
+        if decoded != raw || digest_hex(&decoded) != checksum {
             return Err(RecoveryError::BlobMismatch);
         }
-        let (mut ready, ready_bytes) = if registered_writer {
-            let mut staged = staging.clone();
-            staged.state = ManifestState::Staging;
-            let mut batch = BatchBuilder::new();
-            batch
-                .with_account_id(0)
-                .assert_value(value_class(&policy_key), record_revision(&policy_bytes)?)
-                .assert_value(value_class(&hold_key), record_revision(&hold_bytes)?)
-                .assert_value(value_class(&manifest_key), record_revision(&staging_bytes)?);
-            batch.with_account_id(0).set(
-                value_class(&manifest_key),
-                encode_record(&staged, next_record_revision(Some(&staging_bytes))?)?,
-            );
-            if batch.has_commit_points() || batch.is_large_batch() {
-                return Err(RecoveryError::BatchTooLarge);
-            }
-            self.metadata.write_batch(&mut batch).await?;
-            self.read::<Manifest>(&manifest_key)
-                .await?
-                .ok_or(RecoveryError::Conflict("staging manifest disappeared"))?
-        } else {
-            (staging, staging_bytes)
-        };
-        if ready.state != ManifestState::Staging {
-            return Err(RecoveryError::Conflict("capture is not verified staging"));
-        }
-        ready.stored_recovery_key_id = Some(stored_key_id);
-        ready.state = ManifestState::Preserved;
-        Ok(PreparedCapture {
-            policy_key,
-            hold_key,
-            manifest_key,
-            policy_record_revision: record_revision(&policy_bytes)?,
-            hold_revision: record_revision(&hold_bytes)?,
-            manifest_revision: record_revision(&ready_bytes)?,
-            source: request.source,
-            manifest: ready,
-            retention_days,
-        })
+        Ok(key_id)
     }
 
     pub async fn get(&self, scope: &RecoveryScope, id: &str) -> Result<Option<Manifest>> {
@@ -1092,6 +1314,21 @@ fn value_class(key: &[u8]) -> ValueClass {
         key: key.to_vec(),
     })
 }
+fn append_record_assert(
+    batch: &mut BatchBuilder,
+    key: &[u8],
+    previous: Option<&[u8]>,
+) -> Result<()> {
+    let class = value_class(key);
+    if let Some(bytes) = previous {
+        batch
+            .with_account_id(0)
+            .assert_value(class, record_revision(bytes)?);
+    } else {
+        batch.with_account_id(0).assert_value(class, ());
+    }
+    Ok(())
+}
 fn any_key(key: &[u8]) -> AnyKey<Vec<u8>> {
     AnyKey {
         subspace: Subspace::System,
@@ -1151,6 +1388,16 @@ fn scoped_key<T: Serialize>(kind: &[u8], scope: &T, suffix: &str) -> Result<Vec<
 fn recovery_blob_key(scope: &RecoveryScope, operation: &str) -> Result<Vec<u8>> {
     let id = hash_hex(&[scope_hash(scope)?.as_bytes(), operation.as_bytes()].concat());
     Ok([PREFIX, b"blob:", id.as_bytes()].concat())
+}
+fn recovery_attempt_blob_key(
+    scope: &RecoveryScope,
+    operation: &str,
+    attempt_id: u8,
+) -> Result<Vec<u8>> {
+    let mut key = recovery_blob_key(scope, operation)?;
+    key.extend_from_slice(b":attempt:");
+    key.push(attempt_id);
+    Ok(key)
 }
 fn quota_key(scope: &RecoveryScope) -> Result<Vec<u8>> {
     scoped_key(b"quota", &scope.tenant_id, "")
