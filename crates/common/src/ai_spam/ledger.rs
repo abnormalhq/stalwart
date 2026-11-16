@@ -3,11 +3,27 @@
  */
 
 use crate::ai_spam::config::Budgets;
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, ops::Deref, pin::Pin, sync::Arc};
 use store::{
-    Store, Subspace, ValueKey,
+    Deserialize, Store, Subspace, ValueKey,
     write::{AnyClass, BatchBuilder, ValueClass, assert::AssertValue},
 };
+
+struct LedgerBytes(Vec<u8>);
+
+impl Deref for LedgerBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Deserialize for LedgerBytes {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
+        Ok(Self(bytes.to_vec()))
+    }
+}
 
 pub type LedgerFuture<'a> = Pin<Box<dyn Future<Output = ReserveOutcome> + Send + 'a>>;
 
@@ -66,7 +82,7 @@ impl StoreLedger {
             document_id: 0,
             class: class.clone(),
         };
-        let previous = match self.store.get_value::<Vec<u8>>(key).await {
+        let previous = match self.store.get_value::<LedgerBytes>(key).await {
             Ok(value) => value,
             Err(_) => return ReserveOutcome::Unavailable,
         };
@@ -106,7 +122,7 @@ impl ReservationLedger for StoreLedger {
             }
             let period_control = match self
                 .store
-                .get_value::<Vec<u8>>(ValueKey {
+                .get_value::<LedgerBytes>(ValueKey {
                     account_id: 0,
                     collection: 0,
                     document_id: 0,
@@ -130,7 +146,7 @@ impl ReservationLedger for StoreLedger {
                 document_id: 0,
                 class: class.clone(),
             };
-            let previous = match self.store.get_value::<Vec<u8>>(value_key).await {
+            let previous = match self.store.get_value::<LedgerBytes>(value_key).await {
                 Ok(value) => value,
                 Err(_) => return ReserveOutcome::Unavailable,
             };

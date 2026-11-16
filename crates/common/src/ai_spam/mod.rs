@@ -7,7 +7,7 @@ pub mod input;
 pub mod ledger;
 pub mod provider;
 
-use config::{MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS, RuntimeConfig, ValidatedConfig, reserved_cost};
+use config::{MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS, RuntimeConfig, reserved_cost};
 use input::extract;
 use ledger::{LedgerKey, Reservation, ReservationLedger, ReserveOutcome};
 use provider::{HttpProvider, ModelResult, Provider, Verdict};

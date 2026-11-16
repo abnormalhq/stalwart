@@ -4,6 +4,7 @@
 
 use reqwest::Url;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -198,8 +199,8 @@ impl RuntimeConfig {
         ) {
             (Some(reference_id), Some(epoch), Some(resolved))
                 if reference_id == &resolved.reference_id
-                    && *epoch == resolved.epoch
-                    && *epoch <= MAX_FOUNDATION_INTEGER => {}
+                    && epoch == resolved.epoch
+                    && epoch <= MAX_FOUNDATION_INTEGER => {}
             (None, None, None) => {}
             _ => return Ok(Self::unready()),
         }
@@ -418,7 +419,12 @@ pub fn consent_fingerprint(
         hash.update((value.len() as u64).to_be_bytes());
         hash.update(value);
     }
-    format!("{:x}", hash.finalize())
+    let digest = hash.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 pub(crate) fn reserved_cost(pricing: Pricing) -> Option<u64> {

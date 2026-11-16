@@ -59,7 +59,7 @@ pub fn extract(message: &Message<'_>) -> Result<ProviderInput, InputError> {
     };
     let root = message.root().parts().next();
     if let Some(root) = root {
-        visit(root, 1, &mut state)?;
+        visit(&root, 1, &mut state)?;
     }
     check_deadline(&state)?;
 
@@ -139,12 +139,12 @@ fn visit(part: &MessagePart<'_>, depth: usize, state: &mut WalkState) -> Result<
             if !state.body.is_empty() {
                 append_literal(&mut state.body, '\n', MAX_MESSAGE_BYTES);
             }
-            append_normalized(&mut state.body, text, MAX_MESSAGE_BYTES, state.started)?;
+            append_normalized(&mut state.body, text.as_ref(), MAX_MESSAGE_BYTES, state.started)?;
         }
     }
 
     for child in part.children() {
-        visit(child, depth + 1, state)?;
+        visit(&child, depth + 1, state)?;
     }
     check_deadline(state)
 }
