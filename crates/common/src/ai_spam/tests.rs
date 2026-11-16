@@ -956,6 +956,165 @@ async fn disabled_or_unready_runtime_does_not_touch_provider_or_ledger() {
 }
 
 #[tokio::test]
+async fn runtime_without_ledger_does_not_call_provider() {
+    let message = parse(b"Subject: offer\r\n\r\nhello");
+    let provider = fake_provider(ModelResult {
+        verdict: Verdict::Spam,
+        confidence: 100,
+    });
+    let runtime = AiSpamRuntime::with_provider(local_config(1), None, Some(provider.clone()));
+
+    assert!(matches!(
+        runtime.classify(&message).await,
+        ClassifyOutcome::Neutral(NeutralReason::NotReady)
+    ));
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+#[tokio::test]
+async fn none_store_is_unavailable_for_rollover_reservation_and_runtime() {
+    let store = Arc::new(Store::None);
+    let ledger = Arc::new(StoreLedger::new(store));
+    let key = LedgerKey {
+        server_id: "server-1".into(),
+        billing_period: "2026-01".into(),
+    };
+
+    assert_eq!(
+        ledger.rollover_period("server-1", None, "2026-01").await,
+        ReserveOutcome::Unavailable
+    );
+    assert_eq!(
+        ledger
+            .reserve(
+                key,
+                local_operator(1, 1).budgets,
+                Reservation {
+                    requests: 1,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cost_micros: 0,
+                },
+            )
+            .await,
+        ReserveOutcome::Unavailable
+    );
+
+    let provider = fake_provider(ModelResult {
+        verdict: Verdict::Spam,
+        confidence: 100,
+    });
+    let runtime =
+        AiSpamRuntime::with_provider(local_config(1), Some(ledger), Some(provider.clone()));
+    let message = parse(b"Subject: offer\r\n\r\nhello");
+    assert_eq!(
+        runtime.classify(&message).await,
+        ClassifyOutcome::Neutral(NeutralReason::LedgerUnavailable)
+    );
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+}
+
+#[cfg(feature = "ai-spam-test-sqlite")]
+#[tokio::test]
+async fn ephemeral_store_rejects_initial_and_seeded_ledger_operations_without_mutation() {
+    let store = Arc::new(store::backend::ephemeral::EphemeralStore::open());
+    assert!(store.is_ephemeral());
+    let key = LedgerKey {
+        server_id: "server-1".into(),
+        billing_period: "2026-01".into(),
+    };
+    let (period_class, ledger_class) = sqlite_key_classes(&key);
+    let ledger = Arc::new(StoreLedger::new(store.clone()));
+
+    assert_eq!(sqlite_value(&store, period_class.clone()).await, None);
+    assert_eq!(sqlite_value(&store, ledger_class.clone()).await, None);
+    assert_eq!(
+        ledger.rollover_period("server-1", None, "2026-01").await,
+        ReserveOutcome::Unavailable
+    );
+    assert_eq!(sqlite_value(&store, period_class.clone()).await, None);
+    assert_eq!(sqlite_value(&store, ledger_class.clone()).await, None);
+
+    let seeded_period = encode_period(PeriodControl::new("2026-01", 0).expect("valid period"));
+    let seeded_snapshot = Snapshot {
+        requests: 3,
+        input_tokens: 12,
+        output_tokens: 4,
+        cost_micros: 18,
+        version: 1,
+    };
+    let seeded_ledger = encode_snapshot(seeded_snapshot);
+    let mut batch = BatchBuilder::new();
+    batch.set(period_class.clone(), seeded_period.clone());
+    batch.set(ledger_class.clone(), seeded_ledger.clone());
+    store
+        .write_batch(&mut batch)
+        .await
+        .expect("seed ephemeral ledger state");
+
+    let before_period = sqlite_value(&store, period_class.clone())
+        .await
+        .expect("seeded period control");
+    let before_ledger = sqlite_value(&store, ledger_class.clone())
+        .await
+        .expect("seeded ledger snapshot");
+    assert_eq!(before_period, seeded_period);
+    assert_eq!(before_ledger, seeded_ledger);
+
+    assert_eq!(
+        ledger
+            .rollover_period("server-1", Some("2026-01"), "2026-02")
+            .await,
+        ReserveOutcome::Unavailable
+    );
+    assert_eq!(
+        ledger
+            .reserve(
+                key,
+                local_operator(10, 1).budgets,
+                Reservation {
+                    requests: 1,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cost_micros: 1,
+                },
+            )
+            .await,
+        ReserveOutcome::Unavailable
+    );
+    assert_eq!(
+        sqlite_value(&store, period_class.clone()).await,
+        Some(before_period.clone())
+    );
+    assert_eq!(
+        sqlite_value(&store, ledger_class.clone()).await,
+        Some(before_ledger.clone())
+    );
+
+    let provider = fake_provider(ModelResult {
+        verdict: Verdict::Spam,
+        confidence: 100,
+    });
+    let runtime =
+        AiSpamRuntime::with_provider(local_config(10), Some(ledger), Some(provider.clone()));
+    let message = parse(b"Subject: offer\r\n\r\nhello");
+    assert_eq!(
+        runtime.classify(&message).await,
+        ClassifyOutcome::Neutral(NeutralReason::LedgerUnavailable)
+    );
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        sqlite_value(&store, period_class).await,
+        Some(before_period)
+    );
+    assert_eq!(
+        sqlite_value(&store, ledger_class).await,
+        Some(before_ledger)
+    );
+}
+
+#[tokio::test]
 async fn runtime_recreation_retains_reservations_and_exhaustion_skips_provider() {
     let raw = b"Subject: offer\r\nContent-Type: text/plain\r\n\r\nhello";
     let message = parse(raw);
