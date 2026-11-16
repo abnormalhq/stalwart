@@ -1,6 +1,6 @@
 # Community AI spam module contract
 
-This directory contains an opt-in foundation only. It is not exported from `common`, installed in the server runtime, or called by SMTP. It must remain ineffective until the parent adds the Community wiring and authenticated configuration/acknowledgment path.
+This directory contains an opt-in foundation only. It is exported from `common` for focused validation, but it is not installed in the server runtime or called by SMTP. At this branch revision, `cargo test --locked -p common --no-default-features ai_spam::tests` passes 27 tests; that does not validate runtime installation or an end-to-end provider/ACK path. The module remains inactive until the parent adds Community scoring/runtime wiring and authenticated configuration/acknowledgment.
 
 ## Runtime installation
 
@@ -18,7 +18,7 @@ Classification consumes the already parsed `mail_parser::Message`, reserves the 
 
 ## Required Community scoring hook
 
-Export the module from `crates/common/src/lib.rs` only as part of the parent integration:
+The module is exported from `crates/common/src/lib.rs` for focused validation only; this export does not install it in the server runtime or activate SMTP:
 
 ```rust
 pub mod ai_spam;
@@ -39,7 +39,7 @@ if let ClassifyOutcome::Evidence(evidence) = runtime.classify(message).await {
 finalize(ctx, acc, scores, thresholds, classifier)
 ```
 
-The actual Community call site is the final-score path in `spam_filter_classify`, after the `AfterAi` user-defined rules and immediately before `finalize`. The method only adds the private, bounded 0–5 point contribution to `tag_score`; ham/uncertain contribute zero. It must not replace native entries, lower native scores, or clear an existing `Reject`/`Discard` decision. Parent-owned tests should cover negative and positive native scores, the cap, recipient results, and terminal native decisions.
+The actual Community call site is the final-score path in `spam_filter_classify`, after the `AfterAi` user-defined rules and immediately before `finalize`. The method only adds the private, bounded 0–5 point contribution to `tag_score`; ham/uncertain contribute zero. It must not replace native entries, lower native scores, or clear an existing `Reject`/`Discard` decision. Focused module tests cover evidence addition and bounds, not the server's `ScoreAccumulator` integration; parent-owned integration tests must cover recipient results and terminal native decisions.
 
 ## Bounds and tokenizer contract
 
@@ -53,4 +53,4 @@ The response stream is capped at 2048 bytes, requires one assistant choice with 
 
 The ledger keys totals by server and operator billing period, independent of configuration revision. A reservation writes ledger and active-period assertions in one Store batch; a CAS conflict is neutral and is not retried. Period rollover requires the expected current period and a strictly later next period. The authored test checks the production write plan, encoding, and assertions, but there is no Store-backed or restart fixture in this module yet.
 
-Parent-owned work still required: export/install the module; add the Community scoring method/call and tests; connect the authoritative Mail config and authenticated service ACK transport; synchronize Console period rollover with `StoreLedger::rollover_period(server_id, expected_period, next_period)`; and connect credential resolution/rotation. No current module path should be described as active or ready without those pieces.
+Parent-owned work still required: install and wire the exported module into the Community scoring path and test the actual `ScoreAccumulator` integration; connect the authoritative Mail config and authenticated service ACK transport; synchronize Console period rollover with `StoreLedger::rollover_period(server_id, expected_period, next_period)`; and connect server-side credential resolution/rotation. No current module path should be described as active or ready without those pieces.
