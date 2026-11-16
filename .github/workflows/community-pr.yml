@@ -2,7 +2,7 @@ name: Community PR CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, devin/1794818404-capability-foundation]
   push:
     branches: [main]
 
@@ -47,6 +47,12 @@ jobs:
         run: |
           cargo test --locked -p common --no-default-features community_
           cargo test --locked -p http@1.1.0 --no-default-features community_redirect_tests
+
+      - name: Run message recovery tests
+        run: cargo test --locked -p common --no-default-features --features recovery-test-sqlite message_recovery::tests
+
+      - name: Run native Inbox restore slot test
+        run: cargo test --locked -p email --no-default-features message_recovery_slot_tests::pending_restore_ids_accept_native_inbox_id
 
       - name: Run image-size regression tests
         run: cargo test --locked -p spam-filter --no-default-features analysis::image_size::tests
