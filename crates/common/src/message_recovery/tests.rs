@@ -3776,6 +3776,163 @@ async fn retained_recovery_key_allows_staging_retry_and_preserved_read_after_rot
     ));
 }
 
+#[cfg(feature = "recovery-test-sqlite")]
+#[tokio::test]
+async fn file_sqlite_rotation_keeps_retained_key_retryable_after_reopen() {
+    let fixture = persistent_lifecycle_fixture().await;
+    let request = persistent_capture_request(&fixture, "sqlite-key-rotation", 10);
+    let mut new_request = persistent_capture_request(&fixture, "sqlite-key-rotation-new", 12);
+    let new_source_blob_key = b"persistent-post-rotation-source-key".to_vec();
+    new_request.original_blob_key = new_source_blob_key.clone();
+    new_request.source.document_id = 43;
+    let first = fixture
+        .engine
+        .prepare_capture(request.clone(), &fixture.source_blobs, &fixture.source_keys)
+        .await
+        .unwrap();
+    let capture_id = first.manifest().capture_id.clone();
+    let recovery_blob_key = first.manifest().recovery_blob_key.clone();
+    assert_eq!(first.manifest().stored_recovery_key_id, Some(2));
+    assert_eq!(
+        fixture
+            .engine
+            .get(fixture.account.scope(), &capture_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ManifestState::Staging
+    );
+    let old_blob = fixture
+        .recovery_blobs
+        .get_raw_blob(&recovery_blob_key)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let root = fixture.root.clone();
+    let metadata_path = fixture.metadata_path.clone();
+    let source_path = fixture.source_path.clone();
+    let recovery_path = fixture.recovery_path.clone();
+    let account = fixture.account.clone();
+    let source_blob_key = fixture.source_blob_key.clone();
+    let source_keys = fixture.source_keys.clone();
+    let recovery_key = fixture.recovery_key.clone();
+    let message = fixture.message.clone();
+    drop(fixture.engine);
+    drop(fixture.metadata);
+    drop(fixture.source_blobs);
+    drop(fixture.recovery_blobs);
+
+    let metadata = open_test_sqlite(&metadata_path).await;
+    let source_blobs = BlobStore::Store(open_test_sqlite(&source_path).await);
+    let recovery_blobs = BlobStore::Store(open_test_sqlite(&recovery_path).await);
+    source_blobs
+        .put_blob(
+            &new_source_blob_key,
+            &message,
+            &BlobOpts::new(
+                CompressionAlgo::None,
+                BlobEncryption::Key(source_keys.get(1).unwrap().clone()),
+            ),
+        )
+        .await
+        .unwrap();
+    let mut source_batch = BatchBuilder::new();
+    source_batch
+        .with_account_id(account.store_account_id())
+        .with_collection(Collection::Email)
+        .with_document(43)
+        .set(
+            ValueClass::Property(Field::ARCHIVE.into()),
+            1u64.to_be_bytes().to_vec(),
+        );
+    metadata.write_batch(&mut source_batch).await.unwrap();
+    let new_key = Arc::new(BlobKey::new(
+        3,
+        SymmetricCipher::Aes256Gcm,
+        &[3; BLOB_KEY_LEN],
+    ));
+    let rotated = RecoveryEngine::new(
+        metadata.clone(),
+        recovery_blobs.clone(),
+        BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(new_key.clone())),
+        BlobKeyring::new(vec![recovery_key.clone(), new_key.clone()]),
+    )
+    .unwrap();
+    let retry = rotated
+        .prepare_capture(request.clone(), &source_blobs, &source_keys)
+        .await
+        .unwrap();
+    assert_eq!(retry.manifest().stored_recovery_key_id, Some(2));
+    assert_eq!(
+        recovery_blobs
+            .get_raw_blob(&recovery_blob_key)
+            .await
+            .unwrap()
+            .unwrap(),
+        old_blob
+    );
+
+    let unavailable = RecoveryEngine::new(
+        metadata.clone(),
+        recovery_blobs.clone(),
+        BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(new_key.clone())),
+        BlobKeyring::new(vec![new_key.clone()]),
+    )
+    .unwrap();
+    assert!(matches!(
+        unavailable
+            .prepare_capture(request, &source_blobs, &source_keys)
+            .await,
+        Err(RecoveryError::BlobMismatch)
+    ));
+
+    let mut delete_batch = BatchBuilder::new();
+    retry.append_to_delete_batch(&mut delete_batch, 11).unwrap();
+    delete_batch
+        .with_account_id(account.store_account_id())
+        .with_collection(Collection::Email)
+        .with_document(42)
+        .clear(ValueClass::Property(Field::ARCHIVE.into()));
+    metadata.write_batch(&mut delete_batch).await.unwrap();
+
+    let payload = rotated
+        .get_payload(account.scope(), &capture_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        source_keys
+            .decode_bounded(&source_blob_key, payload, MAX_BLOB_BYTES)
+            .unwrap(),
+        message
+    );
+    assert!(matches!(
+        unavailable.get_payload(account.scope(), &capture_id).await,
+        Err(RecoveryError::BlobMismatch)
+    ));
+
+    let new_capture = rotated
+        .prepare_capture(new_request, &source_blobs, &source_keys)
+        .await
+        .unwrap();
+    assert_eq!(new_capture.manifest().stored_recovery_key_id, Some(3));
+    let new_blob = recovery_blobs
+        .get_raw_blob(&new_capture.manifest().recovery_blob_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(BlobFormat::of(&new_blob).unwrap().key_id, Some(3));
+
+    drop(rotated);
+    drop(unavailable);
+    drop(metadata);
+    drop(source_blobs);
+    drop(recovery_blobs);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn old_staging_cleanup_cas_invalidates_prepared_source_deletion() {
     let fixture = lifecycle_fixture().await;

@@ -7,8 +7,8 @@
 use crate::{
     DavError, DavMethod,
     common::{
-        create::DavCreateFence,
         ExtractETag,
+        create::DavCreateFence,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
     },
@@ -20,9 +20,7 @@ use common::{
     storage::{dav::MAX_FILE_NODE_DEPTH, index::ObjectIndexBuilder},
 };
 use dav_proto::{RequestHeaders, Return, schema::property::Rfc1123DateTime};
-use groupware::{
-    file::{FileNode, FileNodeContent, FileProperties},
-};
+use groupware::file::{FileNode, FileNodeContent, FileProperties};
 use http_proto::HttpResponse;
 use hyper::StatusCode;
 use registry::schema::enums::StorageQuota;
@@ -62,14 +60,10 @@ impl FileUpdateRequestHandler for Server {
             .await?
             .into_owned_uri()?;
         let account_id = resource.account_id;
-        let (resources, create_fence) = DavCreateFence::prepare(
-            self,
-            access_token,
-            account_id,
-            SyncCollection::FileNode,
-        )
-        .await
-        .caused_by(trc::location!())?;
+        let (resources, create_fence) =
+            DavCreateFence::prepare(self, access_token, account_id, SyncCollection::FileNode)
+                .await
+                .caused_by(trc::location!())?;
         let resource_name = resource
             .resource
             .ok_or(DavError::Code(StatusCode::CONFLICT))?;
@@ -327,10 +321,7 @@ impl FileUpdateRequestHandler for Server {
                         .with_changed_by(access_token.changed_by()),
                 )
                 .caused_by(trc::location!())?;
-            let etag = create_fence
-                .commit(self, batch)
-                .await?
-                .etag();
+            let etag = create_fence.commit(self, batch).await?.etag();
 
             Ok(HttpResponse::new(StatusCode::CREATED).with_etag_opt(etag))
         }

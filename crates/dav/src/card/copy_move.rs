@@ -8,7 +8,8 @@ use super::assert_is_unique_uid;
 use crate::{
     DavError, DavErrorCondition, DavMethod,
     common::{
-        ContainerOperation, assert_parent_limit, create::DavCreateFence,
+        ContainerOperation, assert_parent_limit,
+        create::DavCreateFence,
         dead::{
             ContainerRequest, ContainerWrites, DeadContainers, check_growth, container_kinds,
             copy_growth, read_container,

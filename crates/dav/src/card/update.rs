@@ -29,9 +29,7 @@ use dav_proto::{
 #[cfg(feature = "enterprise")]
 use groupware::SizeWriter;
 // SPDX-SnippetEnd
-use groupware::{
-    contact::{ContactCard, ContactCardContent},
-};
+use groupware::contact::{ContactCard, ContactCardContent};
 use http_proto::HttpResponse;
 use hyper::StatusCode;
 use registry::schema::enums::StorageQuota;
@@ -67,14 +65,10 @@ impl CardUpdateRequestHandler for Server {
             .await?
             .into_owned_uri()?;
         let account_id = resource.account_id;
-        let (resources, create_fence) = DavCreateFence::prepare(
-            self,
-            access_token,
-            account_id,
-            SyncCollection::AddressBook,
-        )
-        .await
-        .caused_by(trc::location!())?;
+        let (resources, create_fence) =
+            DavCreateFence::prepare(self, access_token, account_id, SyncCollection::AddressBook)
+                .await
+                .caused_by(trc::location!())?;
         let resource_name = resource
             .resource
             .ok_or(DavError::Code(StatusCode::CONFLICT))?;
@@ -348,9 +342,7 @@ impl CardUpdateRequestHandler for Server {
                     &mut batch,
                 )
                 .caused_by(trc::location!())?;
-            create_fence
-                .commit(self, batch)
-                .await?;
+            create_fence.commit(self, batch).await?;
 
             Ok(HttpResponse::new(StatusCode::CREATED).with_etag(etag))
         } else {

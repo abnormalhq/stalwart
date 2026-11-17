@@ -660,9 +660,11 @@ mod masked_scope_tests {
             Permission::SysMaskedEmailQuery,
         ] {
             assert_eq!(permission_scopes(permission), OAuthScopes::SETTINGS);
-            assert!(scope_permissions(OAuthScopes::SETTINGS)
-                .build_permissions_list()
-                .contains(&permission));
+            assert!(
+                scope_permissions(OAuthScopes::SETTINGS)
+                    .build_permissions_list()
+                    .contains(&permission)
+            );
         }
     }
 }

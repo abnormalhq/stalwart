@@ -3067,7 +3067,6 @@ pub struct Email {
     #[serde(rename = "maxMaskedAddresses")]
     pub max_masked_addresses: Option<u64>,
     // SPDX-SnippetEnd
-
     #[cfg(not(feature = "enterprise"))]
     #[serde(rename = "maxMaskedAddresses")]
     pub max_masked_addresses: Option<u64>,

@@ -3,7 +3,7 @@ name: Community PR CI
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, devin/1794777185-community-debranding, devin/1794818404-capability-foundation]
+    branches: [main, devin/1794818404-capability-foundation]
   push:
     branches: [main]
 
@@ -18,17 +18,22 @@ jobs:
   community:
     if: github.repository == 'abnormalhq/stalwart'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
 
       - name: Install libclang for RocksDB
         run: |
@@ -44,6 +49,23 @@ jobs:
       - name: Check Community gates and compatibility
         run: python3 scripts/check-community.py
 
+      - name: Run presentation and recipient-policy tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for filter in mail_presentation::tests recipient_policy::; do
+            selected="$(cargo test --locked -p common --no-default-features "$filter" -- --list | awk '/: test$/ { count += 1 } END { print count + 0 }')"
+            if [[ "$selected" -eq 0 ]]; then
+              echo "No tests selected for filter: $filter" >&2
+              exit 1
+            fi
+            echo "$filter: $selected tests selected"
+          done
+
+          cargo test --locked -p common --no-default-features mail_presentation::tests
+          cargo test --locked -p common --no-default-features recipient_policy::
+
       - name: Check Community build
         run: cargo check --locked -p stalwart --no-default-features --features "sqlite postgres mysql rocks s3 redis keep azure nats"
 
@@ -51,6 +73,7 @@ jobs:
         run: |
           cargo test --locked -p common --no-default-features community_
           cargo test --locked -p common --no-default-features mail_capabilities::tests
+          cargo test --locked -p common --no-default-features --features ai-spam-test-sqlite ai_spam::tests
           cargo test --locked -p common --no-default-features masked
           cargo test --locked -p common --no-default-features network::masked::tests
           cargo test --locked -p jmap --no-default-features registry::tests::masked_email_is_forbidden_while_regular_objects_remain_available
@@ -79,6 +102,7 @@ jobs:
   dav-fence-postgres:
     if: github.repository == 'abnormalhq/stalwart'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:16
@@ -99,9 +123,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
 
       - name: Run DAV PostgreSQL fence contract
         run: cargo test --locked -p dav --no-default-features --features test-postgres common::create::tests

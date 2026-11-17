@@ -2279,7 +2279,6 @@ pub enum Permission {
     #[cfg(feature = "enterprise")]
     SysMaskedEmailQuery = 401,
     // SPDX-SnippetEnd
-
     #[cfg(not(feature = "enterprise"))]
     SysMaskedEmailGet = 397,
     #[cfg(not(feature = "enterprise"))]
@@ -3163,7 +3162,6 @@ pub enum StorageQuota {
     #[cfg(feature = "enterprise")]
     MaxMaskedAddresses = 14,
     // SPDX-SnippetEnd
-
     #[cfg(not(feature = "enterprise"))]
     MaxMaskedAddresses = 14,
     MaxAppPasswords = 15,
