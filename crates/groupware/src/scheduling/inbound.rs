@@ -13,8 +13,7 @@ use ahash::AHashSet;
 use calcard::icalendar::{
     ICalendar, ICalendarComponent, ICalendarComponentType, ICalendarEntry, ICalendarMethod,
     ICalendarParameter, ICalendarParameterName, ICalendarParticipationStatus, ICalendarProperty,
-    ICalendarStatus, ICalendarValue,
-    Uri,
+    ICalendarStatus, ICalendarValue, Uri,
 };
 
 #[derive(Debug)]
@@ -707,8 +706,7 @@ impl InstanceId {
 
 impl Attendee<'_> {
     fn answers_differently(&self, reply: &Attendee<'_>) -> bool {
-        self.part_stat != reply.part_stat
-            || self.delegated_to != reply.delegated_to
+        self.part_stat != reply.part_stat || self.delegated_to != reply.delegated_to
     }
 }
 

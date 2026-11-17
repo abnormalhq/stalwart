@@ -34934,7 +34934,6 @@ impl Pickle for Email {
             #[cfg(feature = "enterprise")]
             max_masked_addresses: field12,
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             max_masked_addresses: field12,
             max_public_keys: field13,
@@ -34968,7 +34967,6 @@ impl Default for Email {
             #[cfg(feature = "enterprise")]
             max_masked_addresses: Some(5u64),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             max_masked_addresses: Some(5u64),
             max_public_keys: Some(5u64),
@@ -35109,7 +35107,6 @@ impl RegistryJsonPropertyPatch for Email {
             #[cfg(feature = "enterprise")]
             Some(Property::MaxMaskedAddresses) => self.max_masked_addresses.patch(pointer, value),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             Some(Property::MaxMaskedAddresses) => self.max_masked_addresses.patch(pointer, value),
             Some(Property::MaxPublicKeys) => self.max_public_keys.patch(pointer, value),

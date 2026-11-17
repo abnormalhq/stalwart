@@ -86,7 +86,6 @@ pub enum ObjectInner {
     #[cfg(feature = "enterprise")]
     MaskedEmail(Box<MaskedEmail>),
     // SPDX-SnippetEnd
-
     #[cfg(not(feature = "enterprise"))]
     MaskedEmail(Box<MaskedEmail>),
     MemoryLookupKey(Box<MemoryLookupKey>),
@@ -270,7 +269,6 @@ pub enum ObjectType {
     #[cfg(feature = "enterprise")]
     MaskedEmail = 52,
     // SPDX-SnippetEnd
-
     #[cfg(not(feature = "enterprise"))]
     MaskedEmail = 52,
     MemoryLookupKey = 53,
@@ -607,7 +605,6 @@ pub enum Property {
     #[cfg(feature = "enterprise")]
     CreatedBy = 575,
     // SPDX-SnippetEnd
-
     #[cfg(not(feature = "enterprise"))]
     CreatedBy = 575,
     CredentialId = 730,
@@ -873,7 +870,6 @@ pub enum Property {
     #[cfg(feature = "enterprise")]
     ForDomain = 574,
     // SPDX-SnippetEnd
-
     #[cfg(not(feature = "enterprise"))]
     ForDomain = 574,
     Format = 493,
@@ -1180,7 +1176,6 @@ pub enum Property {
     #[cfg(feature = "enterprise")]
     MaxMaskedAddresses = 437,
     // SPDX-SnippetEnd
-
     #[cfg(not(feature = "enterprise"))]
     MaxMaskedAddresses = 437,
     MaxMatchVars = 829,

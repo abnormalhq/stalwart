@@ -944,10 +944,7 @@ mod community_append_tests {
         view.append_local([row(1, 10)]);
 
         let total_messages = view.take_appended().unwrap();
-        assert_eq!(
-            Exists { total_messages }.into_bytes(),
-            b"* 1 EXISTS\r\n"
-        );
+        assert_eq!(Exists { total_messages }.into_bytes(), b"* 1 EXISTS\r\n");
 
         let mut flushed = Vec::new();
         view.flush(false, &mut flushed);
