@@ -25,10 +25,18 @@ python3 scripts/generate-ui-assets.py --check
 python3 scripts/check-community.py
 cargo check --locked -p stalwart --no-default-features --features "sqlite postgres mysql rocks s3 redis keep azure nats"
 cargo test --locked -p common --no-default-features community_
-cargo test --locked -p http@1.1.1 --no-default-features community_redirect_tests
+cargo test --locked --manifest-path crates/http/Cargo.toml --no-default-features community_redirect_tests
 cargo test --locked -p spam-filter --no-default-features analysis::image_size::tests
 cargo test --locked -p spam-filter --no-default-features analysis::html::image_size_tests
 ```
+
+## Releases
+
+Release Please runs on pushes to `main` and opens a synchronized release PR from Conventional Commits. Use `fix:` for patch releases, `feat:` for minor releases, and `!` or a `BREAKING CHANGE:` footer for major releases. The initial changelog is bootstrapped from the `v1.1.0` tag at `e7cde9b3fac32d2a254ef782efec56f2373ec5d4`, so earlier inherited history is excluded.
+
+Release PRs update the root version, the 36 direct workspace crate manifests, and `Cargo.lock`; fork release notes are written to `CHANGELOG-fork.md`, separate from the upstream reference `CHANGELOG.md`. Cargo may remove the `x-release-please-version` comments when regenerating `Cargo.lock`; restore them only on the 36 direct local package version lines and local-qualified dependency references. Do not annotate `event_macro` or registry records. Run `python3 scripts/check-release-please.py` to verify coverage before merging; the merge creates the version tag and GitHub release.
+
+GitHub suppresses pull-request workflow runs for PRs created with the default `GITHUB_TOKEN`. Before merging a Release Please PR, manually run **Community PR CI** from the Actions tab and select that release PR's branch for `workflow_dispatch`. If a `RELEASE_PLEASE_TOKEN` secret is already configured, the release workflow can use it instead to enable PR-triggered checks; no token is required for the default setup.
 
 Read the applicable upstream documentation for code conventions, but treat upstream support and contribution policies as applying to the upstream repository only.
 

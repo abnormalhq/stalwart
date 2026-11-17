@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/v17.6.0/schemas/config.json",
+  "bootstrap-sha": "e7cde9b3fac32d2a254ef782efec56f2373ec5d4",
+  "include-component-in-tag": false,
+  "include-v-in-tag": true,
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "version-file": ".release-please-version",
+      "changelog-path": "CHANGELOG-fork.md",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "crates/*/Cargo.toml",
+          "glob": true,
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "generic",
+          "path": "Cargo.lock"
+        }
+      ]
+    }
+  }
+}
