@@ -1463,7 +1463,7 @@ pub struct DmarcTroubleshoot {
     #[serde(rename = "ehloDomain")]
     pub ehlo_domain: String,
     #[serde(rename = "mailFrom")]
-    pub mail_from: String,
+    pub mail_from: Option<String>,
     #[serde(rename = "rcptTo")]
     pub rcpt_to: Map<String>,
     pub message: Option<String>,
@@ -2514,11 +2514,8 @@ pub struct DnsServerNamecheap {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DnsServerNetcup {
-    #[serde(rename = "customerNumber")]
-    pub customer_number: String,
-    #[serde(rename = "apiKeyId")]
-    pub api_key_id: String,
-    pub password: SecretKey,
+    #[serde(rename = "apiKey")]
+    pub api_key: SecretKey,
     pub description: String,
     // SPDX-SnippetBegin
     // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -3070,6 +3067,10 @@ pub struct Email {
     #[serde(rename = "maxMaskedAddresses")]
     pub max_masked_addresses: Option<u64>,
     // SPDX-SnippetEnd
+
+    #[cfg(not(feature = "enterprise"))]
+    #[serde(rename = "maxMaskedAddresses")]
+    pub max_masked_addresses: Option<u64>,
     #[serde(rename = "maxPublicKeys")]
     pub max_public_keys: Option<u64>,
     #[serde(rename = "maxMailboxesPerEmail")]
@@ -3891,6 +3892,27 @@ pub struct MaskedEmail {
 }
 
 // SPDX-SnippetEnd
+
+#[cfg(not(feature = "enterprise"))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaskedEmail {
+    pub enable: bool,
+    #[serde(rename = "accountId")]
+    pub account_id: Id,
+    pub email: String,
+    pub description: Option<String>,
+    #[serde(rename = "forDomain")]
+    pub for_domain: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: UTCDateTime,
+    #[serde(rename = "createdBy")]
+    pub created_by: Option<String>,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: Option<UTCDateTime>,
+    pub url: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MeilisearchStore {
@@ -5689,7 +5711,7 @@ pub struct SpamClassify {
     #[serde(rename = "isTls")]
     pub is_tls: bool,
     #[serde(rename = "mailFrom")]
-    pub mail_from: String,
+    pub mail_from: Option<String>,
     #[serde(rename = "mailFromParameters")]
     pub mail_from_parameters: Option<SpamClassifyParameters>,
     #[serde(rename = "rcptTo")]

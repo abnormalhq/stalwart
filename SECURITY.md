@@ -1,6 +1,6 @@
 # Security policy
 
-This repository documents Abnormal Mail Server, an Abnormal-owned fork of Stalwart v1.1.0. It does not promise upstream Stalwart support dates or response times. Consult the release notes for the exact fork version in use.
+This repository documents Abnormal Mail Server, an Abnormal-owned fork updated from Stalwart v1.1.1. It does not promise upstream Stalwart support dates or response times. Consult the release notes for the exact fork version in use.
 
 ## Reporting a vulnerability
 

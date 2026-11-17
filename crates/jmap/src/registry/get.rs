@@ -211,6 +211,8 @@ impl RegistryGet for Server {
             | ObjectType::PublicKey
             | ObjectType::DkimSignature
             | ObjectType::Domain => registry_object_get(get).await,
+            #[cfg(not(feature = "enterprise"))]
+            ObjectType::MaskedEmail => registry_object_get(get).await,
             // SPDX-SnippetBegin
             // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
             // SPDX-License-Identifier: LicenseRef-SEL

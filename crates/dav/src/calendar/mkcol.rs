@@ -8,6 +8,7 @@ use super::proppatch::CalendarPropPatchRequestHandler;
 use crate::{
     DavError, DavMethod, PropStatBuilder,
     common::{
+        create::DavCreateFence,
         ExtractETag,
         dead::{DeadPatch, DeadTarget, DisplayName},
         lock::{LockRequestHandler, ResourceState},
@@ -19,10 +20,7 @@ use dav_proto::{
     RequestHeaders, Return,
     schema::{Namespace, request::MkCol, response::MkColResponse},
 };
-use groupware::{
-    cache::GroupwareCache,
-    calendar::{CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences},
-};
+use groupware::calendar::{CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences};
 use http_proto::HttpResponse;
 use hyper::StatusCode;
 use registry::schema::enums::StorageQuota;
@@ -61,14 +59,14 @@ impl CalendarMkColRequestHandler for Server {
         if !access_token.is_member(account_id) {
             return Err(DavError::Code(StatusCode::FORBIDDEN));
         }
-        let resources = self
-            .fetch_groupware_resources(
-                access_token.account_id(),
-                account_id,
-                SyncCollection::Calendar,
-            )
-            .await
-            .caused_by(trc::location!())?;
+        let (resources, create_fence) = DavCreateFence::prepare(
+            self,
+            access_token,
+            account_id,
+            SyncCollection::Calendar,
+        )
+        .await
+        .caused_by(trc::location!())?;
         if name.contains('/') || resources.by_path(name).is_some() {
             return Err(DavError::Code(StatusCode::METHOD_NOT_ALLOWED));
         }
@@ -112,7 +110,7 @@ impl CalendarMkColRequestHandler for Server {
         // Apply MKCOL properties
         let personal_id = access_token.personal_id(account_id, Collection::Calendar);
         calendar.preferences_mut(personal_id).flags |= CALENDAR_SUBSCRIBED;
-        let mut batch = BatchBuilder::new();
+        let mut batch = BatchBuilder::new_atomic();
         let document_id = batch.reserve_document_id(account_id, Collection::Calendar);
         let mut return_prop_stat = None;
         let mut is_mkcalendar = false;
@@ -173,10 +171,9 @@ impl CalendarMkColRequestHandler for Server {
                 &mut batch,
             )
             .caused_by(trc::location!())?;
-        let etag = self
-            .commit_batch(batch)
-            .await
-            .caused_by(trc::location!())?
+        let etag = create_fence
+            .commit(self, batch)
+            .await?
             .etag();
 
         if let Some(prop_stat) = return_prop_stat {

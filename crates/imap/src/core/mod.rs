@@ -35,6 +35,9 @@ pub mod rights;
 pub mod session;
 pub mod view;
 
+#[cfg(test)]
+mod wire_tests;
+
 pub use view::{ItemChanges, MailboxView, Resolved, Row};
 
 #[derive(Clone)]
