@@ -349,7 +349,6 @@ impl EnumImpl for ObjectType {
             #[cfg(feature = "enterprise")]
             ObjectType::MaskedEmail => "MaskedEmail",
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectType::MaskedEmail => "MaskedEmail",
             ObjectType::MemoryLookupKey => "MemoryLookupKey",
@@ -537,7 +536,6 @@ impl EnumImpl for ObjectType {
             #[cfg(feature = "enterprise")]
             52 => Some(ObjectType::MaskedEmail),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             52 => Some(ObjectType::MaskedEmail),
             53 => Some(ObjectType::MemoryLookupKey),
@@ -3006,7 +3004,6 @@ impl EnumImpl for Property {
             #[cfg(feature = "enterprise")]
             Property::CreatedBy => "createdBy",
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             Property::CreatedBy => "createdBy",
             Property::CredentialId => "credentialId",
@@ -3272,7 +3269,6 @@ impl EnumImpl for Property {
             #[cfg(feature = "enterprise")]
             Property::ForDomain => "forDomain",
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             Property::ForDomain => "forDomain",
             Property::Format => "format",
@@ -3579,7 +3575,6 @@ impl EnumImpl for Property {
             #[cfg(feature = "enterprise")]
             Property::MaxMaskedAddresses => "maxMaskedAddresses",
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             Property::MaxMaskedAddresses => "maxMaskedAddresses",
             Property::MaxMatchVars => "maxMatchVars",
@@ -4413,7 +4408,6 @@ impl EnumImpl for Property {
             #[cfg(feature = "enterprise")]
             575 => Some(Property::CreatedBy),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             575 => Some(Property::CreatedBy),
             730 => Some(Property::CredentialId),
@@ -4679,7 +4673,6 @@ impl EnumImpl for Property {
             #[cfg(feature = "enterprise")]
             574 => Some(Property::ForDomain),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             574 => Some(Property::ForDomain),
             493 => Some(Property::Format),
@@ -4986,7 +4979,6 @@ impl EnumImpl for Property {
             #[cfg(feature = "enterprise")]
             437 => Some(Property::MaxMaskedAddresses),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             437 => Some(Property::MaxMaskedAddresses),
             829 => Some(Property::MaxMatchVars),
@@ -5687,7 +5679,6 @@ impl ObjectType {
             #[cfg(feature = "enterprise")]
             ObjectType::MaskedEmail => MaskedEmail::FLAGS,
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectType::MaskedEmail => MaskedEmail::FLAGS,
             ObjectType::MemoryLookupKey => MemoryLookupKey::FLAGS,
@@ -6016,7 +6007,6 @@ impl ObjectType {
                 IndexSchemaValueType::Id,
             )],
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectType::MaskedEmail => vec![IndexSchema::new(
                 Property::AccountId,
@@ -6246,7 +6236,6 @@ impl ObjectType {
             #[cfg(feature = "enterprise")]
             ObjectType::MaskedEmail => Permission::SysMaskedEmailGet,
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectType::MaskedEmail => Permission::SysMaskedEmailGet,
             ObjectType::MemoryLookupKey => Permission::SysMemoryLookupKeyGet,
@@ -6397,7 +6386,6 @@ impl ObjectType {
             #[cfg(feature = "enterprise")]
             ObjectType::MaskedEmail => Permission::SysMaskedEmailQuery,
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectType::MaskedEmail => Permission::SysMaskedEmailQuery,
             ObjectType::MemoryLookupKey => Permission::SysMemoryLookupKeyQuery,
@@ -6534,7 +6522,6 @@ impl ObjectType {
             #[cfg(feature = "enterprise")]
             ObjectType::MaskedEmail => Permission::SysMaskedEmailCreate,
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectType::MaskedEmail => Permission::SysMaskedEmailCreate,
             ObjectType::MemoryLookupKey => Permission::SysMemoryLookupKeyCreate,
@@ -6718,7 +6705,6 @@ impl ObjectType {
             #[cfg(feature = "enterprise")]
             ObjectType::MaskedEmail => Permission::SysMaskedEmailUpdate,
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectType::MaskedEmail => Permission::SysMaskedEmailUpdate,
             ObjectType::MemoryLookupKey => Permission::SysMemoryLookupKeyUpdate,
@@ -6902,7 +6888,6 @@ impl ObjectType {
             #[cfg(feature = "enterprise")]
             ObjectType::MaskedEmail => Permission::SysMaskedEmailDestroy,
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectType::MaskedEmail => Permission::SysMaskedEmailDestroy,
             ObjectType::MemoryLookupKey => Permission::SysMemoryLookupKeyDestroy,
@@ -7380,7 +7365,6 @@ impl ObjectInner {
             #[cfg(feature = "enterprise")]
             ObjectInner::MaskedEmail(obj) => obj.to_pickled_vec(),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectInner::MaskedEmail(obj) => obj.to_pickled_vec(),
             ObjectInner::MemoryLookupKey(obj) => obj.to_pickled_vec(),
@@ -7655,7 +7639,6 @@ impl ObjectInner {
                 Pickle::unpickle(stream).map(|obj| ObjectInner::MaskedEmail(Box::new(obj)))
             }
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectType::MaskedEmail => {
                 Pickle::unpickle(stream).map(|obj| ObjectInner::MaskedEmail(Box::new(obj)))
@@ -8048,7 +8031,6 @@ impl ObjectInner {
             ObjectType::MaskedEmail => MaskedEmail::deserialize(deserializer)
                 .map(|obj| ObjectInner::MaskedEmail(Box::new(obj))),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectType::MaskedEmail => MaskedEmail::deserialize(deserializer)
                 .map(|obj| ObjectInner::MaskedEmail(Box::new(obj))),
@@ -8370,7 +8352,6 @@ impl Object {
             #[cfg(feature = "enterprise")]
             ObjectInner::MaskedEmail(_) => MaskedEmail::FLAGS,
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectInner::MaskedEmail(_) => MaskedEmail::FLAGS,
             ObjectInner::MemoryLookupKey(_) => MemoryLookupKey::FLAGS,
@@ -8554,7 +8535,6 @@ impl Object {
             #[cfg(feature = "enterprise")]
             ObjectInner::MaskedEmail(_) => ObjectType::MaskedEmail,
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectInner::MaskedEmail(_) => ObjectType::MaskedEmail,
             ObjectInner::MemoryLookupKey(_) => ObjectType::MemoryLookupKey,
@@ -8790,7 +8770,6 @@ impl Object {
             #[cfg(feature = "enterprise")]
             ObjectInner::MaskedEmail(obj) => obj.validate(errors),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectInner::MaskedEmail(obj) => obj.validate(errors),
             ObjectInner::MemoryLookupKey(obj) => obj.validate(errors),
@@ -9011,7 +8990,6 @@ impl Object {
             #[cfg(feature = "enterprise")]
             ObjectInner::MaskedEmail(obj) => obj.index(i),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectInner::MaskedEmail(obj) => obj.index(i),
             ObjectInner::MemoryLookupKey(obj) => obj.index(i),
@@ -9199,7 +9177,6 @@ impl Object {
             #[cfg(feature = "enterprise")]
             ObjectInner::MaskedEmail(obj) => obj.patch(pointer, value),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectInner::MaskedEmail(obj) => obj.patch(pointer, value),
             ObjectInner::MemoryLookupKey(obj) => obj.patch(pointer, value),
@@ -9389,7 +9366,6 @@ impl IntoValue for Object {
             #[cfg(feature = "enterprise")]
             ObjectInner::MaskedEmail(obj) => (*obj).into_value_with(opts),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectInner::MaskedEmail(obj) => (*obj).into_value_with(opts),
             ObjectInner::MemoryLookupKey(obj) => (*obj).into_value_with(opts),
@@ -9575,7 +9551,6 @@ impl From<ObjectType> for ObjectInner {
             #[cfg(feature = "enterprise")]
             ObjectType::MaskedEmail => ObjectInner::MaskedEmail(Box::default()),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             ObjectType::MaskedEmail => ObjectInner::MaskedEmail(Box::default()),
             ObjectType::MemoryLookupKey => ObjectInner::MemoryLookupKey(Box::default()),

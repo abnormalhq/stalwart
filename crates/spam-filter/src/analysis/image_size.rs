@@ -777,12 +777,14 @@ mod tests {
 
     #[test]
     fn percentage_css_size_keeps_html_attribute() {
-        assert!(size(
-            Some("600"),
-            Some("400"),
-            "width:100%;max-width:600px;height:auto"
-        )
-        .is_large());
+        assert!(
+            size(
+                Some("600"),
+                Some("400"),
+                "width:100%;max-width:600px;height:auto"
+            )
+            .is_large()
+        );
         assert!(size(Some("300"), None, "width:50%").is_large());
         assert!(!size(Some("300"), None, "width:50%;max-width:100px").is_large());
         assert!(!size(None, Some("12"), "width:50%").is_large());

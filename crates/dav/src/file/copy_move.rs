@@ -8,7 +8,8 @@ use super::FromDavResource;
 use crate::{
     DavError, DavMethod,
     common::{
-        ExtractETag, create::DavCreateFence,
+        ExtractETag,
+        create::DavCreateFence,
         dead::{
             ContainerRequest, ContainerWrites, copy_growth, edited_container, read_container,
             stored_entry_of,
@@ -153,14 +154,10 @@ impl FileCopyMoveRequestHandler for Server {
             .account_id
             .ok_or(DavError::Code(StatusCode::BAD_GATEWAY))?;
         let is_same_account = to_account_id == from_account_id;
-        let (to_resources, create_fence) = DavCreateFence::prepare(
-            self,
-            access_token,
-            to_account_id,
-            SyncCollection::FileNode,
-        )
-        .await
-        .caused_by(trc::location!())?;
+        let (to_resources, create_fence) =
+            DavCreateFence::prepare(self, access_token, to_account_id, SyncCollection::FileNode)
+                .await
+                .caused_by(trc::location!())?;
 
         // Map file item
         let destination_resource_name = destination
@@ -679,7 +676,15 @@ async fn copy_container(
 ) -> crate::Result<HttpResponse> {
     let infinity_copy = match depth {
         Depth::Zero if !delete_source => {
-            return copy_item(server, fence, access_token, from_resource, destination, transfer).await;
+            return copy_item(
+                server,
+                fence,
+                access_token,
+                from_resource,
+                destination,
+                transfer,
+            )
+            .await;
         }
         Depth::One if !delete_source => false,
         _ => true,

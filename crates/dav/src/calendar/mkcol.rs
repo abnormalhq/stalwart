@@ -8,8 +8,8 @@ use super::proppatch::CalendarPropPatchRequestHandler;
 use crate::{
     DavError, DavMethod, PropStatBuilder,
     common::{
-        create::DavCreateFence,
         ExtractETag,
+        create::DavCreateFence,
         dead::{DeadPatch, DeadTarget, DisplayName},
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
@@ -59,14 +59,10 @@ impl CalendarMkColRequestHandler for Server {
         if !access_token.is_member(account_id) {
             return Err(DavError::Code(StatusCode::FORBIDDEN));
         }
-        let (resources, create_fence) = DavCreateFence::prepare(
-            self,
-            access_token,
-            account_id,
-            SyncCollection::Calendar,
-        )
-        .await
-        .caused_by(trc::location!())?;
+        let (resources, create_fence) =
+            DavCreateFence::prepare(self, access_token, account_id, SyncCollection::Calendar)
+                .await
+                .caused_by(trc::location!())?;
         if name.contains('/') || resources.by_path(name).is_some() {
             return Err(DavError::Code(StatusCode::METHOD_NOT_ALLOWED));
         }
@@ -171,10 +167,7 @@ impl CalendarMkColRequestHandler for Server {
                 &mut batch,
             )
             .caused_by(trc::location!())?;
-        let etag = create_fence
-            .commit(self, batch)
-            .await?
-            .etag();
+        let etag = create_fence.commit(self, batch).await?.etag();
 
         if let Some(prop_stat) = return_prop_stat {
             Ok(HttpResponse::new(StatusCode::CREATED)
