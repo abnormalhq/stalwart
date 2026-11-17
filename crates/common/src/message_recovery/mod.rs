@@ -1136,6 +1136,7 @@ impl RecoveryEngine {
     }
 
     pub async fn get(&self, scope: &RecoveryScope, id: &str) -> Result<Option<Manifest>> {
+        lifecycle::validate_capture_id(id)?;
         if !valid_recovery_scope(scope) {
             return Err(RecoveryError::Invalid("recovery scope"));
         }
@@ -1409,7 +1410,7 @@ impl PreparedCapture {
 }
 
 fn value_class(key: &[u8]) -> ValueClass {
-    ValueClass::Any(AnyClass {
+    ValueClass::AnyChunked(AnyClass {
         subspace: Subspace::System,
         key: key.to_vec(),
     })

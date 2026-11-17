@@ -1710,7 +1710,7 @@ fn operation_key(
     scoped_key(kind, scope, &suffix)
 }
 
-fn validate_capture_id(value: &str) -> Result<()> {
+pub(super) fn validate_capture_id(value: &str) -> Result<()> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(RecoveryError::Invalid("capture identifier"));
     }
@@ -1872,4 +1872,55 @@ fn encode_record_for_store<T: Serialize>(value: &T, revision: u64) -> trc::Resul
     }
     bytes.extend_from_slice(&revision.to_be_bytes());
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod recovery_key_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn written_recovery_key_families_are_prefix_free() {
+        let scope = RecoveryScope {
+            tenant_id: "tenant-1".into(),
+            server_id: "server-1".into(),
+            placement_generation: 3,
+            server_generation: 2,
+            account_id: "7".into(),
+            account_generation: 1,
+        };
+        let other_scope = RecoveryScope {
+            account_id: "8".into(),
+            ..scope.clone()
+        };
+        let server_scope = super::super::server_scope(&scope);
+        let capture_a = "a".repeat(64);
+        let capture_b = "b".repeat(64);
+
+        let keys = [
+            super::super::scoped_key(b"policy", &server_scope, "").unwrap(),
+            super::super::scoped_key(b"hold", &scope, "").unwrap(),
+            super::super::quota_key(&scope).unwrap(),
+            super::super::account_capture_index_key(&scope).unwrap(),
+            super::super::account_capture_index_key(&other_scope).unwrap(),
+            account_lifecycle_key(&scope).unwrap(),
+            account_lifecycle_key(&other_scope).unwrap(),
+            super::super::scoped_key(b"manifest", &scope, &capture_a).unwrap(),
+            super::super::scoped_key(b"manifest", &scope, &capture_b).unwrap(),
+            super::super::scoped_key(b"tombstone", &scope, &capture_a).unwrap(),
+            super::super::scoped_key(b"tombstone", &scope, &capture_b).unwrap(),
+            capture_lifecycle_key(&scope, &capture_a).unwrap(),
+            capture_lifecycle_key(&scope, &capture_b).unwrap(),
+            operation_key(b"restore-job", &scope, &capture_a, "restore-a").unwrap(),
+            operation_key(b"restore-job", &scope, &capture_b, "restore-b").unwrap(),
+            operation_key(b"purge-job", &scope, &capture_a, "purge-a").unwrap(),
+            operation_key(b"purge-job", &scope, &capture_b, "purge-b").unwrap(),
+        ];
+
+        assert!(keys.iter().all(|key| key.starts_with(super::super::PREFIX)));
+        for (index, key) in keys.iter().enumerate() {
+            for other in keys.iter().skip(index + 1) {
+                assert!(!key.starts_with(other) && !other.starts_with(key));
+            }
+        }
+    }
 }

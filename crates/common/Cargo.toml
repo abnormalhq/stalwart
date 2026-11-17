@@ -104,6 +104,7 @@ ai-spam-test-sqlite = ["store/sqlite"]
 redis = ["store/redis"]
 keep = ["store/keep"]
 recovery-test-sqlite = ["store/sqlite"]
+recovery-test-foundationdb = ["foundation", "store/foundation"]
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["full"] }

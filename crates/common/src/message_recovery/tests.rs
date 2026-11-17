@@ -4665,3 +4665,344 @@ async fn capture_page_cursor_advances_across_nonvisible_index_slots() {
     assert_eq!(second.next_cursor.as_deref(), Some(ids[199].as_str()));
     assert_eq!(fixture.engine.read_count(), 101);
 }
+
+#[tokio::test]
+async fn get_rejects_invalid_capture_ids_before_store_access() {
+    let fixture = lifecycle_fixture().await;
+    let scope = scope();
+    let invalid_ids = [
+        String::new(),
+        "a".repeat(63),
+        "g".repeat(64),
+        "a".repeat(65),
+    ];
+
+    for id in invalid_ids {
+        fixture.engine.reset_read_count();
+        assert!(matches!(
+            fixture.engine.get(&scope, &id).await,
+            Err(RecoveryError::Invalid("capture identifier"))
+        ));
+        assert_eq!(fixture.engine.read_count(), 0);
+    }
+}
+
+#[cfg(feature = "recovery-test-foundationdb")]
+fn foundationdb_test_cluster_file() -> std::path::PathBuf {
+    use std::net::IpAddr;
+
+    assert_eq!(
+        std::env::var("STALWART_FDB_TEST_ALLOW_LOOPBACK").as_deref(),
+        Ok("1"),
+        "set STALWART_FDB_TEST_ALLOW_LOOPBACK=1 only for a disposable local cluster"
+    );
+
+    let cluster_file = std::env::var_os("STALWART_FDB_TEST_CLUSTER_FILE")
+        .expect("STALWART_FDB_TEST_CLUSTER_FILE must name the disposable cluster file");
+    let cluster_file = std::fs::canonicalize(cluster_file).expect("cluster file must exist");
+    assert_eq!(
+        cluster_file.file_name().and_then(|name| name.to_str()),
+        Some("fdb.cluster"),
+        "only an explicitly named test cluster file may be used"
+    );
+    let run_dir = cluster_file
+        .parent()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .expect("cluster file must be in a named disposable directory");
+    assert!(
+        run_dir.starts_with("stalwart-recovery-fdb-test-"),
+        "cluster file must be in a unique Stalwart FDB test directory"
+    );
+
+    let connection = std::fs::read_to_string(&cluster_file).expect("cluster file must be readable");
+    let lines = connection
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "only one loopback coordinator is permitted");
+    let mut fields = lines[0].split(':');
+    assert_eq!(
+        fields.next(),
+        Some("stalwart_recovery_test"),
+        "cluster description must identify the disposable test cluster"
+    );
+    let connection = fields
+        .next()
+        .expect("cluster file must contain a coordinator connection");
+    let (cluster_id, address) = connection
+        .split_once('@')
+        .expect("cluster coordinator must include its unique ID");
+    assert!(
+        cluster_id.len() == 8 && cluster_id.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+        "cluster ID must be an eight-character disposable identifier"
+    );
+    let address = address
+        .parse::<IpAddr>()
+        .expect("coordinator address must be an IP literal");
+    assert!(
+        address.is_loopback(),
+        "FDB coordinator must be loopback-only"
+    );
+    let port = fields
+        .next()
+        .expect("cluster file must contain a coordinator port")
+        .parse::<u16>()
+        .expect("coordinator port must be valid");
+    assert!(
+        port >= 30000,
+        "test coordinator must use a unique high port"
+    );
+    assert!(fields.next().is_none(), "unexpected cluster file fields");
+
+    cluster_file
+}
+
+#[cfg(feature = "recovery-test-foundationdb")]
+fn foundationdb_test_index(scope: &RecoveryScope, count: usize) -> ScopeCaptureIndex {
+    let index = ScopeCaptureIndex {
+        scope: scope.clone(),
+        captures: (0..count).map(|id| format!("{id:064x}")).collect(),
+    };
+    validate_account_capture_index(scope, &index).expect("generated index must be valid");
+    index
+}
+
+#[cfg(feature = "recovery-test-foundationdb")]
+async fn assert_foundationdb_record(
+    metadata: &Store,
+    key: &[u8],
+    expected_bytes: &[u8],
+    expected_index: &ScopeCaptureIndex,
+    expected_revision: u64,
+) {
+    let actual = metadata
+        .get_value::<RawBytes>(any_key(key))
+        .await
+        .unwrap()
+        .expect("recovery metadata record must exist");
+    assert_eq!(
+        actual.0.len(),
+        expected_bytes.len(),
+        "assembled recovery metadata byte length changed"
+    );
+    assert!(
+        actual.0.as_slice() == expected_bytes,
+        "assembled recovery metadata bytes changed"
+    );
+    let decoded = decode_record::<ScopeCaptureIndex>(&actual.0).unwrap();
+    assert!(&decoded == expected_index, "decoded recovery index changed");
+    assert_eq!(record_revision(&actual.0).unwrap(), expected_revision);
+}
+
+#[cfg(feature = "recovery-test-foundationdb")]
+async fn assert_foundationdb_chunk(metadata: &Store, key: &[u8], chunk: u8, expected: bool) {
+    let mut chunk_key = key.to_vec();
+    chunk_key.push(chunk);
+    let exists = metadata
+        .get_value::<RawBytes>(any_key(&chunk_key))
+        .await
+        .unwrap()
+        .is_some();
+    assert_eq!(exists, expected, "unexpected FDB chunk suffix {chunk}");
+}
+
+#[cfg(feature = "recovery-test-foundationdb")]
+async fn assert_foundationdb_sentinels(
+    metadata: &Store,
+    neighbor_key: &[u8],
+    neighbor_bytes: &[u8],
+    boundary_key: &[u8],
+    boundary_value: &[u8],
+) {
+    let neighbor = metadata
+        .get_value::<RawBytes>(any_key(neighbor_key))
+        .await
+        .unwrap()
+        .expect("neighboring recovery key must survive chunk cleanup");
+    assert!(neighbor.0.as_slice() == neighbor_bytes);
+    let boundary = metadata
+        .get_value::<RawBytes>(any_key(boundary_key))
+        .await
+        .unwrap()
+        .expect("chunk-range upper-boundary key must survive cleanup");
+    assert!(boundary.0.as_slice() == boundary_value);
+}
+
+#[cfg(feature = "recovery-test-foundationdb")]
+#[tokio::test]
+#[ignore = "requires an explicitly opted-in disposable loopback FoundationDB cluster"]
+async fn foundationdb_recovery_metadata_chunk_lifecycle() {
+    let cluster_file = foundationdb_test_cluster_file();
+    let metadata = store::backend::foundationdb::FdbStore::open(
+        registry::schema::structs::FoundationDbStore {
+            cluster_file: Some(cluster_file.to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let chunk_size = metadata.chunk_size().expect("FoundationDB chunk size");
+    assert_eq!(chunk_size, 100_000);
+
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let scope = RecoveryScope {
+        tenant_id: format!("fdb-test-{unique}"),
+        server_id: "fdb-test-server".into(),
+        placement_generation: 1,
+        server_generation: 1,
+        account_id: "account-7".into(),
+        account_generation: 1,
+    };
+    let neighbor_scope = RecoveryScope {
+        account_id: "account-8".into(),
+        ..scope.clone()
+    };
+    let key = account_capture_index_key(&scope).unwrap();
+    let neighbor_key = account_capture_index_key(&neighbor_scope).unwrap();
+    let mut boundary_key = key.clone();
+    boundary_key.push(u8::MAX);
+    let boundary_value = b"FDB chunk range upper boundary".to_vec();
+
+    let three_chunk_index = foundationdb_test_index(&scope, 4096);
+    let three_chunk_bytes = encode_record(&three_chunk_index, 1).unwrap();
+    assert!(three_chunk_bytes.len() > chunk_size * 2);
+    assert!(three_chunk_bytes.len() <= chunk_size * 3);
+
+    let two_chunk_index = foundationdb_test_index(&scope, 2500);
+    let two_chunk_bytes = encode_record(&two_chunk_index, 2).unwrap();
+    assert!(two_chunk_bytes.len() > chunk_size);
+    assert!(two_chunk_bytes.len() <= chunk_size * 2);
+
+    let small_index = foundationdb_test_index(&scope, 1000);
+    let small_bytes = encode_record(&small_index, 3).unwrap();
+    assert!(small_bytes.len() < chunk_size);
+
+    let regrown_index = foundationdb_test_index(&scope, 2800);
+    let regrown_bytes = encode_record(&regrown_index, 4).unwrap();
+    assert!(regrown_bytes.len() > chunk_size);
+    assert!(regrown_bytes.len() <= chunk_size * 2);
+
+    let neighbor_index = foundationdb_test_index(&neighbor_scope, 1);
+    let neighbor_bytes = encode_record(&neighbor_index, 1).unwrap();
+    let mut initial = BatchBuilder::new();
+    initial.set(value_class(&key), three_chunk_bytes.clone());
+    initial.set(value_class(&neighbor_key), neighbor_bytes.clone());
+    initial.set(
+        ValueClass::Any(AnyClass {
+            subspace: Subspace::System,
+            key: boundary_key.clone(),
+        }),
+        boundary_value.clone(),
+    );
+    metadata.write_batch(&mut initial).await.unwrap();
+
+    assert_foundationdb_record(&metadata, &key, &three_chunk_bytes, &three_chunk_index, 1).await;
+    assert_foundationdb_chunk(&metadata, &key, 0, true).await;
+    assert_foundationdb_chunk(&metadata, &key, 1, true).await;
+    assert_foundationdb_sentinels(
+        &metadata,
+        &neighbor_key,
+        &neighbor_bytes,
+        &boundary_key,
+        &boundary_value,
+    )
+    .await;
+
+    let current = metadata
+        .get_value::<RawBytes>(any_key(&key))
+        .await
+        .unwrap()
+        .expect("three-chunk record must exist");
+    let current_revision = record_revision(&current.0).unwrap();
+    assert_eq!(current_revision, 1);
+    let mut shrink_to_two = BatchBuilder::new();
+    shrink_to_two.assert_value(value_class(&key), current_revision);
+    shrink_to_two.set(value_class(&key), two_chunk_bytes.clone());
+    metadata.write_batch(&mut shrink_to_two).await.unwrap();
+
+    assert_foundationdb_record(&metadata, &key, &two_chunk_bytes, &two_chunk_index, 2).await;
+    assert_foundationdb_chunk(&metadata, &key, 0, true).await;
+    assert_foundationdb_chunk(&metadata, &key, 1, false).await;
+    assert_foundationdb_sentinels(
+        &metadata,
+        &neighbor_key,
+        &neighbor_bytes,
+        &boundary_key,
+        &boundary_value,
+    )
+    .await;
+
+    let mut stale_cas = BatchBuilder::new();
+    stale_cas.set(value_class(&key), small_bytes.clone());
+    stale_cas.assert_value(value_class(&key), current_revision);
+    let error = metadata.write_batch(&mut stale_cas).await.unwrap_err();
+    assert!(
+        error.is_assertion_failure(),
+        "expected stale CAS assertion failure, got {error:?}"
+    );
+    assert_foundationdb_record(&metadata, &key, &two_chunk_bytes, &two_chunk_index, 2).await;
+    assert_foundationdb_chunk(&metadata, &key, 0, true).await;
+    assert_foundationdb_chunk(&metadata, &key, 1, false).await;
+    assert_foundationdb_sentinels(
+        &metadata,
+        &neighbor_key,
+        &neighbor_bytes,
+        &boundary_key,
+        &boundary_value,
+    )
+    .await;
+
+    let mut shrink_to_small = BatchBuilder::new();
+    shrink_to_small.assert_value(value_class(&key), 2u64);
+    shrink_to_small.set(value_class(&key), small_bytes.clone());
+    metadata.write_batch(&mut shrink_to_small).await.unwrap();
+    assert_foundationdb_record(&metadata, &key, &small_bytes, &small_index, 3).await;
+    assert_foundationdb_chunk(&metadata, &key, 0, false).await;
+    assert_foundationdb_chunk(&metadata, &key, 1, false).await;
+
+    let mut regrow = BatchBuilder::new();
+    regrow.assert_value(value_class(&key), 3u64);
+    regrow.set(value_class(&key), regrown_bytes.clone());
+    metadata.write_batch(&mut regrow).await.unwrap();
+    assert_foundationdb_record(&metadata, &key, &regrown_bytes, &regrown_index, 4).await;
+    assert_foundationdb_chunk(&metadata, &key, 0, true).await;
+    assert_foundationdb_chunk(&metadata, &key, 1, false).await;
+
+    let mut delete = BatchBuilder::new();
+    delete.assert_value(value_class(&key), 4u64);
+    delete.clear(value_class(&key));
+    metadata.write_batch(&mut delete).await.unwrap();
+    assert!(
+        metadata
+            .get_value::<RawBytes>(any_key(&key))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_foundationdb_chunk(&metadata, &key, 0, false).await;
+    assert_foundationdb_chunk(&metadata, &key, 1, false).await;
+    assert_foundationdb_sentinels(
+        &metadata,
+        &neighbor_key,
+        &neighbor_bytes,
+        &boundary_key,
+        &boundary_value,
+    )
+    .await;
+
+    let mut cleanup = BatchBuilder::new();
+    cleanup.clear(value_class(&neighbor_key));
+    cleanup.clear(ValueClass::Any(AnyClass {
+        subspace: Subspace::System,
+        key: boundary_key,
+    }));
+    metadata.write_batch(&mut cleanup).await.unwrap();
+}

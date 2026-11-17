@@ -585,7 +585,9 @@ impl ValueClass {
                     .write(*partition)
                     .write(SearchIndexClass::CONTROL_STATUS),
             },
-            ValueClass::Any(any) => serializer.write(any.key.as_slice()),
+            ValueClass::Any(any) | ValueClass::AnyChunked(any) => {
+                serializer.write(any.key.as_slice())
+            }
             ValueClass::Metadata(class) => {
                 let serializer = serializer.write(account_id).write(METADATA_COLLECTION);
                 match class {
@@ -772,7 +774,7 @@ impl ValueClass {
                     U32_LEN + 3
                 }
             },
-            ValueClass::Any(v) => v.key.len(),
+            ValueClass::Any(v) | ValueClass::AnyChunked(v) => v.key.len(),
             ValueClass::Metadata(class) => match class {
                 MetadataClass::Private { .. } => (U32_LEN * 3) + 3,
                 MetadataClass::Shared
@@ -873,7 +875,7 @@ impl ValueClass {
                 | SearchIndexClass::QueueIndex { .. }
                 | SearchIndexClass::QueueStatus { .. } => Subspace::SearchQueue,
             },
-            ValueClass::Any(any) => any.subspace,
+            ValueClass::Any(any) | ValueClass::AnyChunked(any) => any.subspace,
             ValueClass::Metadata(_) => Subspace::Property,
         }
     }
@@ -900,8 +902,55 @@ impl ValueClass {
                     | SearchIndexClass::GlobalDocument { .. }
                     | SearchIndexClass::GlobalDocumentId { .. }
             ),
+            ValueClass::AnyChunked(_) => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod any_chunked_tests {
+    use crate::{Key, Subspace, ValueKey, WITH_SUBSPACE, write::AnyClass};
+
+    use super::ValueClass;
+
+    #[test]
+    fn chunked_any_preserves_serialized_key_length_and_subspace() {
+        let key = AnyClass {
+            subspace: Subspace::System,
+            key: b"raw-key-contract".to_vec(),
+        };
+        let any_key = ValueKey {
+            account_id: 17,
+            collection: 3,
+            document_id: 29,
+            class: ValueClass::Any(key.clone()),
+        };
+        let chunked_key = ValueKey {
+            account_id: 17,
+            collection: 3,
+            document_id: 29,
+            class: ValueClass::AnyChunked(key),
+        };
+
+        assert_eq!(any_key.serialize(0), chunked_key.serialize(0));
+        assert_eq!(
+            any_key.serialize(WITH_SUBSPACE),
+            chunked_key.serialize(WITH_SUBSPACE)
+        );
+        assert_eq!(any_key.key_len_hint(), chunked_key.key_len_hint());
+        assert_eq!(any_key.subspace(), chunked_key.subspace());
+    }
+
+    #[test]
+    fn raw_any_values_are_chunkable_only_when_opted_in() {
+        let key = AnyClass {
+            subspace: Subspace::System,
+            key: b"raw-key-contract".to_vec(),
+        };
+
+        assert!(!ValueClass::Any(key.clone()).may_be_chunked());
+        assert!(ValueClass::AnyChunked(key).may_be_chunked());
     }
 }
 
