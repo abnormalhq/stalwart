@@ -85,6 +85,7 @@ use bytes::Bytes;
 use manager::application::Resource;
 // SPDX-SnippetEnd
 
+pub mod ai_spam;
 pub mod auth;
 pub mod cache;
 pub mod config;

@@ -266,8 +266,12 @@ def main() -> None:
     require("contents: read" in community_ci and "write" not in community_ci,
             "Community PR CI must use read-only permissions.")
     require(
-        "pull_request:\n    branches: [main]" in community_ci,
-        "Community PR CI must run for pull requests targeting main.",
+        (
+            "pull_request:\n    branches: [main, "
+            "devin/1794818404-capability-foundation]"
+        )
+        in community_ci,
+        "Community PR CI must run for pull requests targeting main and the capability foundation branch.",
     )
     require(
         "push:\n    branches: [main]" in community_ci,

@@ -100,6 +100,7 @@ dev_mode = []
 test-utils = ["store/sqlite"]
 enterprise = ["store/enterprise", "utils/enterprise", "trc/enterprise", "telemetry/enterprise", "directory/enterprise", "coordinator/enterprise", "registry/enterprise", "jmap_proto/enterprise"]
 foundation = []
+ai-spam-test-sqlite = ["store/sqlite"]
 redis = ["store/redis"]
 keep = ["store/keep"]
 
