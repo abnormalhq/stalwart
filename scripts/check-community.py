@@ -252,6 +252,10 @@ def main() -> None:
         ".github/workflows/auto-redirect-discussions.yml",
         ".github/workflows/ci-retry.yml",
         ".github/workflows/ci.yml",
+    ):
+        require(not (ROOT / workflow).exists(),
+                f"Upstream-only release/triage workflow must stay removed: {workflow}")
+    for workflow in (
         ".github/workflows/scorecard.yml",
         ".github/workflows/trivy.yml",
     ):
