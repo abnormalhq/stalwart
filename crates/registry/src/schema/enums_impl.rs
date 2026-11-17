@@ -9737,6 +9737,11 @@ impl EnumImpl for Permission {
             b"sysMailingListUpdate" => Permission::SysMailingListUpdate,
             b"sysMailingListDestroy" => Permission::SysMailingListDestroy,
             b"sysMailingListQuery" => Permission::SysMailingListQuery,
+            b"sysMaskedEmailGet" => Permission::SysMaskedEmailGet,
+            b"sysMaskedEmailCreate" => Permission::SysMaskedEmailCreate,
+            b"sysMaskedEmailUpdate" => Permission::SysMaskedEmailUpdate,
+            b"sysMaskedEmailDestroy" => Permission::SysMaskedEmailDestroy,
+            b"sysMaskedEmailQuery" => Permission::SysMaskedEmailQuery,
             b"sysMemoryLookupKeyGet" => Permission::SysMemoryLookupKeyGet,
             b"sysMemoryLookupKeyCreate" => Permission::SysMemoryLookupKeyCreate,
             b"sysMemoryLookupKeyUpdate" => Permission::SysMemoryLookupKeyUpdate,
@@ -10456,6 +10461,17 @@ impl EnumImpl for Permission {
             #[cfg(feature = "enterprise")]
             Permission::SysMaskedEmailQuery => "sysMaskedEmailQuery",
             // SPDX-SnippetEnd
+
+            #[cfg(not(feature = "enterprise"))]
+            Permission::SysMaskedEmailGet => "sysMaskedEmailGet",
+            #[cfg(not(feature = "enterprise"))]
+            Permission::SysMaskedEmailCreate => "sysMaskedEmailCreate",
+            #[cfg(not(feature = "enterprise"))]
+            Permission::SysMaskedEmailUpdate => "sysMaskedEmailUpdate",
+            #[cfg(not(feature = "enterprise"))]
+            Permission::SysMaskedEmailDestroy => "sysMaskedEmailDestroy",
+            #[cfg(not(feature = "enterprise"))]
+            Permission::SysMaskedEmailQuery => "sysMaskedEmailQuery",
             Permission::SysMemoryLookupKeyGet => "sysMemoryLookupKeyGet",
             Permission::SysMemoryLookupKeyCreate => "sysMemoryLookupKeyCreate",
             Permission::SysMemoryLookupKeyUpdate => "sysMemoryLookupKeyUpdate",
@@ -11234,6 +11250,17 @@ impl EnumImpl for Permission {
             #[cfg(feature = "enterprise")]
             401 => Some(Permission::SysMaskedEmailQuery),
             // SPDX-SnippetEnd
+
+            #[cfg(not(feature = "enterprise"))]
+            397 => Some(Permission::SysMaskedEmailGet),
+            #[cfg(not(feature = "enterprise"))]
+            398 => Some(Permission::SysMaskedEmailCreate),
+            #[cfg(not(feature = "enterprise"))]
+            399 => Some(Permission::SysMaskedEmailUpdate),
+            #[cfg(not(feature = "enterprise"))]
+            400 => Some(Permission::SysMaskedEmailDestroy),
+            #[cfg(not(feature = "enterprise"))]
+            401 => Some(Permission::SysMaskedEmailQuery),
             402 => Some(Permission::SysMemoryLookupKeyGet),
             403 => Some(Permission::SysMemoryLookupKeyCreate),
             404 => Some(Permission::SysMemoryLookupKeyUpdate),
@@ -12005,6 +12032,17 @@ impl Permission {
         #[cfg(feature = "enterprise")]
         Permission::SysMaskedEmailQuery,
         // SPDX-SnippetEnd
+
+        #[cfg(not(feature = "enterprise"))]
+        Permission::SysMaskedEmailGet,
+        #[cfg(not(feature = "enterprise"))]
+        Permission::SysMaskedEmailCreate,
+        #[cfg(not(feature = "enterprise"))]
+        Permission::SysMaskedEmailUpdate,
+        #[cfg(not(feature = "enterprise"))]
+        Permission::SysMaskedEmailDestroy,
+        #[cfg(not(feature = "enterprise"))]
+        Permission::SysMaskedEmailQuery,
         Permission::SysMemoryLookupKeyGet,
         Permission::SysMemoryLookupKeyCreate,
         Permission::SysMemoryLookupKeyUpdate,
@@ -14572,7 +14610,7 @@ impl EnumImpl for SpamClassifyParameters {
             value.as_bytes(),
             SpamClassifyParameters,
             b"bit7" => SpamClassifyParameters::Bit7,
-            b"bit8Mime - 8-bit MIME message content" => SpamClassifyParameters::Bit8Mime8BitMIMEMessageContent,
+            b"bit8Mime" => SpamClassifyParameters::Bit8Mime,
             b"binaryMime" => SpamClassifyParameters::BinaryMime,
             b"smtpUtf8" => SpamClassifyParameters::SmtpUtf8,
         }
@@ -14582,9 +14620,7 @@ impl EnumImpl for SpamClassifyParameters {
     fn as_str(&self) -> &'static str {
         match self {
             SpamClassifyParameters::Bit7 => "bit7",
-            SpamClassifyParameters::Bit8Mime8BitMIMEMessageContent => {
-                "bit8Mime - 8-bit MIME message content"
-            }
+            SpamClassifyParameters::Bit8Mime => "bit8Mime",
             SpamClassifyParameters::BinaryMime => "binaryMime",
             SpamClassifyParameters::SmtpUtf8 => "smtpUtf8",
         }
@@ -14597,7 +14633,7 @@ impl EnumImpl for SpamClassifyParameters {
     fn from_id(id: u16) -> Option<Self> {
         match id {
             0 => Some(SpamClassifyParameters::Bit7),
-            1 => Some(SpamClassifyParameters::Bit8Mime8BitMIMEMessageContent),
+            1 => Some(SpamClassifyParameters::Bit8Mime),
             2 => Some(SpamClassifyParameters::BinaryMime),
             3 => Some(SpamClassifyParameters::SmtpUtf8),
             _ => None,
@@ -15221,6 +15257,7 @@ impl EnumImpl for StorageQuota {
     }
 
     // SPDX-SnippetEnd
+
     #[cfg(not(feature = "enterprise"))]
     fn parse(value: &str) -> Option<Self> {
         hashify::map! {
@@ -15240,6 +15277,7 @@ impl EnumImpl for StorageQuota {
             b"maxContactCards" => StorageQuota::MaxContactCards,
             b"maxFiles" => StorageQuota::MaxFiles,
             b"maxFolders" => StorageQuota::MaxFolders,
+            b"maxMaskedAddresses" => StorageQuota::MaxMaskedAddresses,
             b"maxAppPasswords" => StorageQuota::MaxAppPasswords,
             b"maxApiKeys" => StorageQuota::MaxApiKeys,
             b"maxPublicKeys" => StorageQuota::MaxPublicKeys,
@@ -15271,6 +15309,9 @@ impl EnumImpl for StorageQuota {
             #[cfg(feature = "enterprise")]
             StorageQuota::MaxMaskedAddresses => "maxMaskedAddresses",
             // SPDX-SnippetEnd
+
+            #[cfg(not(feature = "enterprise"))]
+            StorageQuota::MaxMaskedAddresses => "maxMaskedAddresses",
             StorageQuota::MaxAppPasswords => "maxAppPasswords",
             StorageQuota::MaxApiKeys => "maxApiKeys",
             StorageQuota::MaxPublicKeys => "maxPublicKeys",
@@ -15305,6 +15346,9 @@ impl EnumImpl for StorageQuota {
             #[cfg(feature = "enterprise")]
             14 => Some(StorageQuota::MaxMaskedAddresses),
             // SPDX-SnippetEnd
+
+            #[cfg(not(feature = "enterprise"))]
+            14 => Some(StorageQuota::MaxMaskedAddresses),
             15 => Some(StorageQuota::MaxAppPasswords),
             16 => Some(StorageQuota::MaxApiKeys),
             17 => Some(StorageQuota::MaxPublicKeys),

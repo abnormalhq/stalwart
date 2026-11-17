@@ -30,6 +30,8 @@ pub mod domain;
 pub mod external_public_key;
 pub mod index_queue;
 pub mod log;
+#[cfg(not(feature = "enterprise"))]
+pub mod masked_email;
 pub mod oauth_client;
 pub mod passkey;
 pub mod principal;

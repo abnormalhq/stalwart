@@ -131,6 +131,13 @@ impl MailboxView {
         self.uid_max
     }
 
+    pub fn take_appended(&mut self) -> Option<usize> {
+        (self.appended > 0).then(|| {
+            self.appended = 0;
+            self.rows.len()
+        })
+    }
+
     pub fn has_pending_changes(&self) -> bool {
         !self.tombstones.is_empty() || self.appended > 0 || !self.sorted
     }
@@ -857,6 +864,21 @@ impl<T: SessionStream> SessionData<T> {
         Ok(change_id)
     }
 
+    pub async fn sync_and_announce(
+        &self,
+        mailbox: &SelectedMailbox,
+        cache: &MessageStoreCache,
+    ) -> trc::Result<u64> {
+        let change_id = self.sync_view(mailbox, cache, None).await?;
+        let appended = mailbox.view.lock().take_appended();
+        if let Some(total_messages) = appended {
+            let mut buf = Vec::with_capacity(24);
+            Exists { total_messages }.serialize(&mut buf);
+            self.write_bytes(buf).await?;
+        }
+        Ok(change_id)
+    }
+
     pub async fn flush_view(
         &self,
         mailbox: &SelectedMailbox,
@@ -880,6 +902,86 @@ impl<T: SessionStream> SessionData<T> {
         let change_id = self.sync_view(mailbox, cache, None).await?;
         self.flush_view(mailbox, use_vanished).await?;
         Ok(change_id)
+    }
+}
+
+#[cfg(test)]
+mod community_append_tests {
+    use super::*;
+
+    fn empty_view() -> MailboxView {
+        MailboxView {
+            mailbox_id: 1,
+            rows: Arc::new(Vec::new()),
+            tombstones: Vec::new(),
+            appended: 0,
+            uid_max: 0,
+            snapshot: Arc::new(MessagesCache::new(0, Vec::new(), Vec::new())),
+            sorted: true,
+            mask: None,
+        }
+    }
+
+    fn row(uid: u32, id: u32) -> Row {
+        Row { uid, id }
+    }
+
+    #[test]
+    fn append_local_tracks_rows_and_consumes_exists_once() {
+        let mut view = empty_view();
+        view.append_local([row(2, 20), row(1, 10)]);
+
+        assert_eq!(view.rows(), &[row(1, 10), row(2, 20)]);
+        assert_eq!(view.len(), 2);
+        assert_eq!(view.uid_max(), 2);
+        assert_eq!(view.take_appended(), Some(2));
+        assert_eq!(view.take_appended(), None);
+    }
+
+    #[test]
+    fn taken_append_does_not_repeat_exists_on_flush() {
+        let mut view = empty_view();
+        view.append_local([row(1, 10)]);
+
+        let total_messages = view.take_appended().unwrap();
+        assert_eq!(
+            Exists { total_messages }.into_bytes(),
+            b"* 1 EXISTS\r\n"
+        );
+
+        let mut flushed = Vec::new();
+        view.flush(false, &mut flushed);
+        assert!(flushed.is_empty());
+
+        let mut repeated = Vec::new();
+        view.flush(false, &mut repeated);
+        assert!(repeated.is_empty());
+    }
+
+    #[test]
+    fn taking_append_preserves_pending_expunge_for_flush() {
+        let mut view = empty_view();
+        view.append_local([row(1, 10), row(2, 20)]);
+        view.tombstone(0);
+
+        assert_eq!(view.take_appended(), Some(2));
+
+        let mut actual = Vec::new();
+        view.flush(false, &mut actual);
+
+        let mut expected = Vec::new();
+        expunge::Response {
+            use_vanished: false,
+            ids: vec![1],
+        }
+        .serialize_to(&mut expected);
+        Exists { total_messages: 1 }.serialize(&mut expected);
+        assert_eq!(actual, expected);
+        assert_eq!(view.rows(), &[row(2, 20)]);
+
+        let mut repeated = Vec::new();
+        view.flush(false, &mut repeated);
+        assert!(repeated.is_empty());
     }
 }
 

@@ -23,7 +23,7 @@ use common::{
 use compact_str::{CompactString, ToCompactString};
 use crypto::Protection;
 use groupware::{
-    calendar::itip::{ItipIngest, ItipIngestError},
+    calendar::itip::{ItipIngest, ItipIngestError, ItipOrigin},
     scheduling::{ItipError, ItipMessages},
 };
 use mail_parser::{Message, MessageParser, thread_name};
@@ -490,6 +490,11 @@ impl EmailIngest for Server {
                 {
                     let mut account_info = None;
                     let mut sender = None;
+                    let itip_origin = if sender_authentication == SenderAuthentication::Submission {
+                        ItipOrigin::Submission
+                    } else {
+                        ItipOrigin::Delivery
+                    };
                     for part in message.root().parts() {
                         if part.content_type().is_some_and(|ct| {
                             ct.ctype().eq_ignore_ascii_case("text")
@@ -522,6 +527,7 @@ impl EmailIngest for Server {
                                     match Box::pin(self.itip_ingest(
                                         account_info,
                                         sender,
+                                        itip_origin,
                                         deliver_to,
                                         &itip_message,
                                     ))
@@ -1203,6 +1209,132 @@ impl EmailIngest for Server {
                 SpanId = span_id,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod itip_origin_integration_tests {
+    use super::*;
+    use crate::mailbox::{INBOX_ID, manage::MailboxFnc};
+    use common::{auth::AccessToken, test_utils::ServerFixture};
+    use registry::schema::enums::Permission;
+    use std::time::Duration;
+    use types::{collection::Collection, field::CalendarEventField};
+
+    const DOMAIN: &str = "email-itip.test";
+    const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    fn calendar_email(uid: &str, attendee: &str) -> String {
+        format!(
+            "From: {attendee}\r\nTo: recipient@{DOMAIN}\r\nSubject: calendar invitation\r\nMessage-ID: <{uid}@{DOMAIN}>\r\nMIME-Version: 1.0\r\nContent-Type: text/calendar; method=REQUEST; charset=utf-8\r\n\r\nBEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//EmailIngest test//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20300101T000000Z\r\nDTSTART:20300102T120000Z\r\nDTEND:20300102T130000Z\r\nORGANIZER:mailto:organizer@external.test\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:{attendee}\r\nSUMMARY:Forwarded through EmailIngest\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    async fn ingest_calendar(
+        server: &Server,
+        account_id: u32,
+        recipient: &str,
+        sender: &str,
+        uid: &str,
+        sender_authentication: SenderAuthentication,
+    ) {
+        let raw_message = calendar_email(uid, sender);
+        let parsed = MessageParser::default()
+            .parse(raw_message.as_bytes())
+            .expect("parse calendar MIME message");
+        let access_token =
+            AccessToken::from_permissions(account_id, [Permission::CalendarSchedulingReceive]);
+        server
+            .email_ingest(IngestEmail {
+                raw_message: raw_message.as_bytes(),
+                blob_hash: None,
+                message: Some(&parsed),
+                access_token: &access_token,
+                mailbox_ids: vec![INBOX_ID],
+                keywords: Vec::new(),
+                received_at: None,
+                source: IngestSource::Smtp {
+                    deliver_to: recipient,
+                    envelope_from: sender,
+                    sender_authentication,
+                    is_spam: false,
+                },
+                metadata: None,
+                session_id: u64::from(account_id),
+            })
+            .await
+            .expect("ingest calendar MIME message");
+    }
+
+    async fn stored_event_count(server: &Server, account_id: u32, uid: &str) -> usize {
+        server
+            .document_ids_matching(
+                account_id,
+                Collection::CalendarEvent,
+                CalendarEventField::Uid,
+                uid.as_bytes(),
+            )
+            .await
+            .expect("query persisted calendar UID")
+            .iter()
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn email_ingest_maps_submission_and_delivery_origins_for_calendar_mime() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let fixture = ServerFixture::new().await;
+            let attendee_id = fixture.create_user_account("attendee", DOMAIN).await;
+            let recipient_id = fixture.create_user_account("recipient", DOMAIN).await;
+            let attendee = format!("attendee@{DOMAIN}");
+            let recipient = format!("recipient@{DOMAIN}");
+            fixture
+                .server
+                .create_system_folders(recipient_id)
+                .await
+                .expect("create recipient mailboxes");
+
+            ingest_calendar(
+                &fixture.server,
+                recipient_id,
+                &recipient,
+                &attendee,
+                "email-submission-forwarded-event",
+                SenderAuthentication::Submission,
+            )
+            .await;
+            assert_eq!(
+                stored_event_count(
+                    &fixture.server,
+                    recipient_id,
+                    "email-submission-forwarded-event"
+                )
+                .await,
+                1
+            );
+
+            ingest_calendar(
+                &fixture.server,
+                recipient_id,
+                &recipient,
+                &attendee,
+                "email-delivery-not-forwarded-event",
+                SenderAuthentication::DmarcPass,
+            )
+            .await;
+            assert_eq!(
+                stored_event_count(
+                    &fixture.server,
+                    recipient_id,
+                    "email-delivery-not-forwarded-event"
+                )
+                .await,
+                0
+            );
+            assert_ne!(attendee_id, recipient_id);
+        })
+        .await
+        .expect("EmailIngest iTIP integration timed out");
     }
 }
 
