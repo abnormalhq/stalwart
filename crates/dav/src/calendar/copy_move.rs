@@ -8,7 +8,8 @@ use super::{CalendarComponentSupport, assert_event_privacy_access, assert_is_uni
 use crate::{
     DavError, DavMethod,
     common::{
-        ContainerOperation, assert_parent_limit, create::DavCreateFence,
+        ContainerOperation, assert_parent_limit,
+        create::DavCreateFence,
         dead::{
             ContainerRequest, ContainerWrites, DeadContainers, check_growth, container_kinds,
             copy_growth, read_container,
@@ -148,14 +149,10 @@ impl CalendarCopyMoveRequestHandler for Server {
         let to_account_id = destination
             .account_id
             .ok_or(DavError::Code(StatusCode::BAD_GATEWAY))?;
-        let (to_resources, create_fence) = DavCreateFence::prepare(
-            self,
-            access_token,
-            to_account_id,
-            SyncCollection::Calendar,
-        )
-        .await
-        .caused_by(trc::location!())?;
+        let (to_resources, create_fence) =
+            DavCreateFence::prepare(self, access_token, to_account_id, SyncCollection::Calendar)
+                .await
+                .caused_by(trc::location!())?;
         let is_to_owner = access_token.is_member(to_account_id);
         if !from_resource.is_container()
             && !is_to_owner

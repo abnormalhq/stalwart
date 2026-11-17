@@ -8,8 +8,8 @@ use super::proppatch::FilePropPatchRequestHandler;
 use crate::{
     DavError, DavMethod, PropStatBuilder,
     common::{
-        create::DavCreateFence,
         ExtractETag,
+        create::DavCreateFence,
         dead::{DeadPatch, DeadTarget, DisplayName},
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
@@ -59,14 +59,10 @@ impl FileMkColRequestHandler for Server {
             .await?
             .into_owned_uri()?;
         let account_id = resource_.account_id;
-        let (resources, create_fence) = DavCreateFence::prepare(
-            self,
-            access_token,
-            account_id,
-            SyncCollection::FileNode,
-        )
-        .await
-        .caused_by(trc::location!())?;
+        let (resources, create_fence) =
+            DavCreateFence::prepare(self, access_token, account_id, SyncCollection::FileNode)
+                .await
+                .caused_by(trc::location!())?;
         let path = resource_
             .resource
             .ok_or(DavError::Code(StatusCode::METHOD_NOT_ALLOWED))?;
@@ -186,10 +182,7 @@ impl FileMkColRequestHandler for Server {
             .create_document(document_id)
             .custom(ObjectIndexBuilder::<(), _>::new().with_changes(node))
             .caused_by(trc::location!())?;
-        let etag = create_fence
-            .commit(self, batch)
-            .await?
-            .etag();
+        let etag = create_fence.commit(self, batch).await?.etag();
 
         if let Some(prop_stat) = return_prop_stat {
             Ok(HttpResponse::new(StatusCode::CREATED)
