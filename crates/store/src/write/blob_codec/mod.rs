@@ -156,6 +156,103 @@ impl BlobFormat {
 }
 
 impl BlobKeyring {
+    pub fn decode_bounded(
+        &self,
+        storage_key: &[u8],
+        mut data: Vec<u8>,
+        max_bytes: usize,
+    ) -> trc::Result<Vec<u8>> {
+        let encoded_limit = max_bytes.saturating_add(ENCRYPTED_TRAILER_LEN);
+        if data.len() > encoded_limit {
+            return Err(BlobKeyring::decompress_error(
+                storage_key,
+                "encoded blob exceeds configured size limit",
+            ));
+        }
+        let Some(&flags) = data.last() else {
+            return if data.len() <= max_bytes {
+                Ok(data)
+            } else {
+                Err(BlobKeyring::decompress_error(
+                    storage_key,
+                    "decoded blob exceeds configured size limit",
+                ))
+            };
+        };
+        if flags == PLAIN_MARKER {
+            if data.len().saturating_sub(1) > max_bytes {
+                return Err(BlobKeyring::decompress_error(
+                    storage_key,
+                    "decoded blob exceeds configured size limit",
+                ));
+            }
+            data.pop();
+            return Ok(data);
+        }
+        let Some(compression) = BlobFormat::compression_bits(flags) else {
+            trc::event!(Store(trc::StoreEvent::BlobMissingMarker), Key = storage_key);
+            return if data.len() <= max_bytes {
+                Ok(data)
+            } else {
+                Err(BlobKeyring::decompress_error(
+                    storage_key,
+                    "decoded blob exceeds configured size limit",
+                ))
+            };
+        };
+
+        if flags & ENCRYPTED != 0 {
+            self.decrypt(storage_key, &mut data, flags)?;
+        } else {
+            data.pop();
+        }
+
+        match compression {
+            COMPRESSION_LZ4 => {
+                let Some(prefix) = data.get(..U32_LEN) else {
+                    return Err(BlobKeyring::decompress_error(
+                        storage_key,
+                        "truncated LZ4 size prefix",
+                    ));
+                };
+                let declared_size =
+                    u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
+                if declared_size > max_bytes {
+                    return Err(BlobKeyring::decompress_error(
+                        storage_key,
+                        "decoded blob exceeds configured size limit",
+                    ));
+                }
+                let decoded = lz4_flex::decompress_size_prepended(&data)
+                    .map_err(|err| BlobKeyring::decompress_error(storage_key, err))?;
+                if decoded.len() > max_bytes {
+                    return Err(BlobKeyring::decompress_error(
+                        storage_key,
+                        "decoded blob exceeds configured size limit",
+                    ));
+                }
+                Ok(decoded)
+            }
+            COMPRESSION_ZSTD => {
+                let mut out = Vec::new();
+                decompress_into(&data, &mut out, max_bytes)
+                    .map_err(|err| BlobKeyring::decompress_error(storage_key, err))?;
+                if out.len() > max_bytes {
+                    return Err(BlobKeyring::decompress_error(
+                        storage_key,
+                        "decoded blob exceeds configured size limit",
+                    ));
+                }
+                Ok(out)
+            }
+            _ if data.len() <= max_bytes => Ok(data),
+            _ => Err(BlobKeyring::decompress_error(
+                storage_key,
+                "decoded blob exceeds configured size limit",
+            )),
+        }
+    }
+
     pub fn decode(&self, storage_key: &[u8], mut data: Vec<u8>) -> trc::Result<Vec<u8>> {
         let Some(&flags) = data.last() else {
             return Ok(data);
@@ -235,6 +332,136 @@ impl BlobKeyring {
             .reason(err)
             .ctx(trc::Key::Key, storage_key)
             .caused_by(trc::location!())
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use registry::schema::enums::SymmetricCipher;
+
+    fn encrypted_key() -> Arc<BlobKey> {
+        Arc::new(BlobKey::new(
+            9,
+            SymmetricCipher::Aes256Gcm,
+            &[9; BLOB_KEY_LEN],
+        ))
+    }
+
+    #[test]
+    fn bounded_decode_checks_plain_legacy_and_encoded_input_sizes() {
+        let storage_key = b"bounded-test";
+        let keyring = BlobKeyring::default();
+        let encoded = BlobOpts::PLAIN.encode(storage_key, b"12345").unwrap();
+        assert_eq!(
+            keyring
+                .decode_bounded(storage_key, encoded.clone(), 5)
+                .unwrap(),
+            b"12345"
+        );
+        assert!(keyring.decode_bounded(storage_key, encoded, 4).is_err());
+
+        let legacy = b"legacy payload".to_vec();
+        assert!(
+            keyring
+                .decode_bounded(storage_key, legacy.clone(), legacy.len() - 1)
+                .is_err()
+        );
+        assert_eq!(
+            keyring
+                .decode_bounded(storage_key, legacy.clone(), legacy.len())
+                .unwrap(),
+            legacy
+        );
+        assert!(
+            keyring
+                .decode_bounded(storage_key, vec![0; 100], 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_lz4_rejects_malicious_and_truncated_size_prefixes() {
+        let storage_key = b"bounded-lz4";
+        let keyring = BlobKeyring::default();
+        let mut malicious = u32::MAX.to_le_bytes().to_vec();
+        malicious.extend_from_slice(&[0, MAGIC | COMPRESSION_LZ4]);
+        assert!(
+            keyring
+                .decode_bounded(storage_key, malicious, 1024)
+                .is_err()
+        );
+        assert!(
+            keyring
+                .decode_bounded(storage_key, vec![1, 2, MAGIC | COMPRESSION_LZ4], 1024,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_zstd_and_encrypted_compressed_payloads_respect_output_limit() {
+        let storage_key = b"bounded-compressed";
+        let payload = vec![b'Z'; 8192];
+        let keyring = BlobKeyring::default();
+        let zstd = BlobOpts::compressed(CompressionAlgo::Zstd)
+            .encode(storage_key, &payload)
+            .unwrap();
+        assert_eq!(
+            BlobFormat::of(&zstd).unwrap().compression,
+            CompressionAlgo::Zstd
+        );
+        assert!(
+            keyring
+                .decode_bounded(storage_key, zstd.clone(), payload.len() - 1)
+                .is_err()
+        );
+        assert_eq!(
+            keyring
+                .decode_bounded(storage_key, zstd, payload.len())
+                .unwrap(),
+            payload
+        );
+
+        let key = encrypted_key();
+        let keyring = BlobKeyring::new(vec![key.clone()]);
+        let encrypted_opts = BlobOpts::new(CompressionAlgo::Lz4, BlobEncryption::Key(key));
+        let encrypted = encrypted_opts.encode(storage_key, &payload).unwrap();
+        let format = BlobFormat::of(&encrypted).unwrap();
+        assert_eq!(format.compression, CompressionAlgo::Lz4);
+        assert_eq!(format.key_id, Some(9));
+        assert!(
+            keyring
+                .decode_bounded(storage_key, encrypted.clone(), payload.len() - 1)
+                .is_err()
+        );
+        assert_eq!(
+            keyring
+                .decode_bounded(storage_key, encrypted.clone(), payload.len())
+                .unwrap(),
+            payload
+        );
+        assert!(
+            keyring
+                .decode_bounded(b"wrong-storage-key", encrypted.clone(), 8192)
+                .is_err()
+        );
+        let mut truncated = encrypted;
+        truncated.remove(0);
+        assert!(
+            keyring
+                .decode_bounded(storage_key, truncated, 8192)
+                .is_err()
+        );
+
+        let encrypted_plain =
+            BlobOpts::new(CompressionAlgo::None, BlobEncryption::Key(encrypted_key()))
+                .encode(storage_key, &payload)
+                .unwrap();
+        assert!(
+            BlobKeyring::new(vec![encrypted_key()])
+                .decode_bounded(storage_key, encrypted_plain, 1024)
+                .is_err()
+        );
     }
 }
 

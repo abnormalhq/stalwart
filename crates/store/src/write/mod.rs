@@ -936,6 +936,9 @@ pub enum ValueClass {
     Telemetry(TelemetryClass),
     SearchIndex(SearchIndexClass),
     Any(AnyClass),
+    /// Uses the same serialized key as `Any` while opting into chunk cleanup.
+    /// The raw key owns its backend-defined chunk subkey range; no unrelated key may share it.
+    AnyChunked(AnyClass),
     ShareNotification {
         notification_id: u64,
         notify_account_id: u32,
