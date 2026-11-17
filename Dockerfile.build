@@ -4,7 +4,7 @@
 # *****************
 # Base image for planner & builder
 # *****************
-FROM --platform=$BUILDPLATFORM rust:slim-trixie AS base
+FROM --platform=$BUILDPLATFORM rust:1.100.0-slim-trixie AS base
 
 ENV DEBIAN_FRONTEND="noninteractive" \
     BINSTALL_DISABLE_TELEMETRY=true \
@@ -205,7 +205,7 @@ CMD ["--config", "/etc/stalwart/config.json"]
 # *****************
 # Runtime image for musl targets
 # *****************
-FROM --platform=$TARGETPLATFORM alpine AS musl
+FROM --platform=$TARGETPLATFORM alpine:3.24.4 AS musl
 RUN apk add --update --no-cache ca-certificates curl tzdata libcap && \
     rm -rf /var/cache/apk/* && \
     addgroup -S -g 2000 stalwart && \

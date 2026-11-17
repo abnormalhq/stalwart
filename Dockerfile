@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM docker.io/lukemathwalker/cargo-chef:latest-rust-slim-trixie AS chef
+FROM --platform=$BUILDPLATFORM docker.io/lukemathwalker/cargo-chef:0.1.78-rust-1.100.0-slim-trixie AS chef
 WORKDIR /build
 
 FROM --platform=$BUILDPLATFORM chef AS planner
