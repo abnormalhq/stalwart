@@ -8,7 +8,7 @@ use super::assert_is_unique_uid;
 use crate::{
     DavError, DavErrorCondition, DavMethod,
     common::{
-        ContainerOperation, assert_parent_limit,
+        ContainerOperation, assert_parent_limit, create::DavCreateFence,
         dead::{
             ContainerRequest, ContainerWrites, DeadContainers, check_growth, container_kinds,
             copy_growth, read_container,
@@ -113,17 +113,14 @@ impl CardCopyMoveRequestHandler for Server {
         let to_account_id = destination
             .account_id
             .ok_or(DavError::Code(StatusCode::BAD_GATEWAY))?;
-        let to_resources = if to_account_id == from_account_id {
-            from_resources.clone()
-        } else {
-            self.fetch_groupware_resources(
-                access_token.account_id(),
-                to_account_id,
-                SyncCollection::AddressBook,
-            )
-            .await
-            .caused_by(trc::location!())?
-        };
+        let (to_resources, create_fence) = DavCreateFence::prepare(
+            self,
+            access_token,
+            to_account_id,
+            SyncCollection::AddressBook,
+        )
+        .await
+        .caused_by(trc::location!())?;
 
         // Validate headers
         let destination_resource_name = destination
@@ -209,6 +206,7 @@ impl CardCopyMoveRequestHandler for Server {
                     // Overwrite container
                     copy_container(
                         self,
+                        &create_fence,
                         access_token,
                         &from_resources,
                         &to_resources,
@@ -251,6 +249,7 @@ impl CardCopyMoveRequestHandler for Server {
                     if is_move {
                         move_card(
                             self,
+                            &create_fence,
                             access_token,
                             &to_resources,
                             from_account_id,
@@ -266,6 +265,7 @@ impl CardCopyMoveRequestHandler for Server {
                     } else {
                         copy_card(
                             self,
+                            &create_fence,
                             access_token,
                             &to_resources,
                             from_account_id,
@@ -320,6 +320,7 @@ impl CardCopyMoveRequestHandler for Server {
                     {
                         move_card(
                             self,
+                            &create_fence,
                             access_token,
                             &to_resources,
                             from_account_id,
@@ -335,6 +336,7 @@ impl CardCopyMoveRequestHandler for Server {
                     } else {
                         rename_card(
                             self,
+                            &create_fence,
                             access_token,
                             from_account_id,
                             from_resource.document_id(),
@@ -347,6 +349,7 @@ impl CardCopyMoveRequestHandler for Server {
                 } else {
                     copy_card(
                         self,
+                        &create_fence,
                         access_token,
                         &to_resources,
                         from_account_id,
@@ -388,6 +391,7 @@ impl CardCopyMoveRequestHandler for Server {
                     if from_account_id != to_account_id {
                         copy_container(
                             self,
+                            &create_fence,
                             access_token,
                             &from_resources,
                             &to_resources,
@@ -409,6 +413,7 @@ impl CardCopyMoveRequestHandler for Server {
                     } else {
                         rename_container(
                             self,
+                            &create_fence,
                             access_token,
                             from_account_id,
                             from_resource.document_id(),
@@ -420,6 +425,7 @@ impl CardCopyMoveRequestHandler for Server {
                 } else {
                     copy_container(
                         self,
+                        &create_fence,
                         access_token,
                         &from_resources,
                         &to_resources,
@@ -449,6 +455,7 @@ impl CardCopyMoveRequestHandler for Server {
 #[allow(clippy::too_many_arguments)]
 async fn copy_card(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     to_resources: &GroupwareResources,
     from_account_id: u32,
@@ -472,7 +479,7 @@ async fn copy_card(
     let card = card_
         .to_unarchived::<ContactCard>()
         .caused_by(trc::location!())?;
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
 
     // Validate UID
     assert_is_unique_uid(
@@ -628,10 +635,7 @@ async fn copy_card(
         Ok(HttpResponse::new(StatusCode::CREATED))
     };
 
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     response
 }
@@ -639,6 +643,7 @@ async fn copy_card(
 #[allow(clippy::too_many_arguments)]
 async fn move_card(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     to_resources: &GroupwareResources,
     from_account_id: u32,
@@ -677,7 +682,7 @@ async fn move_card(
         )?;
     }
 
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     if from_account_id == to_account_id {
         let mut name_idx = None;
         for (idx, name) in card.inner.names.iter().enumerate() {
@@ -848,10 +853,7 @@ async fn move_card(
         Ok(HttpResponse::new(StatusCode::CREATED))
     };
 
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     response
 }
@@ -859,6 +861,7 @@ async fn move_card(
 #[allow(clippy::too_many_arguments)]
 async fn rename_card(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     account_id: u32,
     document_id: u32,
@@ -892,7 +895,7 @@ async fn rename_card(
         .caused_by(trc::location!())?;
     new_card.names[name_idx].name = new_name.to_string();
 
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     new_card
         .update_meta(
             access_token.changed_by(),
@@ -904,10 +907,7 @@ async fn rename_card(
         )
         .caused_by(trc::location!())?;
     batch.log_vanished_item(VanishedCollection::AddressBook, from_resource_path);
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     Ok(HttpResponse::new(StatusCode::CREATED))
 }
@@ -915,6 +915,7 @@ async fn rename_card(
 #[allow(clippy::too_many_arguments)]
 async fn copy_container(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     from_resources: &GroupwareResources,
     to_resources: &GroupwareResources,
@@ -1022,7 +1023,7 @@ async fn copy_container(
     };
 
     // Prepare write batch
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
 
     let preference = book.preferences.into_iter().next().unwrap();
     book.name = new_name.to_string();
@@ -1280,10 +1281,7 @@ async fn copy_container(
             .clear_if_equals(PrincipalField::DefaultAddressBookId, from_document_id);
     }
 
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     if !is_overwrite {
         Ok(HttpResponse::new(StatusCode::CREATED))
@@ -1295,6 +1293,7 @@ async fn copy_container(
 #[allow(clippy::too_many_arguments)]
 async fn rename_container(
     server: &Server,
+    fence: &DavCreateFence,
     access_token: &AccessToken,
     account_id: u32,
     document_id: u32,
@@ -1320,7 +1319,7 @@ async fn rename_container(
         .caused_by(trc::location!())?;
     new_book.name = new_name.to_string();
 
-    let mut batch = BatchBuilder::new();
+    let mut batch = BatchBuilder::new_atomic();
     new_book
         .update(
             access_token.changed_by(),
@@ -1331,10 +1330,7 @@ async fn rename_container(
         )
         .caused_by(trc::location!())?;
     batch.log_vanished_item(VanishedCollection::AddressBook, from_resource_path);
-    server
-        .commit_batch(batch)
-        .await
-        .caused_by(trc::location!())?;
+    fence.commit(server, batch).await?;
 
     Ok(HttpResponse::new(StatusCode::CREATED))
 }

@@ -102,6 +102,9 @@ pub mod sharing;
 pub mod storage;
 pub mod telemetry;
 
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
+
 // SPDX-SnippetBegin
 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
 // SPDX-License-Identifier: LicenseRef-SEL

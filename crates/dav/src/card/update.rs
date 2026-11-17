@@ -8,6 +8,7 @@ use super::{assert_is_unique_uid, is_same_uid};
 use crate::{
     DavError, DavErrorCondition, DavMethod,
     common::{
+        create::DavCreateFence,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
     },
@@ -29,7 +30,6 @@ use dav_proto::{
 use groupware::SizeWriter;
 // SPDX-SnippetEnd
 use groupware::{
-    cache::GroupwareCache,
     contact::{ContactCard, ContactCardContent},
 };
 use http_proto::HttpResponse;
@@ -67,14 +67,14 @@ impl CardUpdateRequestHandler for Server {
             .await?
             .into_owned_uri()?;
         let account_id = resource.account_id;
-        let resources = self
-            .fetch_groupware_resources(
-                access_token.account_id(),
-                account_id,
-                SyncCollection::AddressBook,
-            )
-            .await
-            .caused_by(trc::location!())?;
+        let (resources, create_fence) = DavCreateFence::prepare(
+            self,
+            access_token,
+            account_id,
+            SyncCollection::AddressBook,
+        )
+        .await
+        .caused_by(trc::location!())?;
         let resource_name = resource
             .resource
             .ok_or(DavError::Code(StatusCode::CONFLICT))?;
@@ -333,7 +333,7 @@ impl CardUpdateRequestHandler for Server {
             let content = ContactCardContent { card: vcard };
 
             // Prepare write batch
-            let mut batch = BatchBuilder::new();
+            let mut batch = BatchBuilder::new_atomic();
             batch.with_account_id(account_id);
             self.limit_disk_quota(&mut batch, &account);
             let document_id = batch.reserve_document_id(account_id, Collection::ContactCard);
@@ -348,7 +348,9 @@ impl CardUpdateRequestHandler for Server {
                     &mut batch,
                 )
                 .caused_by(trc::location!())?;
-            self.commit_batch(batch).await.caused_by(trc::location!())?;
+            create_fence
+                .commit(self, batch)
+                .await?;
 
             Ok(HttpResponse::new(StatusCode::CREATED).with_etag(etag))
         } else {

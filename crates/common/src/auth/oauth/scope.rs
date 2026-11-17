@@ -497,6 +497,14 @@ permission_scopes!(
         SysPublicKeyDestroy,
         SysPublicKeyQuery,
     ],
+    #[cfg(not(feature = "enterprise"))]
+    OAuthScopes::SETTINGS => [
+        SysMaskedEmailGet,
+        SysMaskedEmailCreate,
+        SysMaskedEmailUpdate,
+        SysMaskedEmailDestroy,
+        SysMaskedEmailQuery,
+    ],
     // SPDX-SnippetBegin
     // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
     // SPDX-License-Identifier: LicenseRef-SEL
@@ -635,3 +643,26 @@ pub fn scope_data_types(scopes: OAuthScopes) -> Bitmap<DataType> {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/common/src/auth/oauth/scope/tests.rs"]
 mod tests;
+
+#[cfg(all(test, not(feature = "enterprise")))]
+mod masked_scope_tests {
+    use super::{OAuthScopes, permission_scopes, scope_permissions};
+    use crate::auth::permissions::PermissionsListBuilder;
+    use registry::schema::enums::Permission;
+
+    #[test]
+    fn settings_scope_maps_masked_email_permissions() {
+        for permission in [
+            Permission::SysMaskedEmailGet,
+            Permission::SysMaskedEmailCreate,
+            Permission::SysMaskedEmailUpdate,
+            Permission::SysMaskedEmailDestroy,
+            Permission::SysMaskedEmailQuery,
+        ] {
+            assert_eq!(permission_scopes(permission), OAuthScopes::SETTINGS);
+            assert!(scope_permissions(OAuthScopes::SETTINGS)
+                .build_permissions_list()
+                .contains(&permission));
+        }
+    }
+}

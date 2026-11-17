@@ -1,6 +1,6 @@
 # Agent instructions for this fork
 
-This checkout is the Abnormal-owned fork at [abnormalhq/stalwart](https://github.com/abnormalhq/stalwart), based on upstream Stalwart v1.1.0. Follow [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) for fork-specific routing.
+This checkout is the Abnormal-owned fork at [abnormalhq/stalwart](https://github.com/abnormalhq/stalwart), based on the Abnormal Community/debranding baseline with a selective v1.1.1 Community port; it is not a complete v1.1.1 upstream ancestry. See [UPGRADE-v1.1.1.md](UPGRADE-v1.1.1.md) for scope and exclusions. Follow [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) for fork-specific routing.
 
 ## Do not contact upstream
 

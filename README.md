@@ -1,6 +1,8 @@
 # Abnormal Mail Server
 
-Abnormal Mail Server is an Abnormal-owned Community build and debranding fork of [Stalwart Mail Server](https://github.com/stalwartlabs/stalwart). The upstream base is tag **v1.1.0**, commit **e7cde9b3fac32d2a254ef782efec56f2373ec5d4**. The fork repository is [abnormalhq/stalwart](https://github.com/abnormalhq/stalwart).
+Abnormal Mail Server is an Abnormal-owned Community build and debranding fork of [Stalwart Mail Server](https://github.com/stalwartlabs/stalwart). The upstream update is tag **v1.1.1**, commit **3adead91f3c87e7415b58c9ed8e6ec05a5dda521**, selectively ported onto the Abnormal Community baseline. The fork repository is [abnormalhq/stalwart](https://github.com/abnormalhq/stalwart).
+
+> **v1.1.1 scope:** This is a selective Community port, not a complete upstream merge. See [UPGRADE-v1.1.1.md](UPGRADE-v1.1.1.md) for included changes, exclusions, migrations, and disabled features.
 
 **Fork modification date: 2026-11-16.**
 
@@ -64,7 +66,7 @@ These notes describe known integration paths, not a claim that the Community alt
 
 The upstream source tree is mixed-license: many files are dual-licensed `AGPL-3.0-only OR LicenseRef-SEL`, and some files/snippets are SEL-only. The Community build disables the Enterprise feature and excludes the SEL-only SCIM dependency from its active feature graph; this does **not** relicense the whole source tree. Preserve all SEL notices and snippets and do not use this build as a way to bypass Enterprise licensing. Review each file's SPDX notice and `LICENSES/` before modifying or redistributing source.
 
-The Community artifact is intended to use the AGPL-3.0-only option for the applicable dual-licensed code. This statement is not a claim that every file in the checkout is AGPL. The upstream v1.1.0 notices remain in place; copyright in those materials remains with Stalwart Labs LLC and the applicable contributors.
+The Community artifact is intended to use the AGPL-3.0-only option for the applicable dual-licensed code. This statement is not a claim that every file in the checkout is AGPL. The upstream v1.1.1 notices remain in place; copyright in those materials remains with Stalwart Labs LLC and the applicable contributors.
 
 Operators distributing a modified version or making it available for remote network interaction must meet the applicable AGPL obligations, including the corresponding-source offer in §13. Provide users of each running deployment with access to the **exact corresponding source** for that build, including the source revision, fork modifications, build scripts and installation information required by the license. The source link on the built-in login and RSVP pages points to this fork, but each operator is responsible for ensuring that it identifies the exact source corresponding to the deployed binary and remains accessible.
 
@@ -78,7 +80,7 @@ For security-sensitive reports, use GitHub's private vulnerability reporting for
 
 ## Upstream provenance and acknowledgements
 
-This fork is derived from Stalwart v1.1.0. Stalwart Labs LLC and the upstream contributors retain their original copyright and attribution. Upstream documentation and release history remain available at [stalwartlabs/stalwart](https://github.com/stalwartlabs/stalwart); consult it as upstream documentation, not as a guarantee that every instruction applies to this fork.
+This fork is updated from Stalwart v1.1.1. Stalwart Labs LLC and the upstream contributors retain their original copyright and attribution. Upstream documentation and release history remain available at [stalwartlabs/stalwart](https://github.com/stalwartlabs/stalwart); consult it as upstream documentation, not as a guarantee that every instruction applies to this fork.
 
 The original Stalwart project acknowledged support from the [NGI0 Entrust Fund](https://nlnet.nl/entrust) and [NGI Zero Core](https://nlnet.nl/NGI0/), established by [NLnet](https://nlnet.nl/) with European Commission support. Those acknowledgements concern upstream work and do not imply endorsement of this fork.
 
