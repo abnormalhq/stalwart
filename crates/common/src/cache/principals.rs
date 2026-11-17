@@ -34,9 +34,9 @@ use registry::schema::{
 
 #[cfg(not(feature = "enterprise"))]
 use crate::network::masked::MaskedAddress;
+use compact_str::{CompactString, ToCompactString};
 #[cfg(not(feature = "enterprise"))]
 use registry::schema::structs::MaskedEmail;
-use compact_str::{CompactString, ToCompactString};
 use registry::{
     schema::{
         enums::{DkimRotationStage, Locale, StorageQuota},
@@ -598,8 +598,7 @@ impl Server {
                         }
                     }
                     #[cfg(not(feature = "enterprise"))]
-                    if let Some(masked_id) =
-                        MaskedAddress::parse_for_routing(local_part.as_ref())
+                    if let Some(masked_id) = MaskedAddress::parse_for_routing(local_part.as_ref())
                         && let Some(masked_entry) = self
                             .registry()
                             .object::<MaskedEmail>(Id::new(masked_id))

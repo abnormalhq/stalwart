@@ -10461,7 +10461,6 @@ impl EnumImpl for Permission {
             #[cfg(feature = "enterprise")]
             Permission::SysMaskedEmailQuery => "sysMaskedEmailQuery",
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             Permission::SysMaskedEmailGet => "sysMaskedEmailGet",
             #[cfg(not(feature = "enterprise"))]
@@ -11250,7 +11249,6 @@ impl EnumImpl for Permission {
             #[cfg(feature = "enterprise")]
             401 => Some(Permission::SysMaskedEmailQuery),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             397 => Some(Permission::SysMaskedEmailGet),
             #[cfg(not(feature = "enterprise"))]
@@ -12032,7 +12030,6 @@ impl Permission {
         #[cfg(feature = "enterprise")]
         Permission::SysMaskedEmailQuery,
         // SPDX-SnippetEnd
-
         #[cfg(not(feature = "enterprise"))]
         Permission::SysMaskedEmailGet,
         #[cfg(not(feature = "enterprise"))]
@@ -15309,7 +15306,6 @@ impl EnumImpl for StorageQuota {
             #[cfg(feature = "enterprise")]
             StorageQuota::MaxMaskedAddresses => "maxMaskedAddresses",
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             StorageQuota::MaxMaskedAddresses => "maxMaskedAddresses",
             StorageQuota::MaxAppPasswords => "maxAppPasswords",
@@ -15346,7 +15342,6 @@ impl EnumImpl for StorageQuota {
             #[cfg(feature = "enterprise")]
             14 => Some(StorageQuota::MaxMaskedAddresses),
             // SPDX-SnippetEnd
-
             #[cfg(not(feature = "enterprise"))]
             14 => Some(StorageQuota::MaxMaskedAddresses),
             15 => Some(StorageQuota::MaxAppPasswords),

@@ -419,7 +419,9 @@ impl UnauthorizedResponse for HttpResponse {
     fn unauthorized(challenge: AuthChallenge, resource_metadata: &str) -> Self {
         let response = HttpResponse::new(StatusCode::UNAUTHORIZED).with_header(
             header::WWW_AUTHENTICATE,
-            format!("Bearer realm=\"Abnormal Mail Server\", resource_metadata=\"{resource_metadata}\""),
+            format!(
+                "Bearer realm=\"Abnormal Mail Server\", resource_metadata=\"{resource_metadata}\""
+            ),
         );
 
         if challenge == AuthChallenge::BearerAndBasic {
