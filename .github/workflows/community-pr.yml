@@ -88,7 +88,7 @@ jobs:
           cargo test --locked -p http@1.1.1 --no-default-features community_redirect_tests
 
       - name: Run message recovery tests
-        run: cargo test --locked -p common --no-default-features --features recovery-test-sqlite message_recovery::
+        run: 'cargo test --locked -p common --no-default-features --features recovery-test-sqlite message_recovery::'
 
       - name: Run AnyChunked raw-key tests
         run: cargo test --locked -p store --no-default-features any_chunked_tests
