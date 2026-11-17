@@ -50,6 +50,7 @@ jobs:
       - name: Run Community route tests
         run: |
           cargo test --locked -p common --no-default-features community_
+          cargo test --locked -p common --no-default-features mail_capabilities::tests
           cargo test --locked -p common --no-default-features masked
           cargo test --locked -p common --no-default-features network::masked::tests
           cargo test --locked -p jmap --no-default-features registry::tests::masked_email_is_forbidden_while_regular_objects_remain_available

@@ -92,6 +92,7 @@ pub mod expr;
 pub mod gateway;
 pub mod i18n;
 pub mod ipc;
+pub mod mail_capabilities;
 pub mod manager;
 pub mod network;
 pub mod scripts;
