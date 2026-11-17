@@ -92,14 +92,10 @@ impl CalendarUpdateRequestHandler for Server {
             .await?
             .into_owned_uri()?;
         let account_id = resource.account_id;
-        let (resources, create_fence) = DavCreateFence::prepare(
-            self,
-            access_token,
-            account_id,
-            SyncCollection::Calendar,
-        )
-        .await
-        .caused_by(trc::location!())?;
+        let (resources, create_fence) =
+            DavCreateFence::prepare(self, access_token, account_id, SyncCollection::Calendar)
+                .await
+                .caused_by(trc::location!())?;
         let resource_name = resource
             .resource
             .ok_or(DavError::Code(StatusCode::CONFLICT))?;
@@ -848,9 +844,7 @@ impl CalendarUpdateRequestHandler for Server {
                     .queue(&mut batch)
                     .caused_by(trc::location!())?;
             }
-            create_fence
-                .commit(self, batch)
-                .await?;
+            create_fence.commit(self, batch).await?;
 
             Ok(HttpResponse::new(StatusCode::CREATED)
                 .with_etag_opt(serves_submitted_ical.then_some(etag))
