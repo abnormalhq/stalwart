@@ -3,7 +3,7 @@ name: Community PR CI
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, devin/1794777185-community-debranding]
+    branches: [main, devin/1794777185-community-debranding, devin/1794818404-capability-foundation]
   push:
     branches: [main]
 
