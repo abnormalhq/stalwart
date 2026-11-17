@@ -46,6 +46,13 @@ use types::{
 
 const DESTROY_WINDOW: usize = 5_000;
 
+#[cfg(not(feature = "enterprise"))]
+const COMMUNITY_CLEANUP_OBJECTS: [ObjectType; 3] = [
+    ObjectType::PublicKey,
+    ObjectType::MaskedEmail,
+    ObjectType::OAuthGrant,
+];
+
 pub(crate) trait DestroyAccountTask: Sync + Send {
     fn destroy_account(&self, task: &TaskDestroyAccount) -> impl Future<Output = Outcome> + Send;
 }
@@ -104,7 +111,7 @@ async fn destroy_account(server: &Server, task: &TaskDestroyAccount) -> trc::Res
     ];
     // SPDX-SnippetEnd
     #[cfg(not(feature = "enterprise"))]
-    let objects = [ObjectType::PublicKey, ObjectType::OAuthGrant];
+    let objects = COMMUNITY_CLEANUP_OBJECTS;
     for object in objects {
         let mut batch = BatchBuilder::new();
         let ids = server
@@ -410,4 +417,22 @@ async fn clear_links(
             }));
     }
     Ok(())
+}
+
+#[cfg(all(test, not(feature = "enterprise")))]
+mod masked_cleanup_tests {
+    use super::COMMUNITY_CLEANUP_OBJECTS;
+    use registry::schema::prelude::ObjectType;
+
+    #[test]
+    fn community_account_cleanup_includes_masked_emails() {
+        assert_eq!(
+            COMMUNITY_CLEANUP_OBJECTS,
+            [
+                ObjectType::PublicKey,
+                ObjectType::MaskedEmail,
+                ObjectType::OAuthGrant,
+            ]
+        );
+    }
 }

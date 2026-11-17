@@ -56,7 +56,14 @@ impl BatchBuilder {
             has_index_tasks: false,
             task_types: TaskTypes::default(),
             priority: CommitPriority::Default,
+            atomic: false,
         }
+    }
+
+    pub fn new_atomic() -> Self {
+        let mut batch = Self::new();
+        batch.atomic = true;
+        batch
     }
 
     pub fn with_priority(priority: CommitPriority) -> Self {
@@ -671,6 +678,9 @@ impl BatchBuilder {
     }
 
     pub fn add_commit_point(&mut self) -> &mut Self {
+        if self.atomic {
+            return self;
+        }
         self.serialize_changes();
         self.flush_counters();
         self.sort_allocations_for_lock_order();
@@ -1087,3 +1097,41 @@ impl Default for BatchBuilder {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/store/src/write/batch/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod commit_point_mode_tests {
+    use super::*;
+    use crate::write::{AnyClass, ValueClass};
+
+    #[test]
+    fn atomic_builder_suppresses_splits_and_default_builder_still_splits() {
+        let mut split = BatchBuilder::new();
+        for index in 0..=MAX_COMMIT_OPS {
+            split
+                .set(
+                    ValueClass::Any(AnyClass {
+                        subspace: Subspace::System,
+                        key: index.to_be_bytes().to_vec(),
+                    }),
+                    Vec::<u8>::new(),
+                )
+                .commit_point();
+        }
+        assert_eq!(split.commit_point_count(), 1);
+
+        let mut atomic = BatchBuilder::new_atomic();
+        for index in 0..=MAX_COMMIT_OPS {
+            atomic
+                .set(
+                    ValueClass::Any(AnyClass {
+                        subspace: Subspace::System,
+                        key: index.to_be_bytes().to_vec(),
+                    }),
+                    Vec::<u8>::new(),
+                )
+                .commit_point();
+        }
+        atomic.add_commit_point().bulk_commit_point();
+        assert_eq!(atomic.commit_point_count(), 0);
+    }
+}

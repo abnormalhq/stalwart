@@ -40,6 +40,10 @@ pub struct ResourceState<'x> {
     pub path: &'x str,
 }
 
+pub(crate) fn if_exists_condition_matches(is_not: bool, exists: bool) -> bool {
+    exists ^ is_not
+}
+
 #[derive(Debug, Default, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct LockData {
     locks: VecMap<String, LockItems>,
@@ -649,7 +653,7 @@ impl LockRequestHandler for Server {
                         }
                     }
                     Condition::Exists { is_not } => {
-                        if !((resource_state.etag.is_some()) ^ is_not) {
+                        if !if_exists_condition_matches(*is_not, resource_state.etag.is_some()) {
                             continue 'outer;
                         }
                     }

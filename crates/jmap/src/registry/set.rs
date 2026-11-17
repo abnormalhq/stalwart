@@ -63,6 +63,9 @@ use registry::{
 };
 use services::task_manager::reconcile::schedule_replacing;
 use services::task_manager::tasks::rebuild_shares::RevokeAccountGrants;
+
+#[cfg(not(feature = "enterprise"))]
+use crate::registry::mapping::masked_email::validate_masked_email;
 use std::borrow::Cow;
 use store::{
     registry::{
@@ -377,6 +380,10 @@ async fn registry_object_set(
             ObjectInner::Role(role) => {
                 validate_role(access_token, role, modification.as_role()).await?
             }
+            #[cfg(not(feature = "enterprise"))]
+            ObjectInner::MaskedEmail(masked_email) => {
+                validate_masked_email(&set, masked_email, is_create, unpatched_properties).await?
+            }
             // SPDX-SnippetBegin
             // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
             // SPDX-License-Identifier: LicenseRef-SEL
@@ -648,7 +655,11 @@ async fn registry_object_set(
     ];
     // SPDX-SnippetEnd
     #[cfg(not(feature = "enterprise"))]
-    const ACCOUNT_ORPHAN_TYPES: &[ObjectType] = &[ObjectType::PublicKey, ObjectType::OAuthGrant];
+    const ACCOUNT_ORPHAN_TYPES: &[ObjectType] = &[
+        ObjectType::PublicKey,
+        ObjectType::MaskedEmail,
+        ObjectType::OAuthGrant,
+    ];
 
     // Process destroy
     for id in set.destroy.drain(..) {
@@ -939,6 +950,8 @@ impl RegistrySet for Server {
             | ObjectType::Tenant
             | ObjectType::MaskedEmail => registry_object_set(set).await,
             // SPDX-SnippetEnd
+            #[cfg(not(feature = "enterprise"))]
+            ObjectType::MaskedEmail => registry_object_set(set).await,
             ObjectType::ArfExternalReport
             | ObjectType::DmarcExternalReport
             | ObjectType::TlsExternalReport
