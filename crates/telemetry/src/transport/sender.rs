@@ -25,7 +25,7 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_rustls::TlsConnector;
 
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const USER_AGENT_VALUE: &str = concat!("Stalwart/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT_VALUE: &str = concat!("AbnormalMailServer/", env!("CARGO_PKG_VERSION"));
 const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
 const CONTENT_TYPE_GRPC: &str = "application/grpc";
 const GRPC_TIMEOUT: &str = "grpc-timeout";

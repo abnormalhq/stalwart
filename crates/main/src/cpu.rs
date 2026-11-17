@@ -21,7 +21,7 @@ const LAHF_SAHF: u32 = 1 << 0;
 const FEATURES_X86_64_V2: u32 = SSE3 | SSSE3 | CMPXCHG16B | SSE4_1 | SSE4_2 | POPCNT;
 const EXTENDED_FEATURES_X86_64_V2: u32 = LAHF_SAHF;
 
-const UNSUPPORTED_CPU: &[u8] = b"This build of Stalwart requires an x86-64-v2 compatible CPU (SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, CMPXCHG16B and LAHF/SAHF). If Stalwart runs in a virtual machine, set its CPU type to 'host' or 'x86-64-v2'.\n";
+const UNSUPPORTED_CPU: &[u8] = b"This build of Abnormal Mail Server requires an x86-64-v2 compatible CPU (SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, CMPXCHG16B and LAHF/SAHF). If it runs in a virtual machine, set its CPU type to 'host' or 'x86-64-v2'.\n";
 const EXIT_UNSUPPORTED_CPU: i32 = 1;
 
 #[used]

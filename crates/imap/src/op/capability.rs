@@ -80,14 +80,7 @@ impl<T: SessionStream> Session<T> {
         self.write_bytes(
             StatusResponse::completed(Command::Id)
                 .with_tag(arguments.tag)
-                .serialize(
-                    concat!(
-                        "* ID (\"name\" \"Stalwart\" \"version\" \"1.0.0\" \"vendor\" \"Stalwart Labs LLC\" ",
-                        "\"support-url\" \"https://stalw.art\")\r\n"
-                    )
-                    .as_bytes()
-                    .to_vec(),
-                ),
+                .serialize(b"* ID NIL\r\n".to_vec()),
         )
         .await
     }

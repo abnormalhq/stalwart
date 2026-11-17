@@ -105,10 +105,8 @@ impl<T: SessionStream> Session<T> {
                         .caused_by(trc::location!())?;
                 }
                 if not_deleted.is_empty() {
-                    self.write_ok(format!(
-                        "Stalwart POP3 bids you farewell ({num_deleted} messages deleted)."
-                    ))
-                    .await?;
+                    self.write_ok(format!("Logging out ({num_deleted} messages deleted)."))
+                        .await?;
                 } else {
                     self.write_bytes(
                         Response::Err::<u32>("Some messages could not be deleted".into())
@@ -117,11 +115,10 @@ impl<T: SessionStream> Session<T> {
                     .await?;
                 }
             } else {
-                self.write_ok("Stalwart POP3 bids you farewell (no messages deleted).")
-                    .await?;
+                self.write_ok("Logging out (no messages deleted).").await?;
             }
         } else {
-            self.write_ok("Stalwart POP3 bids you farewell.").await?;
+            self.write_ok("Logging out.").await?;
         }
 
         trc::event!(

@@ -12,7 +12,7 @@ use store::write::{AnyClass, AnyKey, BatchBuilder, ValueClass};
 use store::{IterateParams, Shape, Store, Subspace};
 
 const HELP: &str = concat!(
-    "Stalwart Server v",
+    "Abnormal Mail Server v",
     env!("CARGO_PKG_VERSION"),
     r#" Data Store CLI
 

@@ -54,27 +54,6 @@ async fn insert_safe_defaults(bp: &mut Bootstrap) -> trc::Result<()> {
     let is_recovery_mode = bp.registry.is_recovery_mode();
     let is_bootstrap_mode = bp.registry.is_bootstrap_mode();
 
-    #[cfg(not(stalwart_tests))]
-    if bp.registry.count_object(ObjectType::Application).await? == 0 {
-        bp.registry
-            .write(RegistryWrite::insert(
-                &Application {
-                    description: "Stalwart Web Interface".to_string(),
-                    enable: true,
-                    #[cfg(not(feature = "dev_mode"))]
-                    resource_url:
-                        "https://github.com/stalwartlabs/webui/releases/download/v2/webui.zip"
-                            .into(),
-                    #[cfg(feature = "dev_mode")]
-                    resource_url: "file://../webui/.ignore/webui.zip".into(),
-                    url_prefix: Map::new(vec!["/admin".into(), "/account".into()]),
-                    ..Default::default()
-                }
-                .into(),
-            ))
-            .await?;
-    }
-
     if is_bootstrap_mode {
         #[cfg(not(any(feature = "dev_mode", stalwart_tests)))]
         if bp.registry.count_object(ObjectType::SystemSettings).await? == 0 {

@@ -16397,9 +16397,10 @@ impl DmarcTroubleshoot {
         if value.is_empty() {
             errors.push(ValidationError::required(Property::EhloDomain));
         }
-        let value = &self.mail_from;
-        if value.is_empty() {
-            errors.push(ValidationError::required(Property::MailFrom));
+        if let Some(value) = &self.mail_from {
+            if value.is_empty() {
+                errors.push(ValidationError::required(Property::MailFrom));
+            }
         }
         let value = &self.rcpt_to;
         for value in value.iter() {
@@ -28731,15 +28732,7 @@ impl RegistryJsonPropertyPatch for DnsServerNamecheap {
 impl DnsServerNetcup {
     fn validate(&self, errors: &mut Vec<ValidationError>) -> bool {
         let neb = errors.len();
-        let value = &self.customer_number;
-        if value.is_empty() {
-            errors.push(ValidationError::required(Property::CustomerNumber));
-        }
-        let value = &self.api_key_id;
-        if value.is_empty() {
-            errors.push(ValidationError::required(Property::ApiKeyId));
-        }
-        let value = &self.password;
+        let value = &self.api_key;
         value.validate(errors);
         let value = &self.description;
         if value.is_empty() {
@@ -28798,10 +28791,10 @@ impl Pickle for DnsServerNetcup {
         if self.propagation_delay.is_some() {
             bitmap |= 1 << 1;
         }
-        let block = crate::pickle::begin_block(out, 10, 2, bitmap);
-        self.customer_number.pickle(out);
-        self.api_key_id.pickle(out);
-        self.password.pickle(out);
+        let block = crate::pickle::begin_block(out, 11, 2, bitmap);
+        <String as Default>::default().pickle(out);
+        <String as Default>::default().pickle(out);
+        <SecretKey as Default>::default().pickle(out);
         self.description.pickle(out);
         // SPDX-SnippetBegin
         // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -28818,26 +28811,21 @@ impl Pickle for DnsServerNetcup {
         if let Some(value) = &self.propagation_delay {
             value.pickle(out);
         }
+        self.api_key.pickle(out);
         crate::pickle::end_block(out, block);
     }
 
     fn unpickle(stream: &mut crate::pickle::PickledStream<'_>) -> Option<Self> {
         let block = stream.open_block()?;
-        let field0: String = if block.has(0) {
-            Pickle::unpickle(stream)?
-        } else {
-            Default::default()
-        };
-        let field1: String = if block.has(1) {
-            Pickle::unpickle(stream)?
-        } else {
-            Default::default()
-        };
-        let field2: SecretKey = if block.has(2) {
-            Pickle::unpickle(stream)?
-        } else {
-            Default::default()
-        };
+        if block.has(0) {
+            let _: String = Pickle::unpickle(stream)?;
+        }
+        if block.has(1) {
+            let _: String = Pickle::unpickle(stream)?;
+        }
+        if block.has(2) {
+            let _: SecretKey = Pickle::unpickle(stream)?;
+        }
         let field3: String = if block.has(3) {
             Pickle::unpickle(stream)?
         } else {
@@ -28886,11 +28874,13 @@ impl Pickle for DnsServerNetcup {
         } else {
             Default::default()
         };
+        let field10: SecretKey = if block.has(10) {
+            Pickle::unpickle(stream)?
+        } else {
+            Default::default()
+        };
         stream.close_block(block);
         Some(Self {
-            customer_number: field0,
-            api_key_id: field1,
-            password: field2,
             description: field3,
             // SPDX-SnippetBegin
             // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -28903,6 +28893,7 @@ impl Pickle for DnsServerNetcup {
             poll_interval: field7,
             propagation_timeout: field8,
             propagation_delay: field9,
+            api_key: field10,
         })
     }
 }
@@ -28910,9 +28901,7 @@ impl Pickle for DnsServerNetcup {
 impl Default for DnsServerNetcup {
     fn default() -> Self {
         Self {
-            customer_number: Default::default(),
-            api_key_id: Default::default(),
-            password: Default::default(),
+            api_key: Default::default(),
             description: Default::default(),
             // SPDX-SnippetBegin
             // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -28935,13 +28924,8 @@ impl IntoValue for DnsServerNetcup {
     }
 
     fn into_value_with(self, opts: ValueOptions) -> JmapValue<'static> {
-        let mut map = jmap_tools::Map::with_capacity(12);
-        map.insert_unchecked(
-            Property::CustomerNumber,
-            self.customer_number.into_value_with(opts),
-        );
-        map.insert_unchecked(Property::ApiKeyId, self.api_key_id.into_value_with(opts));
-        map.insert_unchecked(Property::Password, self.password.into_value_with(opts));
+        let mut map = jmap_tools::Map::with_capacity(10);
+        map.insert_unchecked(Property::ApiKey, self.api_key.into_value_with(opts));
         map.insert_unchecked(
             Property::Description,
             self.description.into_value_with(opts),
@@ -28980,13 +28964,16 @@ impl RegistryJsonPropertyPatch for DnsServerNetcup {
         value: JmapValue<'x>,
     ) -> PatchResult<'x> {
         match pointer.next_property() {
-            Some(Property::CustomerNumber) => self
-                .customer_number
-                .patch(pointer.with_validators(&[StringValidator::Trim]), value),
-            Some(Property::ApiKeyId) => self
-                .api_key_id
-                .patch(pointer.with_validators(&[StringValidator::Trim]), value),
-            Some(Property::Password) => self.password.patch(pointer, value),
+            Some(property @ Property::CustomerNumber) => {
+                Ok(MaybeUnpatched::Unpatched { property, value })
+            }
+            Some(property @ Property::ApiKeyId) => {
+                Ok(MaybeUnpatched::Unpatched { property, value })
+            }
+            Some(property @ Property::Password) => {
+                Ok(MaybeUnpatched::Unpatched { property, value })
+            }
+            Some(Property::ApiKey) => self.api_key.patch(pointer, value),
             Some(Property::Description) => self
                 .description
                 .patch(pointer.with_validators(&[StringValidator::Trim]), value),
@@ -34664,6 +34651,13 @@ impl ObjectImpl for Email {
             }
         }
         // SPDX-SnippetEnd
+
+        #[cfg(not(feature = "enterprise"))]
+        if let Some(value) = &self.max_masked_addresses {
+            if *value < 1 {
+                errors.push(ValidationError::min_value(Property::MaxMaskedAddresses, 1));
+            }
+        }
         if let Some(value) = &self.max_public_keys {
             if *value < 1 {
                 errors.push(ValidationError::min_value(Property::MaxPublicKeys, 1));
@@ -34726,6 +34720,11 @@ impl Pickle for Email {
             bitmap |= 1 << 6;
         }
         // SPDX-SnippetEnd
+
+        #[cfg(not(feature = "enterprise"))]
+        if self.max_masked_addresses.is_some() {
+            bitmap |= 1 << 6;
+        }
         if self.max_public_keys.is_some() {
             bitmap |= 1 << 7;
         }
@@ -34759,6 +34758,11 @@ impl Pickle for Email {
             value.pickle(out);
         }
         // SPDX-SnippetEnd
+
+        #[cfg(not(feature = "enterprise"))]
+        if let Some(value) = &self.max_masked_addresses {
+            value.pickle(out);
+        }
         if let Some(value) = &self.max_public_keys {
             value.pickle(out);
         }
@@ -34858,6 +34862,17 @@ impl Pickle for Email {
             Some(5u64)
         };
         // SPDX-SnippetEnd
+
+        #[cfg(not(feature = "enterprise"))]
+        let field12: Option<u64> = if block.has(12) {
+            if block.flag(6) {
+                Some(Pickle::unpickle(stream)?)
+            } else {
+                None
+            }
+        } else {
+            Some(5u64)
+        };
         let field13: Option<u64> = if block.has(13) {
             if block.flag(7) {
                 Some(Pickle::unpickle(stream)?)
@@ -34919,6 +34934,9 @@ impl Pickle for Email {
             #[cfg(feature = "enterprise")]
             max_masked_addresses: field12,
             // SPDX-SnippetEnd
+
+            #[cfg(not(feature = "enterprise"))]
+            max_masked_addresses: field12,
             max_public_keys: field13,
             max_mailboxes_per_email: field14,
             max_flags_per_email: field15,
@@ -34950,6 +34968,9 @@ impl Default for Email {
             #[cfg(feature = "enterprise")]
             max_masked_addresses: Some(5u64),
             // SPDX-SnippetEnd
+
+            #[cfg(not(feature = "enterprise"))]
+            max_masked_addresses: Some(5u64),
             max_public_keys: Some(5u64),
             max_mailboxes_per_email: 100u64,
             max_flags_per_email: 100u64,
@@ -35020,6 +35041,12 @@ impl IntoValue for Email {
             self.max_masked_addresses.into_value_with(opts),
         );
         // SPDX-SnippetEnd
+
+        #[cfg(not(feature = "enterprise"))]
+        map.insert_unchecked(
+            Property::MaxMaskedAddresses,
+            self.max_masked_addresses.into_value_with(opts),
+        );
         map.insert_unchecked(
             Property::MaxPublicKeys,
             self.max_public_keys.into_value_with(opts),
@@ -35082,6 +35109,9 @@ impl RegistryJsonPropertyPatch for Email {
             #[cfg(feature = "enterprise")]
             Some(Property::MaxMaskedAddresses) => self.max_masked_addresses.patch(pointer, value),
             // SPDX-SnippetEnd
+
+            #[cfg(not(feature = "enterprise"))]
+            Some(Property::MaxMaskedAddresses) => self.max_masked_addresses.patch(pointer, value),
             Some(Property::MaxPublicKeys) => self.max_public_keys.patch(pointer, value),
             Some(Property::MaxMailboxesPerEmail) => {
                 self.max_mailboxes_per_email.patch(pointer, value)
@@ -43877,6 +43907,261 @@ impl RegistryJsonPropertyPatch for MaskedEmail {
 }
 
 // SPDX-SnippetEnd
+
+#[cfg(not(feature = "enterprise"))]
+impl ObjectImpl for MaskedEmail {
+    const FLAGS: u64 = OBJ_FILTER_ACCOUNT;
+    const VERSION: u8 = 0;
+    const OBJECT: ObjectType = ObjectType::MaskedEmail;
+
+    fn validate(&self, errors: &mut Vec<ValidationError>) -> bool {
+        let neb = errors.len();
+        let value = &self.account_id;
+        if !value.is_valid() {
+            errors.push(ValidationError::required(Property::AccountId));
+        }
+        let value = &self.email;
+        if value.is_empty() {
+            errors.push(ValidationError::required(Property::Email));
+        }
+        if let Some(value) = &self.description {
+            if value.is_empty() {
+                errors.push(ValidationError::required(Property::Description));
+            }
+        }
+        if let Some(value) = &self.for_domain {
+            if value.is_empty() {
+                errors.push(ValidationError::required(Property::ForDomain));
+            }
+        }
+        let value = &self.created_at;
+        if !value.is_valid() {
+            errors.push(ValidationError::invalid(Property::CreatedAt, value));
+        }
+        if let Some(value) = &self.created_by {
+            if value.is_empty() {
+                errors.push(ValidationError::required(Property::CreatedBy));
+            }
+        }
+        if let Some(value) = &self.expires_at {
+            if !value.is_valid() {
+                errors.push(ValidationError::invalid(Property::ExpiresAt, value));
+            }
+        }
+        if let Some(value) = &self.url {
+            if value.is_empty() {
+                errors.push(ValidationError::required(Property::Url));
+            }
+        }
+        errors.len() == neb
+    }
+
+    fn index<'x>(&'x self, i: &mut IndexBuilder<'x>) {
+        i.foreign_key(ObjectType::Account, self.account_id.into(), None);
+        i.search(Property::AccountId, &self.account_id);
+    }
+}
+
+#[cfg(not(feature = "enterprise"))]
+impl Pickle for MaskedEmail {
+    fn pickle(&self, out: &mut Vec<u8>) {
+        let mut bitmap = 0u64;
+        if self.enable {
+            bitmap |= 1 << 0;
+        }
+        if self.description.is_some() {
+            bitmap |= 1 << 1;
+        }
+        if self.for_domain.is_some() {
+            bitmap |= 1 << 2;
+        }
+        if self.created_by.is_some() {
+            bitmap |= 1 << 3;
+        }
+        if self.expires_at.is_some() {
+            bitmap |= 1 << 4;
+        }
+        if self.url.is_some() {
+            bitmap |= 1 << 5;
+        }
+        let block = crate::pickle::begin_block(out, 9, 6, bitmap);
+        self.account_id.pickle(out);
+        self.email.pickle(out);
+        if let Some(value) = &self.description {
+            value.pickle(out);
+        }
+        if let Some(value) = &self.for_domain {
+            value.pickle(out);
+        }
+        self.created_at.pickle(out);
+        if let Some(value) = &self.created_by {
+            value.pickle(out);
+        }
+        if let Some(value) = &self.expires_at {
+            value.pickle(out);
+        }
+        if let Some(value) = &self.url {
+            value.pickle(out);
+        }
+        crate::pickle::end_block(out, block);
+    }
+
+    fn unpickle(stream: &mut crate::pickle::PickledStream<'_>) -> Option<Self> {
+        if stream.version() > Self::VERSION {
+            return None;
+        }
+        let block = stream.open_block()?;
+        let field0: bool = if block.has(0) { block.flag(0) } else { true };
+        let field1: Id = if block.has(1) {
+            Pickle::unpickle(stream)?
+        } else {
+            Default::default()
+        };
+        let field2: String = if block.has(2) {
+            Pickle::unpickle(stream)?
+        } else {
+            Default::default()
+        };
+        let field3: Option<String> = if block.has(3) {
+            if block.flag(1) {
+                Some(Pickle::unpickle(stream)?)
+            } else {
+                None
+            }
+        } else {
+            Default::default()
+        };
+        let field4: Option<String> = if block.has(4) {
+            if block.flag(2) {
+                Some(Pickle::unpickle(stream)?)
+            } else {
+                None
+            }
+        } else {
+            Default::default()
+        };
+        let field5: UTCDateTime = if block.has(5) {
+            Pickle::unpickle(stream)?
+        } else {
+            Default::default()
+        };
+        let field6: Option<String> = if block.has(6) {
+            if block.flag(3) {
+                Some(Pickle::unpickle(stream)?)
+            } else {
+                None
+            }
+        } else {
+            Default::default()
+        };
+        let field7: Option<UTCDateTime> = if block.has(7) {
+            if block.flag(4) {
+                Some(Pickle::unpickle(stream)?)
+            } else {
+                None
+            }
+        } else {
+            Default::default()
+        };
+        let field8: Option<String> = if block.has(8) {
+            if block.flag(5) {
+                Some(Pickle::unpickle(stream)?)
+            } else {
+                None
+            }
+        } else {
+            Default::default()
+        };
+        stream.close_block(block);
+        Some(Self {
+            enable: field0,
+            account_id: field1,
+            email: field2,
+            description: field3,
+            for_domain: field4,
+            created_at: field5,
+            created_by: field6,
+            expires_at: field7,
+            url: field8,
+        })
+    }
+}
+
+#[cfg(not(feature = "enterprise"))]
+impl Default for MaskedEmail {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            account_id: Default::default(),
+            email: Default::default(),
+            description: Default::default(),
+            for_domain: Default::default(),
+            created_at: Default::default(),
+            created_by: Default::default(),
+            expires_at: Default::default(),
+            url: Default::default(),
+        }
+    }
+}
+
+#[cfg(not(feature = "enterprise"))]
+impl IntoValue for MaskedEmail {
+    fn into_value(self) -> JmapValue<'static> {
+        self.into_value_with(ValueOptions::default())
+    }
+
+    fn into_value_with(self, opts: ValueOptions) -> JmapValue<'static> {
+        let mut map = jmap_tools::Map::with_capacity(11);
+        map.insert_unchecked(Property::Enable, self.enable.into_value_with(opts));
+        map.insert_unchecked(Property::AccountId, self.account_id.into_value_with(opts));
+        map.insert_unchecked(Property::Email, self.email.into_value_with(opts));
+        map.insert_unchecked(
+            Property::Description,
+            self.description.into_value_with(opts),
+        );
+        map.insert_unchecked(Property::ForDomain, self.for_domain.into_value_with(opts));
+        map.insert_unchecked(Property::CreatedAt, self.created_at.into_value_with(opts));
+        map.insert_unchecked(Property::CreatedBy, self.created_by.into_value_with(opts));
+        map.insert_unchecked(Property::ExpiresAt, self.expires_at.into_value_with(opts));
+        map.insert_unchecked(Property::Url, self.url.into_value_with(opts));
+        JmapValue::Object(map)
+    }
+}
+
+#[cfg(not(feature = "enterprise"))]
+impl RegistryJsonPropertyPatch for MaskedEmail {
+    fn patch_property<'x>(
+        &mut self,
+        mut pointer: JsonPointerPatch<'_>,
+        value: JmapValue<'x>,
+    ) -> PatchResult<'x> {
+        match pointer.next_property() {
+            Some(Property::Enable) => self.enable.patch(pointer, value),
+            Some(Property::AccountId) => self
+                .account_id
+                .patch(pointer.assert_read_only()?.assert_can_set_account()?, value),
+            Some(Property::Email) => pointer.assert_server_set(),
+            Some(Property::Description) => self.description.patch(pointer, value),
+            Some(Property::ForDomain) => self.for_domain.patch(pointer, value),
+            Some(Property::CreatedAt) => pointer.assert_server_set(),
+            Some(Property::CreatedBy) => self.created_by.patch(pointer, value),
+            Some(Property::ExpiresAt) => self.expires_at.patch(pointer.assert_read_only()?, value),
+            Some(Property::Url) => self.url.patch(pointer, value),
+            Some(property @ Property::EmailPrefix) => {
+                Ok(MaybeUnpatched::Unpatched { property, value })
+            }
+            Some(property @ Property::EmailDomain) => {
+                Ok(MaybeUnpatched::Unpatched { property, value })
+            }
+            Some(Property::Type) => Ok(MaybeUnpatched::Unpatched {
+                property: Property::Type,
+                value,
+            }),
+            _ => Err(PatchError::new(pointer, "Invalid property")),
+        }
+    }
+}
+
 impl MeilisearchStore {
     fn validate(&self, errors: &mut Vec<ValidationError>) -> bool {
         let neb = errors.len();
@@ -49526,7 +49811,7 @@ impl MtaStageConnect {
         ExpressionContext {
             expr: &self.smtp_greeting,
             default: Some(Expression {
-                else_: "system('hostname') + ' Stalwart ESMTP at your service'".to_string(),
+                else_: "system('hostname') + ' ESMTP ready'".to_string(),
                 ..Default::default()
             }),
             property: Property::SmtpGreeting,
@@ -49588,7 +49873,7 @@ impl Pickle for MtaStageConnect {
             Pickle::unpickle(stream)?
         } else {
             Expression {
-                else_: "system('hostname') + ' Stalwart ESMTP at your service'".to_string(),
+                else_: "system('hostname') + ' ESMTP ready'".to_string(),
                 ..Default::default()
             }
         };
@@ -49621,7 +49906,7 @@ impl Default for MtaStageConnect {
     fn default() -> Self {
         Self {
             smtp_greeting: Expression {
-                else_: "system('hostname') + ' Stalwart ESMTP at your service'".to_string(),
+                else_: "system('hostname') + ' ESMTP ready'".to_string(),
                 ..Default::default()
             },
             hostname: Expression {
@@ -64498,9 +64783,10 @@ impl SpamClassify {
                 errors.push(ValidationError::required(Property::AuthenticatedAs));
             }
         }
-        let value = &self.mail_from;
-        if value.is_empty() {
-            errors.push(ValidationError::required(Property::MailFrom));
+        if let Some(value) = &self.mail_from {
+            if value.is_empty() {
+                errors.push(ValidationError::required(Property::MailFrom));
+            }
         }
         let value = &self.rcpt_to;
         for value in value.iter() {

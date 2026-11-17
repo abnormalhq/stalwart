@@ -2279,6 +2279,17 @@ pub enum Permission {
     #[cfg(feature = "enterprise")]
     SysMaskedEmailQuery = 401,
     // SPDX-SnippetEnd
+
+    #[cfg(not(feature = "enterprise"))]
+    SysMaskedEmailGet = 397,
+    #[cfg(not(feature = "enterprise"))]
+    SysMaskedEmailCreate = 398,
+    #[cfg(not(feature = "enterprise"))]
+    SysMaskedEmailUpdate = 399,
+    #[cfg(not(feature = "enterprise"))]
+    SysMaskedEmailDestroy = 400,
+    #[cfg(not(feature = "enterprise"))]
+    SysMaskedEmailQuery = 401,
     SysMemoryLookupKeyGet = 402,
     SysMemoryLookupKeyCreate = 403,
     SysMemoryLookupKeyUpdate = 404,
@@ -3020,7 +3031,7 @@ pub enum SpamClassifierModelType {
 pub enum SpamClassifyParameters {
     #[default]
     Bit7 = 0,
-    Bit8Mime8BitMIMEMessageContent = 1,
+    Bit8Mime = 1,
     BinaryMime = 2,
     SmtpUtf8 = 3,
 }
@@ -3152,6 +3163,9 @@ pub enum StorageQuota {
     #[cfg(feature = "enterprise")]
     MaxMaskedAddresses = 14,
     // SPDX-SnippetEnd
+
+    #[cfg(not(feature = "enterprise"))]
+    MaxMaskedAddresses = 14,
     MaxAppPasswords = 15,
     MaxApiKeys = 16,
     MaxPublicKeys = 17,

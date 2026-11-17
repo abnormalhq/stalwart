@@ -594,7 +594,7 @@ impl SieveScriptIngest for Server {
         );
         ctx.set_user_address(mail_from);
         ctx.set_envelope(Envelope::From, envelope_from);
-        ctx.set_envelope(Envelope::To, envelope_to.address.as_str());
+        ctx.set_envelope(Envelope::To, envelope_to.envelope_to());
         if let Some(orcpt) = envelope_to.orcpt_parameter() {
             ctx.set_envelope(Envelope::Orcpt, orcpt);
         }
@@ -1113,7 +1113,7 @@ async fn verified_script<'x>(
 fn write_received_header(buf: &mut Vec<u8>, hostname: &str, id: u64) {
     buf.extend_from_slice(b"Received: from localhost (localhost [127.0.0.1])\r\n\tby ");
     buf.extend_from_slice(hostname.as_bytes());
-    buf.extend_from_slice(b" (Stalwart SMTP) with LMTP id ");
+    buf.extend_from_slice(b" with LMTP id ");
     buf.extend_from_slice(format!("{id:X}").as_bytes());
     buf.extend_from_slice(b";\r\n\t");
     buf.extend_from_slice(Date::now().to_rfc822().as_bytes());

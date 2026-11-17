@@ -7,6 +7,7 @@
 use super::{resource::ResourceIdentifiers, *};
 use crate::{
     expr::if_block::{BootstrapExprExt, IfBlock},
+    manager::app_client::is_reserved_console_prefix,
     network::{
         autoconfig::pacc::{
             Authentication, Configuration, HttpServer, Info, Logo, OAuthPublic, Protocols,
@@ -26,6 +27,7 @@ use registry::schema::{
         SystemSettings, TaskManager,
     },
 };
+use reqwest::Url;
 use std::{str::FromStr, time::Duration};
 use utils::{map::vec_map::VecMap, memory::available_memory};
 
@@ -201,7 +203,7 @@ impl Network {
             }),
             info: Info {
                 provider: Provider {
-                    name: "Stalwart".into(),
+                    name: "Abnormal Mail".into(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -509,9 +511,50 @@ impl Http {
             },
             response_headers: http_headers,
             remote_ip_source: RemoteIpSource::new(http.client_ip_source, http.forwarded_hops),
-            redirect_root: http.redirect_root,
+            redirect_root: normalize_redirect_root(http.redirect_root),
         }
     }
+}
+
+const CONSOLE_ROOT: &str = "https://console.abnormalhq.com/";
+
+fn normalize_redirect_root(redirect_root: Option<String>) -> Option<String> {
+    redirect_root.map(|redirect_root| {
+        if Url::parse(&redirect_root).is_ok() || redirect_root.starts_with("//") {
+            return redirect_root;
+        }
+
+        let base = Url::parse(CONSOLE_ROOT).expect("valid Console root URL");
+        let Ok(resolved) = base.join(&redirect_root) else {
+            return redirect_root;
+        };
+
+        let path = resolved.path();
+        if is_reserved_console_prefix(path) {
+            return CONSOLE_ROOT.to_string();
+        }
+        if path == "/" {
+            return CONSOLE_ROOT.to_string();
+        }
+
+        let path_end = redirect_root
+            .find(['?', '#'])
+            .unwrap_or(redirect_root.len());
+        if redirect_root.starts_with('/') && &redirect_root[..path_end] == path {
+            return redirect_root;
+        }
+
+        let mut normalized = path.to_string();
+        if let Some(query) = resolved.query() {
+            normalized.push('?');
+            normalized.push_str(query);
+        }
+        if let Some(fragment) = resolved.fragment() {
+            normalized.push('#');
+            normalized.push_str(fragment);
+        }
+        normalized
+    })
 }
 
 impl AsnGeoLookupConfig {
@@ -578,6 +621,86 @@ impl ClusterRoles {
             ClusterTaskType::OutboundMta => self.outbound_mta = enabled,
             ClusterTaskType::TaskQueueProcessing => self.task_manager = enabled,
             ClusterTaskType::TaskScheduler => self.task_scheduler = enabled,
+        }
+    }
+}
+
+#[cfg(test)]
+mod community_redirect_root_tests {
+    use super::{CONSOLE_ROOT, normalize_redirect_root};
+
+    #[test]
+    fn normalizes_legacy_admin_and_account_redirects() {
+        for path in [
+            "/admin",
+            "/admin/",
+            "/admin/settings?tab=mail#security",
+            "/account",
+            "/account/",
+            "/account/security?tab=login#devices",
+        ] {
+            assert_eq!(
+                normalize_redirect_root(Some(path.to_string())).as_deref(),
+                Some(CONSOLE_ROOT)
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_explicit_destinations_and_disabled_redirects() {
+        for target in [
+            "https://other.example/admin",
+            "https://other.example/",
+            "//other.example/",
+            "/settings?tab=mail#top",
+        ] {
+            assert_eq!(
+                normalize_redirect_root(Some(target.to_string())).as_deref(),
+                Some(target)
+            );
+        }
+        assert_eq!(normalize_redirect_root(None), None);
+    }
+
+    #[test]
+    fn maps_root_resolving_destinations_to_console_root() {
+        for target in [
+            "",
+            "/",
+            ".",
+            "..",
+            "../",
+            "./?tab=x",
+            "#fragment",
+            "/a/..",
+            "/%2e",
+            "/a/%2E%2e/",
+        ] {
+            assert_eq!(
+                normalize_redirect_root(Some(target.to_string())).as_deref(),
+                Some(CONSOLE_ROOT),
+                "target: {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchors_relative_destinations_and_normalizes_dot_segments() {
+        for (target, expected) in [
+            ("webmail/", "/webmail/"),
+            ("./webmail/", "/webmail/"),
+            ("../webmail/?tab=inbox#top", "/webmail/?tab=inbox#top"),
+            ("/webmail/", "/webmail/"),
+            ("/webmail/../calendar/", "/calendar/"),
+            ("admin/../webmail/", "/webmail/"),
+            ("webmail/../admin", CONSOLE_ROOT),
+            ("../account/settings", CONSOLE_ROOT),
+            ("/webmail/../account", CONSOLE_ROOT),
+        ] {
+            assert_eq!(
+                normalize_redirect_root(Some(target.to_string())).as_deref(),
+                Some(expected)
+            );
         }
     }
 }

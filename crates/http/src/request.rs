@@ -29,7 +29,7 @@ use common::{
     config::telemetry::PrometheusAuth,
     ipc::PushEvent,
     manager::{
-        app_client::APP_CLIENT_DOCUMENT,
+        app_client::{APP_CLIENT_DOCUMENT, is_reserved_console_prefix},
         application::{AppClientDocument, Resource},
     },
     network::{
@@ -817,6 +817,12 @@ impl ParseHttp for Server {
                     .with_header(CONTENT_SECURITY_POLICY, "frame-ancestors 'none'")
                     .with_binary_body(LOGIN_PAGE));
             }
+            reserved_prefix if is_reserved_console_prefix(reserved_prefix) => {
+                return Ok(reserved_prefix_response(
+                    req.method(),
+                    self.core.network.http.redirect_root.as_deref(),
+                ));
+            }
             external => {
                 if path.next().is_none() {
                     if let Some((content_type, body)) = external
@@ -843,7 +849,7 @@ impl ParseHttp for Server {
                         }
                         return Ok(HttpResponse::redirect(format!("/{external}/")));
                     } else if let Some(url) = &self.core.network.http.redirect_root {
-                        return Ok(HttpResponse::redirect(url.clone()));
+                        return Ok(root_redirect_response(req.method(), url));
                     }
                 } else if req.uri().path().get(external.len() + 2..) == Some(APP_CLIENT_DOCUMENT)
                     && let Some(response) = match self
@@ -1134,6 +1140,117 @@ fn pacc_domain(host: &str) -> &str {
         .filter(|prefix| prefix.eq_ignore_ascii_case(PACC_HOST_PREFIX))
         .and_then(|_| host.get(PACC_HOST_PREFIX.len()..))
         .unwrap_or(host)
+}
+
+fn root_redirect_response(method: &Method, redirect_root: &str) -> HttpResponse {
+    if method != &Method::GET && method != &Method::HEAD {
+        return redirect_method_not_allowed_response();
+    }
+
+    let location = if redirect_root.contains('#') {
+        redirect_root.to_string()
+    } else {
+        format!("{redirect_root}#")
+    };
+    HttpResponse::redirect(location)
+        .with_header("Referrer-Policy", "no-referrer")
+        .with_no_cache()
+}
+
+fn redirect_method_not_allowed_response() -> HttpResponse {
+    HttpResponse::new(StatusCode::METHOD_NOT_ALLOWED)
+        .with_header(header::ALLOW, "GET, HEAD")
+        .with_no_cache()
+}
+
+fn reserved_prefix_response(method: &Method, redirect_root: Option<&str>) -> HttpResponse {
+    if method != &Method::GET && method != &Method::HEAD {
+        return redirect_method_not_allowed_response();
+    }
+
+    redirect_root.map_or_else(
+        || HttpResponse::new(StatusCode::NOT_FOUND).with_no_cache(),
+        |redirect_root| root_redirect_response(method, redirect_root),
+    )
+}
+
+#[cfg(test)]
+mod community_redirect_tests {
+    use super::{
+        HttpResponse, HttpResponseBody, Method, StatusCode, reserved_prefix_response,
+        root_redirect_response,
+    };
+
+    fn response_header<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a str> {
+        response.headers()?.get(name)?.to_str().ok()
+    }
+
+    #[test]
+    fn get_and_head_redirect_without_cache_or_referrer() {
+        for method in [&Method::GET, &Method::HEAD] {
+            let response = root_redirect_response(method, "https://console.abnormalhq.com/");
+            assert_eq!(response.status(), StatusCode::FOUND);
+            assert_eq!(
+                response_header(&response, "location"),
+                Some("https://console.abnormalhq.com/#")
+            );
+            assert_eq!(
+                response_header(&response, "referrer-policy"),
+                Some("no-referrer")
+            );
+            assert_eq!(
+                response_header(&response, "cache-control"),
+                Some("no-cache")
+            );
+            assert!(matches!(response.body(), HttpResponseBody::Empty));
+        }
+    }
+
+    #[test]
+    fn unsupported_methods_are_not_redirected() {
+        let response = root_redirect_response(&Method::POST, "https://console.abnormalhq.com/");
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response_header(&response, "allow"), Some("GET, HEAD"));
+        assert_eq!(response_header(&response, "location"), None);
+        assert!(matches!(response.body(), HttpResponseBody::Empty));
+    }
+
+    #[test]
+    fn disabled_reserved_route_is_not_found() {
+        let response = reserved_prefix_response(&Method::GET, None);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response_header(&response, "location"), None);
+        assert!(matches!(response.body(), HttpResponseBody::Empty));
+
+        let response = reserved_prefix_response(&Method::POST, None);
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response_header(&response, "allow"), Some("GET, HEAD"));
+        assert_eq!(response_header(&response, "location"), None);
+    }
+
+    #[test]
+    fn redirects_use_only_the_configured_destination() {
+        let request = hyper::Request::builder()
+            .method(Method::GET)
+            .uri("/account/recovery?token=secret")
+            .body(())
+            .unwrap();
+        let response =
+            root_redirect_response(request.method(), "https://console.example/path?tab=mail");
+        assert_eq!(
+            response_header(&response, "location"),
+            Some("https://console.example/path?tab=mail#")
+        );
+
+        let custom = "https://console.example/path?tab=mail#section";
+        let response = root_redirect_response(request.method(), custom);
+        assert_eq!(response_header(&response, "location"), Some(custom));
+        assert!(
+            !response_header(&response, "location")
+                .unwrap()
+                .contains("token")
+        );
+    }
 }
 
 #[cfg(all(test, stalwart_tests))]

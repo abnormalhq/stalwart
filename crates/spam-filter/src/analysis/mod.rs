@@ -24,6 +24,7 @@ pub mod ehlo;
 pub mod from;
 pub mod headers;
 pub mod html;
+mod image_size;
 pub mod init;
 pub mod ip;
 pub mod messageid;
