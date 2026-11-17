@@ -25,7 +25,7 @@ python3 scripts/generate-ui-assets.py --check
 python3 scripts/check-community.py
 cargo check --locked -p stalwart --no-default-features --features "sqlite postgres mysql rocks s3 redis keep azure nats"
 cargo test --locked -p common --no-default-features community_
-cargo test --locked -p http@1.1.0 --no-default-features community_redirect_tests
+cargo test --locked -p http@1.1.1 --no-default-features community_redirect_tests
 cargo test --locked -p spam-filter --no-default-features analysis::image_size::tests
 cargo test --locked -p spam-filter --no-default-features analysis::html::image_size_tests
 ```

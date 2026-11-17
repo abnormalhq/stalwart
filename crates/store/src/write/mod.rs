@@ -541,6 +541,7 @@ pub struct BatchBuilder {
     has_index_tasks: bool,
     task_types: TaskTypes,
     priority: CommitPriority,
+    atomic: bool,
     ops: Vec<Operation>,
 }
 

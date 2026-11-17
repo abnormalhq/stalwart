@@ -689,6 +689,8 @@ const REG_MAILING_LIST: u16 = ObjectType::MailingList as u16;
 #[cfg(feature = "enterprise")]
 const REG_MASKED_EMAIL: u16 = ObjectType::MaskedEmail as u16;
 // SPDX-SnippetEnd
+#[cfg(not(feature = "enterprise"))]
+const REG_MASKED_EMAIL: u16 = ObjectType::MaskedEmail as u16;
 const REG_PUBLIC_KEY: u16 = ObjectType::PublicKey as u16;
 const REPORT_EXTERNAL_ARF: u16 = ObjectType::ArfExternalReport as u16;
 const REPORT_EXTERNAL_DMARC: u16 = ObjectType::DmarcExternalReport as u16;
@@ -808,6 +810,8 @@ impl ValueClass {
                 RegistryClass::Item { object_id, .. } => match *object_id {
                     REG_ACCOUNT | REG_DOMAIN | REG_ROLE | REG_OAUTH_CLIENT | REG_MAILING_LIST
                     | REG_PUBLIC_KEY | REG_OAUTH_GRANT => Subspace::Directory,
+                    #[cfg(not(feature = "enterprise"))]
+                    REG_MASKED_EMAIL => Subspace::Directory,
                     // SPDX-SnippetBegin
                     // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
                     // SPDX-License-Identifier: LicenseRef-SEL
@@ -1280,3 +1284,88 @@ impl SearchIndex {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/store/src/write/key/tests.rs"]
 mod tests;
+
+#[cfg(all(test, not(feature = "enterprise"), feature = "sqlite"))]
+mod masked_email_key_tests {
+    use super::*;
+    use crate::{Store, write::BatchBuilder};
+    use registry::schema::structs::{DataStore, SqliteStore as SqliteConfig};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_DB_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDb(PathBuf);
+
+    impl TestDb {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "masked-email-key-{}-{}",
+                std::process::id(),
+                NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).expect("create SQLite test directory");
+            Self(path)
+        }
+
+        async fn open(&self) -> Store {
+            let store = Store::build(DataStore::Sqlite(SqliteConfig {
+                path: self.0.to_string_lossy().into_owned(),
+                pool_workers: Some(2),
+                pool_max_connections: Some(4),
+            }))
+            .await
+            .expect("open SQLite test store");
+            store.create_tables().await.expect("create SQLite tables");
+            store
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn masked_email_directory_record_persists_after_reopen() {
+        let db = TestDb::new();
+        let store = db.open().await;
+        let class = ValueClass::Registry(RegistryClass::Item {
+            object_id: REG_MASKED_EMAIL,
+            item_id: 27,
+        });
+        let key = ValueKey {
+            account_id: 0,
+            collection: 0,
+            document_id: 0,
+            class: class.clone(),
+        };
+
+        assert_eq!(key.subspace(), Subspace::Directory);
+        assert_eq!(
+            class.serialize(0, 0, 0, WITH_SUBSPACE).first().copied(),
+            Some(Subspace::Directory.byte())
+        );
+
+        let mut batch = BatchBuilder::new();
+        batch.set(class, 55u64.to_be_bytes());
+        store
+            .write_batch(&mut batch)
+            .await
+            .expect("write masked email registry record");
+        drop(store);
+
+        let store = db.open().await;
+        assert_eq!(
+            store
+                .get_value::<u64>(key)
+                .await
+                .expect("read masked email registry record"),
+            Some(55)
+        );
+    }
+}

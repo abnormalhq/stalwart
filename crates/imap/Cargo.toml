@@ -1,6 +1,6 @@
 [package]
 name = "imap"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 
 [dependencies]
@@ -25,6 +25,9 @@ compact_str = "0.10.0"
 
 [features]
 enterprise = ["directory/enterprise", "trc/enterprise", "store/enterprise", "common/enterprise", "email/enterprise", "utils/enterprise", "registry/enterprise"]
+
+[dev-dependencies]
+common = { path = "../common", features = ["test-utils"] }
 
 [lints]
 workspace = true

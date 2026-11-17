@@ -31,6 +31,7 @@ pub mod chunk;
 pub mod dav;
 pub mod document;
 pub mod encryption;
+pub mod groupware;
 pub mod index;
 pub mod metadata;
 pub mod quota;
