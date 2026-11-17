@@ -252,22 +252,26 @@ def main() -> None:
         ".github/workflows/auto-redirect-discussions.yml",
         ".github/workflows/ci-retry.yml",
         ".github/workflows/ci.yml",
-        ".github/workflows/scorecard.yml",
-        ".github/workflows/trivy.yml",
     ):
-        require("github.repository == 'stalwartlabs/stalwart'" in read(workflow),
-                f"Inherited upstream-only workflow is not repository-gated: {workflow}")
+        require(not (ROOT / workflow).exists(),
+                f"Upstream-only release/triage workflow must stay removed: {workflow}")
+    for workflow in sorted((ROOT / ".github/workflows").glob("*.y*ml")):
+        name = workflow.relative_to(ROOT)
+        source = workflow.read_text()
+        require("stalwartlabs/stalwart" not in source,
+                f"Workflow still targets the upstream repository: {name}")
+        require("github.repository == 'abnormalhq/stalwart'" in source,
+                f"Workflow is not gated to the fork repository: {name}")
     community_ci = read(".github/workflows/community-pr.yml")
     require("contents: read" in community_ci and "write" not in community_ci,
             "Community PR CI must use read-only permissions.")
     require(
         (
             "pull_request:\n    branches: [main, "
-            "devin/1794777185-community-debranding, "
             "devin/1794818404-capability-foundation]"
         )
         in community_ci,
-        "Community PR CI must run for the PR1 debranding and capability foundation targets.",
+        "Community PR CI must run for pull requests targeting main and the capability foundation branch.",
     )
     require(
         "push:\n    branches: [main]" in community_ci,
