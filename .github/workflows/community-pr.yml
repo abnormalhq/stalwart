@@ -3,7 +3,7 @@ name: Community PR CI
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, devin/1794777185-community-debranding]
+    branches: [main]
   push:
     branches: [main]
 
@@ -18,17 +18,22 @@ jobs:
   community:
     if: github.repository == 'abnormalhq/stalwart'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
 
       - name: Install libclang for RocksDB
         run: |
@@ -73,6 +78,7 @@ jobs:
   dav-fence-postgres:
     if: github.repository == 'abnormalhq/stalwart'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:16
@@ -93,9 +99,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
 
       - name: Run DAV PostgreSQL fence contract
         run: cargo test --locked -p dav --no-default-features --features test-postgres common::create::tests
