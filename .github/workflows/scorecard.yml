@@ -20,7 +20,7 @@ jobs:
     name: Scorecard analysis
     # publish_results only works from the default branch of this repository.
     if: github.repository == 'abnormalhq/stalwart' && github.event.repository.default_branch == github.ref_name
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
