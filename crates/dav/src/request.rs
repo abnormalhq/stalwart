@@ -980,6 +980,7 @@ mod server_integration_tests {
         AccessToken::from_permissions(
             account_id,
             [
+                Permission::DavFileGet,
                 Permission::DavFilePut,
                 Permission::DavFileCopy,
                 Permission::DavFileMove,
@@ -1054,6 +1055,27 @@ mod server_integration_tests {
             Err(DavError::Internal(err)) => panic!("unexpected DAV store error: {err:?}"),
             Err(DavError::Parse(err)) => panic!("unexpected DAV parse error: {err:?}"),
         }
+    }
+
+    async fn dispatch_once(
+        server: &Server,
+        access_token: AccessToken,
+        resource: DavResourceName,
+        method: DavMethod,
+        uri: &str,
+        destination: Option<&str>,
+    ) -> crate::Result<HttpResponse> {
+        let mut headers = RequestHeaders {
+            uri,
+            raw_uri: uri,
+            ..Default::default()
+        };
+        headers.destination = destination;
+        bounded(
+            server.dispatch_dav_request(&headers, access_token, resource, method, &[]),
+            "single DAV dispatch without conflict retry",
+        )
+        .await
     }
 
     async fn stats(
@@ -1664,6 +1686,221 @@ mod server_integration_tests {
                     "unexpected source retention after {method:?} collision"
                 );
             }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_copy_move_overwrite_folder_conflict_preserves_resources_until_retry() {
+        let _test_lock = INTEGRATION_TEST_LOCK.lock().await;
+        let primary = bounded(ServerFixture::new(), "build overwrite DAV server").await;
+        let account_id = bounded(
+            primary.create_user_account("dav-overwrite", "dav-overwrite.test"),
+            "seed overwrite DAV account",
+        )
+        .await;
+        let secondary = bounded(
+            primary.new_with_shared_primary(),
+            "build independent overwrite DAV server",
+        )
+        .await;
+        let resource = DavResourceName::File;
+        let base = resource.account_base_path("dav-overwrite@dav-overwrite.test");
+        let access = token(account_id);
+
+        for method in [DavMethod::COPY, DavMethod::MOVE] {
+            let suffix = if matches!(method, DavMethod::COPY) {
+                "copy"
+            } else {
+                "move"
+            };
+            let source_name = format!("source-{suffix}.txt");
+            let destination_name = format!("destination-{suffix}");
+            let source_uri = format!("{base}{source_name}");
+            let destination_uri = format!("{base}{destination_name}");
+            let old_child_uri = format!("{destination_uri}/old-child.txt");
+
+            assert_eq!(
+                dispatch_status(
+                    &primary.server,
+                    access.clone(),
+                    resource,
+                    DavMethod::MKCOL,
+                    &destination_uri,
+                    None,
+                    None,
+                    &[],
+                    false,
+                    false,
+                )
+                .await,
+                StatusCode::CREATED
+            );
+            assert_eq!(
+                dispatch_status(
+                    &primary.server,
+                    access.clone(),
+                    resource,
+                    DavMethod::PUT,
+                    &source_uri,
+                    None,
+                    Some("text/plain"),
+                    FILE_BODY,
+                    true,
+                    false,
+                )
+                .await,
+                StatusCode::CREATED
+            );
+            assert_eq!(
+                dispatch_status(
+                    &primary.server,
+                    access.clone(),
+                    resource,
+                    DavMethod::PUT,
+                    &old_child_uri,
+                    None,
+                    Some("text/plain"),
+                    b"old destination body\r\n",
+                    true,
+                    false,
+                )
+                .await,
+                StatusCode::CREATED
+            );
+            let _ = preload(&primary.server, account_id, SyncCollection::FileNode).await;
+            let _ = preload(&secondary.server, account_id, SyncCollection::FileNode).await;
+
+            let (prepared, resume) = crate::file::copy_move::set_test_transfer_prepare_pause();
+            let request_server = primary.server.clone();
+            let request_access = access.clone();
+            let request_source_uri = source_uri.clone();
+            let request_destination_uri = destination_uri.clone();
+            let overwrite = tokio::spawn(async move {
+                dispatch_once(
+                    &request_server,
+                    request_access,
+                    resource,
+                    method,
+                    &request_source_uri,
+                    Some(&request_destination_uri),
+                )
+                .await
+            });
+            bounded(prepared, "wait for overwrite transaction staging")
+                .await
+                .expect("overwrite reached transaction staging");
+
+            secondary
+                .server
+                .inner
+                .mark_cache_stale(account_id, SyncCollection::FileNode);
+            let paused_resources =
+                preload(&secondary.server, account_id, SyncCollection::FileNode).await;
+            assert!(paused_resources.by_path(&source_name).is_some());
+            assert!(paused_resources.by_path(&destination_name).is_some());
+            assert!(
+                paused_resources
+                    .by_path(&format!("{destination_name}/old-child.txt"))
+                    .is_some(),
+                "overwrite deleted the destination before its fenced commit"
+            );
+
+            let competing_uri = format!("{base}competing-{suffix}.txt");
+            assert_eq!(
+                dispatch_status(
+                    &secondary.server,
+                    access.clone(),
+                    resource,
+                    DavMethod::PUT,
+                    &competing_uri,
+                    None,
+                    Some("text/plain"),
+                    FILE_BODY,
+                    true,
+                    false,
+                )
+                .await,
+                StatusCode::CREATED
+            );
+            resume.send(()).expect("resume fenced overwrite");
+            let stale_attempt = bounded(overwrite, "finish stale overwrite attempt")
+                .await
+                .expect("overwrite task completed");
+            assert!(matches!(
+                stale_attempt,
+                Err(DavError::Internal(err)) if err.is_assertion_failure()
+            ));
+
+            secondary
+                .server
+                .inner
+                .mark_cache_stale(account_id, SyncCollection::FileNode);
+            let after_conflict =
+                preload(&secondary.server, account_id, SyncCollection::FileNode).await;
+            assert!(after_conflict.by_path(&source_name).is_some());
+            assert!(after_conflict.by_path(&destination_name).is_some());
+            assert!(
+                after_conflict
+                    .by_path(&format!("{destination_name}/old-child.txt"))
+                    .is_some(),
+                "failed fenced overwrite removed the destination folder"
+            );
+            assert!(
+                after_conflict
+                    .by_path(&format!("competing-{suffix}.txt"))
+                    .is_some()
+            );
+
+            assert_eq!(
+                dispatch_status(
+                    &secondary.server,
+                    access.clone(),
+                    resource,
+                    method,
+                    &source_uri,
+                    Some(&destination_uri),
+                    None,
+                    &[],
+                    false,
+                    false,
+                )
+                .await,
+                StatusCode::NO_CONTENT,
+                "successful retry should complete {method:?} overwrite"
+            );
+
+            let after_retry =
+                preload(&secondary.server, account_id, SyncCollection::FileNode).await;
+            assert_eq!(
+                after_retry.by_path(&source_name).is_some(),
+                matches!(method, DavMethod::COPY),
+                "unexpected source state after {method:?} retry"
+            );
+            assert!(after_retry.by_path(&destination_name).is_some());
+            assert!(
+                after_retry
+                    .by_path(&format!("{destination_name}/old-child.txt"))
+                    .is_none(),
+                "successful retry left the overwritten folder child in place"
+            );
+            let response = match dispatch_once(
+                &secondary.server,
+                access.clone(),
+                resource,
+                DavMethod::GET,
+                &destination_uri,
+                None,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(_) => panic!("read overwritten file after retry"),
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(matches!(
+                response.body(),
+                http_proto::HttpResponseBody::Binary(body) if body.as_ref() == FILE_BODY
+            ));
         }
     }
 
