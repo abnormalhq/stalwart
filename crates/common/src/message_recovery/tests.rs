@@ -4940,13 +4940,35 @@ async fn foundationdb_recovery_metadata_chunk_lifecycle() {
     )
     .await;
 
-    let mut stale_cas = BatchBuilder::new();
-    stale_cas.set(value_class(&key), small_bytes.clone());
-    stale_cas.assert_value(value_class(&key), current_revision);
-    let error = metadata.write_batch(&mut stale_cas).await.unwrap_err();
+    let mut stale_persisted_cas = BatchBuilder::new();
+    stale_persisted_cas.assert_value(value_class(&key), current_revision);
+    let error = metadata
+        .write_batch(&mut stale_persisted_cas)
+        .await
+        .unwrap_err();
     assert!(
         error.is_assertion_failure(),
-        "expected stale CAS assertion failure, got {error:?}"
+        "expected stale persisted-CAS assertion failure, got {error:?}"
+    );
+    assert_foundationdb_record(&metadata, &key, &two_chunk_bytes, &two_chunk_index, 2).await;
+    assert_foundationdb_chunk(&metadata, &key, 0, true).await;
+    assert_foundationdb_chunk(&metadata, &key, 1, false).await;
+    assert_foundationdb_sentinels(
+        &metadata,
+        &neighbor_key,
+        &neighbor_bytes,
+        &boundary_key,
+        &boundary_value,
+    )
+    .await;
+
+    let mut staged_cleanup = BatchBuilder::new();
+    staged_cleanup.set(value_class(&key), small_bytes.clone());
+    staged_cleanup.assert_value(value_class(&key), current_revision);
+    let error = metadata.write_batch(&mut staged_cleanup).await.unwrap_err();
+    assert!(
+        error.is_assertion_failure(),
+        "expected assertion failure after staged chunk cleanup, got {error:?}"
     );
     assert_foundationdb_record(&metadata, &key, &two_chunk_bytes, &two_chunk_index, 2).await;
     assert_foundationdb_chunk(&metadata, &key, 0, true).await;
