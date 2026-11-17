@@ -1,6 +1,7 @@
 name: Community PR CI
 
 on:
+  workflow_dispatch:
   pull_request:
     branches: [main, devin/1794777185-community-debranding]
   push:

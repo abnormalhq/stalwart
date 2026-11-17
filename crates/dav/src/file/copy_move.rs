@@ -49,6 +49,46 @@ use types::{
     metadata::MetadataKinds,
 };
 
+#[cfg(test)]
+static TEST_TRANSFER_PREPARE_PAUSE: std::sync::Mutex<
+    Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_test_transfer_prepare_pause() -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (prepared_tx, prepared_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    assert!(
+        TEST_TRANSFER_PREPARE_PAUSE
+            .lock()
+            .expect("file transfer test pause mutex")
+            .replace((prepared_tx, resume_rx))
+            .is_none()
+    );
+    (prepared_rx, resume_tx)
+}
+
+#[cfg(test)]
+async fn wait_test_transfer_prepare_pause() {
+    let pause = TEST_TRANSFER_PREPARE_PAUSE
+        .lock()
+        .expect("file transfer test pause mutex")
+        .take();
+    if let Some((prepared, resume)) = pause {
+        let _ = prepared.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(10), resume)
+            .await
+            .expect("timed out waiting to resume file transfer")
+            .expect("file transfer test pause was dropped");
+    }
+}
+
 pub(crate) trait FileCopyMoveRequestHandler: Sync + Send {
     fn handle_file_copy_move_request(
         &self,
@@ -517,7 +557,12 @@ struct Overwritten {
 }
 
 impl Transfer {
-    async fn prepare(self, server: &Server, growth: u64) -> crate::Result<()> {
+    async fn prepare(
+        self,
+        server: &Server,
+        growth: u64,
+        batch: &mut BatchBuilder,
+    ) -> crate::Result<()> {
         if let Some((account, bytes)) = &self.quota {
             server
                 .has_available_quota(account, bytes.saturating_add(growth))
@@ -525,15 +570,18 @@ impl Transfer {
         }
         if let Some(overwritten) = self.overwritten {
             DestroyArchive(overwritten.ids)
-                .delete(
+                .delete_batch(
                     server,
                     overwritten.changed_by,
                     overwritten.account_id,
                     &overwritten.cleanup,
                     None,
+                    batch,
                 )
                 .await
                 .caused_by(trc::location!())?;
+            #[cfg(test)]
+            wait_test_transfer_prepare_pause().await;
         }
         Ok(())
     }
@@ -559,7 +607,8 @@ async fn move_container(
     let parent_id = destination.document_id.map(|id| id + 1).unwrap_or(0);
 
     if from_account_id == to_account_id {
-        transfer.prepare(server, 0).await?;
+        let mut batch = BatchBuilder::new_atomic();
+        transfer.prepare(server, 0, &mut batch).await?;
         let node_ = server
             .store()
             .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
@@ -578,7 +627,6 @@ async fn move_container(
         if let Some(new_name) = destination.new_name {
             new_node.name = new_name;
         }
-        let mut batch = BatchBuilder::new_atomic();
         let etag = new_node
             .update(
                 access_token.changed_by(),
@@ -664,12 +712,14 @@ async fn copy_container(
         .load(server)
         .await
         .caused_by(trc::location!())?;
-    transfer.prepare(server, containers.stored_len()).await?;
+    let mut batch = BatchBuilder::new_atomic();
+    transfer
+        .prepare(server, containers.stored_len(), &mut batch)
+        .await?;
     let mut copies = ContainerWrites::new(to_account_id, Collection::FileNode);
     let mut removals = ContainerWrites::new(from_account_id, Collection::FileNode);
 
     // Top-down copy
-    let mut batch = BatchBuilder::new_atomic();
     let mut id_map = AHashMap::with_capacity(copy_files.len());
     let mut delete_files = if delete_source {
         Vec::with_capacity(copy_files.len())
@@ -1003,7 +1053,7 @@ async fn move_item(
     let mut batch = BatchBuilder::new_atomic();
     let etag = if from_account_id == to_account_id {
         // Destination is in the same account: just update the parent id
-        transfer.prepare(server, 0).await?;
+        transfer.prepare(server, 0, &mut batch).await?;
         let etag = new_node
             .update(
                 access_token.changed_by(),
@@ -1218,6 +1268,7 @@ async fn copy_node_container(
             source
                 .as_ref()
                 .map_or(0, |source| copy_growth(source, None)),
+            batch,
         )
         .await?;
     if let Some(source) = &source {
@@ -1268,6 +1319,7 @@ async fn replace_container(
             source
                 .as_ref()
                 .map_or(0, |source| copy_growth(source, previous.as_ref())),
+            batch,
         )
         .await?;
 
