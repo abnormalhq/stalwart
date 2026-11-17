@@ -7,6 +7,7 @@
 use crate::{
     DavError, DavMethod,
     common::{
+        create::DavCreateFence,
         ExtractETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
@@ -20,7 +21,6 @@ use common::{
 };
 use dav_proto::{RequestHeaders, Return, schema::property::Rfc1123DateTime};
 use groupware::{
-    cache::GroupwareCache,
     file::{FileNode, FileNodeContent, FileProperties},
 };
 use http_proto::HttpResponse;
@@ -62,14 +62,14 @@ impl FileUpdateRequestHandler for Server {
             .await?
             .into_owned_uri()?;
         let account_id = resource.account_id;
-        let resources = self
-            .fetch_groupware_resources(
-                access_token.account_id(),
-                account_id,
-                SyncCollection::FileNode,
-            )
-            .await
-            .caused_by(trc::location!())?;
+        let (resources, create_fence) = DavCreateFence::prepare(
+            self,
+            access_token,
+            account_id,
+            SyncCollection::FileNode,
+        )
+        .await
+        .caused_by(trc::location!())?;
         let resource_name = resource
             .resource
             .ok_or(DavError::Code(StatusCode::CONFLICT))?;
@@ -312,7 +312,7 @@ impl FileUpdateRequestHandler for Server {
             };
 
             // Prepare write batch
-            let mut batch = BatchBuilder::new();
+            let mut batch = BatchBuilder::new_atomic();
             let document_id = batch.reserve_document_id(account_id, Collection::FileNode);
             batch.with_account_id(account_id);
             self.limit_disk_quota(&mut batch, &account);
@@ -327,10 +327,9 @@ impl FileUpdateRequestHandler for Server {
                         .with_changed_by(access_token.changed_by()),
                 )
                 .caused_by(trc::location!())?;
-            let etag = self
-                .commit_batch(batch)
-                .await
-                .caused_by(trc::location!())?
+            let etag = create_fence
+                .commit(self, batch)
+                .await?
                 .etag();
 
             Ok(HttpResponse::new(StatusCode::CREATED).with_etag_opt(etag))

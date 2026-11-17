@@ -44,7 +44,31 @@ impl EnterpriseRegistry for Server {
     // SPDX-SnippetEnd
 
     #[cfg(not(feature = "enterprise"))]
-    fn assert_enterprise_object(&self, _object_type: ObjectType) -> trc::Result<()> {
-        Ok(())
+    fn assert_enterprise_object(&self, object_type: ObjectType) -> trc::Result<()> {
+        assert_community_object_available(object_type)
+    }
+}
+
+#[cfg(not(feature = "enterprise"))]
+fn assert_community_object_available(object_type: ObjectType) -> trc::Result<()> {
+    if matches!(object_type, ObjectType::MaskedEmail)
+        && !common::network::masked::MASKED_ADDRESS_ROUTING_AVAILABLE
+    {
+        return Err(trc::JmapEvent::Forbidden
+            .into_err()
+            .details("MaskedEmail is disabled in this Community build."));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, not(feature = "enterprise")))]
+mod tests {
+    use super::assert_community_object_available;
+    use registry::schema::prelude::ObjectType;
+
+    #[test]
+    fn masked_email_is_forbidden_while_regular_objects_remain_available() {
+        assert!(assert_community_object_available(ObjectType::MaskedEmail).is_err());
+        assert!(assert_community_object_available(ObjectType::Domain).is_ok());
     }
 }

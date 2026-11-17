@@ -21,8 +21,8 @@ use crate::{
         InstanceId, ItipError, ItipMessage, ItipSnapshots,
         format::{DateStyle, TextFormatter, hyperlink},
         inbound::{
-            MergeAction, MergeResult, itip_import_message, itip_merge_changes, itip_method,
-            itip_process_message,
+            MergeAction, MergeResult, itip_add_uninvited_attendee, itip_import_message,
+            itip_merge_changes, itip_method, itip_process_message,
         },
         itip::{itip_add_tz, itip_build_envelope},
         recipient::RecipientPolicy,
@@ -42,6 +42,7 @@ use common::{
     DavName, Server,
     auth::{AccessToken, AccountInfo, oauth::GrantType},
     i18n,
+    storage::groupware::GroupwareCreateGeneration,
 };
 use compact_str::ToCompactString;
 use registry::schema::enums::{Permission, StorageQuota};
@@ -52,20 +53,102 @@ use store::{
 };
 use trc::AddContext;
 use types::{
-    collection::Collection,
+    collection::{Collection, SyncCollection},
     field::{CalendarEventField, ContactField},
 };
 const MAX_RSVP_COMMENT_LEN: usize = 512;
 const MAX_WRITE_ATTEMPTS: usize = 3;
 const WRITE_RETRY_BACKOFF_MS: RangeInclusive<u64> = 1..=15;
 
+fn should_forward_itip(origin: ItipOrigin, error: &ItipError) -> bool {
+    origin == ItipOrigin::Submission && matches!(error, ItipError::NotOrganizerNorAttendee)
+}
+
+fn validate_forward_sender(
+    method: &ICalendarMethod,
+    snapshots: &ItipSnapshots<'_>,
+    sender: &str,
+    sender_id: Option<u32>,
+) -> Result<u32, ItipError> {
+    if method != &ICalendarMethod::Request
+        || snapshots.organizer.email.email == sender
+        || !snapshots.components.values().any(|component| {
+            component
+                .attendees
+                .iter()
+                .any(|attendee| attendee.email.email == sender)
+        })
+    {
+        return Err(ItipError::NotOrganizerNorAttendee);
+    }
+
+    sender_id.ok_or(ItipError::NotOrganizerNorAttendee)
+}
+
+fn ensure_forward_uid_available(uid_exists: bool) -> Result<(), ItipError> {
+    if uid_exists {
+        Err(ItipError::SenderIsNotOrganizer)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(stalwart_tests)]
 pub static ITIP_MERGE_BARRIER: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Barrier>>> =
     std::sync::Mutex::new(None);
 
+#[cfg(test)]
+static ITIP_CREATE_BARRIER: std::sync::Mutex<
+    Option<(Vec<String>, std::sync::Arc<tokio::sync::Barrier>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static ITIP_CREATE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+async fn wait_itip_create_barrier(uid: &str) {
+    let barrier = ITIP_CREATE_BARRIER.lock().ok().and_then(|slot| {
+        slot.as_ref().and_then(|(expected_uids, barrier)| {
+            expected_uids
+                .iter()
+                .any(|expected_uid| expected_uid == uid)
+                .then(|| barrier.clone())
+        })
+    });
+    if let Some(barrier) = barrier {
+        let is_leader = tokio::time::timeout(Duration::from_secs(20), barrier.wait())
+            .await
+            .expect("timed out waiting for iTIP create test barrier")
+            .is_leader();
+        if is_leader
+            && let Ok(mut slot) = ITIP_CREATE_BARRIER.lock()
+            && slot.as_ref().is_some_and(|(expected_uids, current)| {
+                expected_uids.iter().any(|expected_uid| expected_uid == uid)
+                    && std::sync::Arc::ptr_eq(current, &barrier)
+            })
+        {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn set_itip_create_barrier(uids: &[&str], participants: usize) {
+    *ITIP_CREATE_BARRIER.lock().expect("iTIP test barrier mutex") = Some((
+        uids.iter().map(|uid| (*uid).to_string()).collect(),
+        std::sync::Arc::new(tokio::sync::Barrier::new(participants)),
+    ));
+}
+
 pub enum ItipIngestError {
     Message(ItipError),
     Internal(trc::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItipOrigin {
+    Submission,
+    Delivery,
 }
 
 #[derive(Default)]
@@ -86,6 +169,7 @@ pub trait ItipIngest: Sync + Send {
         &self,
         account_info: &AccountInfo,
         sender: &str,
+        origin: ItipOrigin,
         recipient: &str,
         itip_message: &str,
     ) -> impl Future<Output = Result<Option<ItipMessage<ICalendar>>, ItipIngestError>> + Send;
@@ -109,9 +193,29 @@ pub trait ItipIngest: Sync + Send {
         &self,
         account_info: &AccountInfo,
         sender: &str,
+        origin: ItipOrigin,
         recipient: &str,
         itip_message: &str,
     ) -> impl Future<Output = Result<Option<ItipMessage<ICalendar>>, ItipIngestError>> + Send;
+
+    fn itip_ingest_forward(
+        &self,
+        account_info: &AccountInfo,
+        sender: &str,
+        recipient: &str,
+        itip: &ICalendar,
+        itip_message: &str,
+    ) -> impl Future<Output = Result<Option<ItipMessage<ICalendar>>, ItipIngestError>> + Send;
+
+    fn itip_create_event(
+        &self,
+        account_info: &AccountInfo,
+        generation: GroupwareCreateGeneration,
+        ical: ICalendar,
+        itip: ICalendar,
+        changed_by: ChangedBy,
+        itip_message: &str,
+    ) -> impl Future<Output = Result<(), ItipIngestError>> + Send;
 
     #[allow(clippy::too_many_arguments)]
     fn commit_itip_merge(
@@ -153,13 +257,14 @@ impl ItipIngest for Server {
         &self,
         account_info: &AccountInfo,
         sender: &str,
+        origin: ItipOrigin,
         recipient: &str,
         itip_message: &str,
     ) -> Result<Option<ItipMessage<ICalendar>>, ItipIngestError> {
         let mut attempt = 1;
         loop {
             match self
-                .itip_ingest_once(account_info, sender, recipient, itip_message)
+                .itip_ingest_once(account_info, sender, origin, recipient, itip_message)
                 .await
             {
                 Err(ItipIngestError::Internal(err))
@@ -406,6 +511,7 @@ impl ItipIngest for Server {
         &self,
         account_info: &AccountInfo,
         sender: &str,
+        origin: ItipOrigin,
         recipient: &str,
         itip_message: &str,
     ) -> Result<Option<ItipMessage<ICalendar>>, ItipIngestError> {
@@ -458,7 +564,20 @@ impl ItipIngest for Server {
             }
         }
 
-        let itip_snapshots = itip_snapshot(&itip, account_info.addresses(), false)?;
+        let itip_snapshots = match itip_snapshot(&itip, account_info.addresses(), false) {
+            Ok(itip_snapshots) => itip_snapshots,
+            Err(err) if should_forward_itip(origin, &err) => {
+                return Box::pin(self.itip_ingest_forward(
+                    account_info,
+                    sender,
+                    recipient,
+                    &itip,
+                    itip_message,
+                ))
+                .await;
+            }
+            Err(err) => return Err(ItipIngestError::Message(err)),
+        };
         match itip_method(&itip)? {
             ICalendarMethod::Reply | ICalendarMethod::Refresh | ICalendarMethod::Counter => {
                 if !itip_snapshots.sender_is_organizer_or_attendee(sender) {
@@ -487,6 +606,12 @@ impl ItipIngest for Server {
 
         // Find event by UID
         let account_id = account_info.account_id();
+        let generation = GroupwareCreateGeneration::read_primary(
+            self.store(),
+            account_id,
+            SyncCollection::Calendar,
+        )
+        .await?;
         let document_id = self
             .document_ids_matching(
                 account_id,
@@ -580,7 +705,91 @@ impl ItipIngest for Server {
             let mut ical = itip.clone();
             itip_import_message(&mut ical)?;
 
-            let account = self.account(account_id).await?;
+            #[cfg(test)]
+            wait_itip_create_barrier(&itip_snapshots.uid).await;
+
+            self.itip_create_event(
+                account_info,
+                generation,
+                ical,
+                itip,
+                changed_by,
+                itip_message,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+
+    async fn itip_ingest_forward(
+        &self,
+        account_info: &AccountInfo,
+        sender: &str,
+        recipient: &str,
+        itip: &ICalendar,
+        itip_message: &str,
+    ) -> Result<Option<ItipMessage<ICalendar>>, ItipIngestError> {
+        let method = itip_method(itip)?;
+        if method != &ICalendarMethod::Request {
+            return Err(ItipIngestError::Message(ItipError::NotOrganizerNorAttendee));
+        }
+        let sender_addresses = [sender.to_string()];
+        let sender_snapshots = itip_snapshot(itip, &sender_addresses, false)?;
+        let sender_id = validate_forward_sender(
+            method,
+            &sender_snapshots,
+            sender,
+            self.account_id_from_email(sender, true).await?,
+        )?;
+        let generation = GroupwareCreateGeneration::read_primary(
+            self.store(),
+            account_info.account_id(),
+            SyncCollection::Calendar,
+        )
+        .await?;
+        let uid_exists = self
+            .document_exists(
+                account_info.account_id(),
+                Collection::CalendarEvent,
+                CalendarEventField::Uid,
+                sender_snapshots.uid.as_bytes(),
+            )
+            .await
+            .caused_by(trc::location!())?;
+        ensure_forward_uid_available(uid_exists)?;
+
+        let mut ical = itip.clone();
+        itip_import_message(&mut ical)?;
+        itip_add_uninvited_attendee(&mut ical, recipient);
+        #[cfg(test)]
+        wait_itip_create_barrier(&sender_snapshots.uid).await;
+
+        self.itip_create_event(
+            account_info,
+            generation,
+            ical,
+            itip.clone(),
+            ChangedBy::PrincipalId(sender_id),
+            itip_message,
+        )
+        .await?;
+
+        Ok(None)
+    }
+
+    #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
+    async fn itip_create_event(
+        &self,
+        account_info: &AccountInfo,
+        generation: GroupwareCreateGeneration,
+        ical: ICalendar,
+        itip: ICalendar,
+        changed_by: ChangedBy,
+        itip_message: &str,
+    ) -> Result<(), ItipIngestError> {
+        let account_id = account_info.account_id();
+        let account = self.account(account_id).await?;
+        {
             // SPDX-SnippetBegin
             // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
             // SPDX-License-Identifier: LicenseRef-SEL
@@ -594,107 +803,105 @@ impl ItipIngest for Server {
                 return Err(ItipIngestError::Message(ItipError::QuotaExceeded));
             }
             // SPDX-SnippetEnd
+        }
 
-            // Obtain parent calendar
-            let Some(parent_id) = self
-                .get_or_create_default_calendar(account_info.account(), account_info.account())
-                .await
-                .caused_by(trc::location!())?
-            else {
-                return Err(ItipIngestError::Message(ItipError::NoDefaultCalendar));
-            };
+        let Some(parent_id) = self
+            .get_or_create_default_calendar(account_info.account(), account_info.account())
+            .await
+            .caused_by(trc::location!())?
+        else {
+            return Err(ItipIngestError::Message(ItipError::NoDefaultCalendar));
+        };
+        let now = now() as i64;
+        let event = CalendarEvent {
+            names: vec![DavName {
+                name: format!("{}_{}.ics", now, rand::random::<u64>()),
+                parent_id,
+            }],
+            schedule_tag: Some(1),
+            ..Default::default()
+        };
+        let current = ical.clone();
+        let event_content = CalendarEventContent {
+            data: CalendarEventData::new(
+                ical,
+                Tz::Floating,
+                self.core.groupware.max_ical_instances,
+            ),
+            ..Default::default()
+        };
+        let next_email_alarms = self
+            .next_event_alarms(
+                account_id,
+                &EventAlarmUsers::new(account_id, &event_content)?.with_event_flags(event.flags),
+                &event_content.data,
+                &[parent_id],
+                now,
+                &mut DefaultAlertsResolver::default(),
+            )
+            .await
+            .caused_by(trc::location!())?;
 
-            // Build event
-            let now = now() as i64;
-            let event = CalendarEvent {
-                names: vec![DavName {
-                    name: format!("{}_{}.ics", now, rand::random::<u64>()),
-                    parent_id,
-                }],
-                schedule_tag: Some(1),
-                ..Default::default()
-            };
-            let current = ical.clone();
-            let event_content = CalendarEventContent {
-                data: CalendarEventData::new(
-                    ical,
-                    Tz::Floating,
-                    self.core.groupware.max_ical_instances,
-                ),
-                ..Default::default()
-            };
-            let next_email_alarms = self
-                .next_event_alarms(
-                    account_id,
-                    &EventAlarmUsers::new(account_id, &event_content)?
-                        .with_event_flags(event.flags),
-                    &event_content.data,
-                    &[parent_id],
-                    now,
-                    &mut DefaultAlertsResolver::default(),
-                )
-                .await
-                .caused_by(trc::location!())?;
+        let notification = CalendarEventNotification {
+            event_id: None,
+            changed_by,
+            calendar_ids: vec![parent_id],
+            flags: NotificationAudience::of_event(event.flags)
+                .with_privacy(current.privacy().is_public())
+                .flags(),
+            ..Default::default()
+        };
+        let notification_content = CalendarEventNotificationContent::Itip {
+            message: itip,
+            previous: None,
+            current: Some(current),
+        };
 
-            let notification = CalendarEventNotification {
-                event_id: None,
-                changed_by,
-                calendar_ids: vec![parent_id],
-                flags: NotificationAudience::of_event(event.flags)
-                    .with_privacy(current.privacy().is_public())
-                    .flags(),
-                ..Default::default()
-            };
-            let notification_content = CalendarEventNotificationContent::Itip {
-                message: itip,
-                previous: None,
-                current: Some(current),
-            };
-
-            // Prepare write batch
-            let mut batch = BatchBuilder::new();
-            batch.with_account_id(account_id);
-            self.limit_disk_quota(&mut batch, &account);
-            self.limit_object_quota(&mut batch, &account, StorageQuota::MaxCalendarEvents);
-            let document_id = batch.reserve_document_id(account_id, Collection::CalendarEvent);
-            event
+        let mut batch = BatchBuilder::new_atomic();
+        batch.with_account_id(account_id);
+        self.limit_disk_quota(&mut batch, &account);
+        self.limit_object_quota(&mut batch, &account, StorageQuota::MaxCalendarEvents);
+        let document_id = batch.reserve_document_id(account_id, Collection::CalendarEvent);
+        event
+            .insert(
+                event_content,
+                account_info.changed_by(),
+                account_id,
+                document_id,
+                None,
+                next_email_alarms,
+                &mut batch,
+            )
+            .caused_by(trc::location!())?;
+        if NotificationQuota::default()
+            .reserve(
+                self,
+                account_id,
+                notification_content.stored_size(),
+                &mut batch,
+            )
+            .await
+            .caused_by(trc::location!())?
+        {
+            let itip_document_id =
+                batch.reserve_document_id(account_id, Collection::CalendarEventNotification);
+            notification
                 .insert(
-                    event_content,
+                    notification_content,
                     account_info.changed_by(),
                     account_id,
-                    document_id,
-                    None,
-                    next_email_alarms,
+                    itip_document_id,
+                    Some(document_id),
                     &mut batch,
                 )
                 .caused_by(trc::location!())?;
-            if NotificationQuota::default()
-                .reserve(
-                    self,
-                    account_id,
-                    notification_content.stored_size(),
-                    &mut batch,
-                )
-                .await
-                .caused_by(trc::location!())?
-            {
-                let itip_document_id =
-                    batch.reserve_document_id(account_id, Collection::CalendarEventNotification);
-                notification
-                    .insert(
-                        notification_content,
-                        account_info.changed_by(),
-                        account_id,
-                        itip_document_id,
-                        Some(document_id),
-                        &mut batch,
-                    )
-                    .caused_by(trc::location!())?;
-            }
-            self.commit_batch(batch).await.caused_by(trc::location!())?;
-
-            Ok(None)
         }
+        generation
+            .append_to_batch(&mut batch)
+            .caused_by(trc::location!())?;
+        self.commit_batch(batch).await.caused_by(trc::location!())?;
+
+        Ok(())
     }
 
     async fn commit_itip_merge(
@@ -1247,7 +1454,9 @@ fn build_rsvp_invitation(
             ICalendarProperty::Summary => invitation.summary = Some(value),
             ICalendarProperty::Description => invitation.description = Some(value),
             ICalendarProperty::Location => invitation.location = Some(value),
-            ICalendarProperty::Rrule => invitation.recurrence = Some(value),
+            ICalendarProperty::Rrule if invitation.recurrence.is_none() => {
+                invitation.recurrence = Some(value)
+            }
             ICalendarProperty::Dtstart if invitation.when.is_none() => {
                 invitation.when = Some(value)
             }
@@ -1590,5 +1799,924 @@ impl CalendarEventNotificationContent {
             .flatten()
             .map(|ical| SizeWriter::ical(ical) as u64)
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod forwarding_tests {
+    use super::*;
+
+    const INVITATION: &str = concat!(
+        "BEGIN:VCALENDAR\r\n",
+        "VERSION:2.0\r\n",
+        "PRODID:-//Example//iTIP test//EN\r\n",
+        "METHOD:REQUEST\r\n",
+        "BEGIN:VEVENT\r\n",
+        "UID:forward-test-uid\r\n",
+        "DTSTAMP:20260101T000000Z\r\n",
+        "DTSTART:20260102T120000Z\r\n",
+        "DTEND:20260102T130000Z\r\n",
+        "ORGANIZER:mailto:organizer@example.com\r\n",
+        "ATTENDEE:mailto:attendee@example.com\r\n",
+        "SUMMARY:Forward test\r\n",
+        "END:VEVENT\r\n",
+        "END:VCALENDAR\r\n",
+    );
+
+    fn invitation() -> ICalendar {
+        ICalendar::parse(INVITATION).expect("parse invitation")
+    }
+
+    fn snapshots_for<'a>(ical: &'a ICalendar, address: &str) -> ItipSnapshots<'a> {
+        itip_snapshot(ical, &[address.to_string()], false).expect("snapshot participant")
+    }
+
+    #[test]
+    fn submission_attendee_is_forwardable_and_recipient_needs_action_is_added() {
+        let mut ical = invitation();
+        let snapshots = snapshots_for(&ical, "attendee@example.com");
+        let method = itip_method(&ical).expect("read method");
+
+        assert!(should_forward_itip(
+            ItipOrigin::Submission,
+            &ItipError::NotOrganizerNorAttendee
+        ));
+        assert!(matches!(
+            validate_forward_sender(method, &snapshots, "attendee@example.com", Some(44)),
+            Ok(44)
+        ));
+        assert!(ensure_forward_uid_available(false).is_ok());
+
+        itip_add_uninvited_attendee(&mut ical, "recipient@example.com");
+        let recipient = snapshots_for(&ical, "recipient@example.com");
+        let attendee = recipient
+            .components
+            .values()
+            .flat_map(|component| component.attendees.iter())
+            .find(|attendee| attendee.email.email == "recipient@example.com")
+            .expect("added recipient attendee");
+        assert!(matches!(
+            attendee.part_stat,
+            Some(&ICalendarParticipationStatus::NeedsAction)
+        ));
+    }
+
+    #[test]
+    fn forwarding_rejects_delivery_other_methods_invalid_senders_and_duplicate_uid() {
+        let ical = invitation();
+        let method = itip_method(&ical).expect("read method");
+        let attendee = snapshots_for(&ical, "attendee@example.com");
+        assert!(!should_forward_itip(
+            ItipOrigin::Delivery,
+            &ItipError::NotOrganizerNorAttendee
+        ));
+        assert!(matches!(
+            validate_forward_sender(
+                &ICalendarMethod::Reply,
+                &attendee,
+                "attendee@example.com",
+                Some(44)
+            ),
+            Err(ItipError::NotOrganizerNorAttendee)
+        ));
+
+        let organizer = snapshots_for(&ical, "organizer@example.com");
+        assert!(matches!(
+            validate_forward_sender(method, &organizer, "organizer@example.com", Some(45)),
+            Err(ItipError::NotOrganizerNorAttendee)
+        ));
+        assert!(matches!(
+            itip_snapshot(&ical, &["other@example.com".to_string()], false),
+            Err(ItipError::NotOrganizerNorAttendee)
+        ));
+        assert!(matches!(
+            validate_forward_sender(method, &attendee, "attendee@example.com", None),
+            Err(ItipError::NotOrganizerNorAttendee)
+        ));
+        assert!(matches!(
+            ensure_forward_uid_available(true),
+            Err(ItipError::SenderIsNotOrganizer)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod server_ingest_tests {
+    use super::*;
+    use crate::DestroyArchive;
+    use common::{auth::AccountInfo, test_utils::ServerFixture};
+    use std::future::Future;
+
+    const OP_TIMEOUT: Duration = Duration::from_secs(20);
+    const DOMAIN: &str = "itip-integration.test";
+
+    async fn bounded<T>(future: impl Future<Output = T>, operation: &'static str) -> T {
+        tokio::time::timeout(OP_TIMEOUT, future)
+            .await
+            .unwrap_or_else(|_| panic!("timed out during {operation}"))
+    }
+
+    fn request(uid: &str, method: &str, organizer: &str, attendee: &str, summary: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Fixture//iTIP integration//EN\r\nMETHOD:{method}\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20300101T000000Z\r\nDTSTART:20300102T120000Z\r\nDTEND:20300102T130000Z\r\nORGANIZER:mailto:{organizer}\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:{attendee}\r\nSUMMARY:{summary}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    async fn ingest(
+        server: &Server,
+        account_info: &AccountInfo,
+        sender: &str,
+        origin: ItipOrigin,
+        recipient: &str,
+        message: &str,
+    ) -> Result<Option<ItipMessage<ICalendar>>, ItipIngestError> {
+        bounded(
+            server.itip_ingest(account_info, sender, origin, recipient, message),
+            "Server.itip_ingest",
+        )
+        .await
+    }
+
+    async fn stored_event(server: &Server, account_id: u32, uid: &str) -> CalendarEventContent {
+        let document_id = bounded(
+            server.document_ids_matching(
+                account_id,
+                Collection::CalendarEvent,
+                CalendarEventField::Uid,
+                uid.as_bytes(),
+            ),
+            "find persisted iTIP event",
+        )
+        .await
+        .expect("query persisted iTIP UID")
+        .iter()
+        .next()
+        .expect("persisted iTIP event exists");
+        let (_, content) = bounded(
+            server.archive_and_field(
+                account_id,
+                Collection::CalendarEvent,
+                document_id,
+                CalendarEventField::Content.field(),
+            ),
+            "read persisted iTIP event",
+        )
+        .await
+        .expect("read persisted event archive");
+        content
+            .expect("event content archive")
+            .deserialize::<CalendarEventContent>()
+            .expect("deserialize persisted event")
+    }
+
+    async fn stored_event_count(server: &Server, account_id: u32, uid: &str) -> usize {
+        bounded(
+            server.document_ids_matching(
+                account_id,
+                Collection::CalendarEvent,
+                CalendarEventField::Uid,
+                uid.as_bytes(),
+            ),
+            "count persisted iTIP UID",
+        )
+        .await
+        .expect("query persisted iTIP UID")
+        .iter()
+        .count()
+    }
+
+    async fn seed_race_accounts(fixture: &ServerFixture) -> (u32, u32, u32) {
+        let organizer_id = bounded(
+            fixture.create_user_account("organizer", DOMAIN),
+            "seed race organizer account",
+        )
+        .await;
+        let attendee_id = bounded(
+            fixture.create_user_account("attendee", DOMAIN),
+            "seed race attendee account",
+        )
+        .await;
+        let recipient_id = bounded(
+            fixture.create_user_account("recipient", DOMAIN),
+            "seed race recipient account",
+        )
+        .await;
+        (organizer_id, attendee_id, recipient_id)
+    }
+
+    async fn account_info(server: &Server, account_id: u32) -> AccountInfo {
+        bounded(server.account_info(account_id), "load race account info")
+            .await
+            .expect("load race account info")
+    }
+
+    async fn prepare_default_calendar(server: &Server, account_info: &AccountInfo) {
+        bounded(
+            server.get_or_create_default_calendar(account_info.account(), account_info.account()),
+            "prepare race default calendar",
+        )
+        .await
+        .expect("prepare race default calendar")
+        .expect("default calendar exists");
+    }
+
+    async fn shared_recipient_servers()
+    -> (ServerFixture, ServerFixture, u32, AccountInfo, AccountInfo) {
+        let first = bounded(ServerFixture::new(), "build first race fixture").await;
+        let second = bounded(
+            first.new_with_shared_primary(),
+            "build independent race fixture",
+        )
+        .await;
+        let account_ids = seed_race_accounts(&first).await;
+
+        let first_recipient = account_info(&first.server, account_ids.2).await;
+        let second_recipient = account_info(&second.server, account_ids.2).await;
+        prepare_default_calendar(&first.server, &first_recipient).await;
+        prepare_default_calendar(&second.server, &second_recipient).await;
+
+        (
+            first,
+            second,
+            account_ids.2,
+            first_recipient,
+            second_recipient,
+        )
+    }
+
+    async fn namespace_generation(server: &Server, account_id: u32) -> Option<u64> {
+        bounded(
+            GroupwareCreateGeneration::read_primary(
+                server.store(),
+                account_id,
+                SyncCollection::Calendar,
+            ),
+            "read Calendar create generation",
+        )
+        .await
+        .expect("read Calendar create generation")
+        .current_generation()
+    }
+
+    async fn delete_event(server: &Server, account_info: &AccountInfo, uid: &str) {
+        let account_id = account_info.account_id();
+        let document_id = bounded(
+            server.document_ids_matching(
+                account_id,
+                Collection::CalendarEvent,
+                CalendarEventField::Uid,
+                uid.as_bytes(),
+            ),
+            "find iTIP event for deletion",
+        )
+        .await
+        .expect("find iTIP event for deletion")
+        .iter()
+        .next()
+        .expect("iTIP event exists before deletion");
+        let (event_archive, content_archive) = bounded(
+            server.archive_and_field(
+                account_id,
+                Collection::CalendarEvent,
+                document_id,
+                CalendarEventField::Content.field(),
+            ),
+            "read iTIP event for deletion",
+        )
+        .await
+        .expect("read iTIP event for deletion");
+        let event_archive = event_archive.expect("event archive exists");
+        let event = event_archive
+            .unarchive::<CalendarEvent>()
+            .expect("unarchive iTIP event for deletion");
+        let calendar_id = event
+            .names
+            .iter()
+            .next()
+            .map(|name| name.parent_id())
+            .expect("event has a calendar name");
+        let event_archive = Archive {
+            inner: event,
+            version: event_archive.version,
+        };
+        let mut batch = BatchBuilder::new();
+        bounded(
+            DestroyArchive(event_archive).delete(
+                server,
+                account_info,
+                account_id,
+                document_id,
+                calendar_id,
+                content_archive,
+                None,
+                false,
+                &mut batch,
+            ),
+            "build iTIP event deletion",
+        )
+        .await
+        .expect("build iTIP event deletion");
+        bounded(server.commit_batch(batch), "commit iTIP event deletion")
+            .await
+            .expect("commit iTIP event deletion");
+        assert_eq!(stored_event_count(server, account_id, uid).await, 0);
+    }
+
+    fn attendee_status<'a>(
+        event: &'a ICalendar,
+        account_info: &AccountInfo,
+        address: &str,
+    ) -> Option<&'a ICalendarParticipationStatus> {
+        itip_snapshot(event, account_info.addresses(), false)
+            .ok()?
+            .components
+            .values()
+            .flat_map(|component| component.attendees.iter())
+            .find(|attendee| attendee.email.email == address)
+            .and_then(|attendee| attendee.part_stat)
+    }
+
+    fn summary(event: &ICalendar) -> Option<&str> {
+        event
+            .components
+            .iter()
+            .flat_map(|component| component.entries.iter())
+            .find(|entry| entry.name == ICalendarProperty::Summary)
+            .and_then(|entry| entry.values.first())
+            .and_then(ICalendarValue::as_text)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_itip_ingest_forwards_guards_and_preserves_normal_invite_rsvp() {
+        let fixture = bounded(ServerFixture::new(), "build iTIP fixture").await;
+        let organizer_id = bounded(
+            fixture.create_user_account("organizer", DOMAIN),
+            "seed local organizer account",
+        )
+        .await;
+        let attendee_id = bounded(
+            fixture.create_user_account("attendee", DOMAIN),
+            "seed local attendee account",
+        )
+        .await;
+        let recipient_id = bounded(
+            fixture.create_user_account("recipient", DOMAIN),
+            "seed local forwarding recipient account",
+        )
+        .await;
+        let _outsider_id = bounded(
+            fixture.create_user_account("outsider", DOMAIN),
+            "seed local non-attendee account",
+        )
+        .await;
+        let organizer_address = format!("organizer@{DOMAIN}");
+        let attendee_address = format!("attendee@{DOMAIN}");
+        let recipient_address = format!("recipient@{DOMAIN}");
+        let outsider_address = format!("outsider@{DOMAIN}");
+        let organizer_info = bounded(
+            fixture.server.account_info(organizer_id),
+            "load organizer account info",
+        )
+        .await
+        .expect("load organizer info");
+        let attendee_info = bounded(
+            fixture.server.account_info(attendee_id),
+            "load attendee account info",
+        )
+        .await
+        .expect("load attendee info");
+        let recipient_info = bounded(
+            fixture.server.account_info(recipient_id),
+            "load forwarding recipient account info",
+        )
+        .await
+        .expect("load recipient info");
+        assert!(organizer_info.addresses().contains(&organizer_address));
+        assert!(attendee_info.addresses().contains(&attendee_address));
+        assert!(recipient_info.addresses().contains(&recipient_address));
+
+        let forwarded_uid = "forwarded-integration-event";
+        let forwarded = request(
+            forwarded_uid,
+            "REQUEST",
+            &organizer_address,
+            &attendee_address,
+            "Forwarded original",
+        );
+        assert!(
+            ingest(
+                &fixture.server,
+                &recipient_info,
+                &attendee_address,
+                ItipOrigin::Submission,
+                &recipient_address,
+                &forwarded,
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(
+            stored_event_count(&fixture.server, recipient_id, forwarded_uid).await,
+            1
+        );
+        let stored = stored_event(&fixture.server, recipient_id, forwarded_uid).await;
+        assert!(matches!(
+            attendee_status(&stored.data.event, &recipient_info, &recipient_address),
+            Some(ICalendarParticipationStatus::NeedsAction)
+        ));
+        assert!(matches!(
+            attendee_status(&stored.data.event, &recipient_info, &attendee_address),
+            Some(ICalendarParticipationStatus::NeedsAction)
+        ));
+
+        let changed_duplicate = request(
+            forwarded_uid,
+            "REQUEST",
+            &organizer_address,
+            &attendee_address,
+            "Must not overwrite",
+        );
+        assert!(matches!(
+            ingest(
+                &fixture.server,
+                &recipient_info,
+                &attendee_address,
+                ItipOrigin::Submission,
+                &recipient_address,
+                &changed_duplicate,
+            )
+            .await,
+            Err(ItipIngestError::Message(ItipError::SenderIsNotOrganizer))
+        ));
+        assert_eq!(
+            stored_event_count(&fixture.server, recipient_id, forwarded_uid).await,
+            1
+        );
+        let still_original = stored_event(&fixture.server, recipient_id, forwarded_uid).await;
+        assert_eq!(
+            summary(&still_original.data.event),
+            Some("Forwarded original")
+        );
+
+        let delivery = request(
+            "delivery-rejected-event",
+            "REQUEST",
+            &organizer_address,
+            &attendee_address,
+            "Delivery must not forward",
+        );
+        assert!(matches!(
+            ingest(
+                &fixture.server,
+                &recipient_info,
+                &attendee_address,
+                ItipOrigin::Delivery,
+                &recipient_address,
+                &delivery,
+            )
+            .await,
+            Err(ItipIngestError::Message(ItipError::NotOrganizerNorAttendee))
+        ));
+        assert_eq!(
+            stored_event_count(&fixture.server, recipient_id, "delivery-rejected-event").await,
+            0
+        );
+
+        let non_request = request(
+            "non-request-rejected-event",
+            "REPLY",
+            &organizer_address,
+            &attendee_address,
+            "Reply is not forwarded",
+        );
+        assert!(matches!(
+            ingest(
+                &fixture.server,
+                &recipient_info,
+                &attendee_address,
+                ItipOrigin::Submission,
+                &recipient_address,
+                &non_request,
+            )
+            .await,
+            Err(ItipIngestError::Message(ItipError::NotOrganizerNorAttendee))
+        ));
+        assert_eq!(
+            stored_event_count(&fixture.server, recipient_id, "non-request-rejected-event").await,
+            0
+        );
+
+        let non_attendee = request(
+            "non-attendee-rejected-event",
+            "REQUEST",
+            &organizer_address,
+            &attendee_address,
+            "Non-attendee sender",
+        );
+        assert!(matches!(
+            ingest(
+                &fixture.server,
+                &recipient_info,
+                &outsider_address,
+                ItipOrigin::Submission,
+                &recipient_address,
+                &non_attendee,
+            )
+            .await,
+            Err(ItipIngestError::Message(ItipError::NotOrganizerNorAttendee))
+        ));
+        assert_eq!(
+            stored_event_count(&fixture.server, recipient_id, "non-attendee-rejected-event").await,
+            0
+        );
+
+        assert!(matches!(
+            ingest(
+                &fixture.server,
+                &recipient_info,
+                &organizer_address,
+                ItipOrigin::Submission,
+                &recipient_address,
+                &non_attendee,
+            )
+            .await,
+            Err(ItipIngestError::Message(ItipError::NotOrganizerNorAttendee))
+        ));
+        assert_eq!(
+            stored_event_count(&fixture.server, recipient_id, "non-attendee-rejected-event").await,
+            0
+        );
+
+        let unknown_sender = "not-a-local-account@itip-integration.test";
+        let unknown = request(
+            "unknown-sender-rejected-event",
+            "REQUEST",
+            &organizer_address,
+            unknown_sender,
+            "Unknown local sender",
+        );
+        assert!(matches!(
+            ingest(
+                &fixture.server,
+                &recipient_info,
+                unknown_sender,
+                ItipOrigin::Submission,
+                &recipient_address,
+                &unknown,
+            )
+            .await,
+            Err(ItipIngestError::Message(ItipError::NotOrganizerNorAttendee))
+        ));
+        assert_eq!(
+            stored_event_count(
+                &fixture.server,
+                recipient_id,
+                "unknown-sender-rejected-event"
+            )
+            .await,
+            0
+        );
+
+        let normal_uid = "normal-invite-rsvp-event";
+        let invitation = request(
+            normal_uid,
+            "REQUEST",
+            &organizer_address,
+            &attendee_address,
+            "Normal organizer invitation",
+        );
+        assert!(
+            ingest(
+                &fixture.server,
+                &organizer_info,
+                &organizer_address,
+                ItipOrigin::Delivery,
+                &attendee_address,
+                &invitation,
+            )
+            .await
+            .is_ok()
+        );
+        let invited = stored_event(&fixture.server, organizer_id, normal_uid).await;
+        assert!(matches!(
+            attendee_status(&invited.data.event, &organizer_info, &attendee_address),
+            Some(ICalendarParticipationStatus::NeedsAction)
+        ));
+
+        let reply = request(
+            normal_uid,
+            "REPLY",
+            &organizer_address,
+            &attendee_address,
+            "Normal RSVP",
+        )
+        .replace(
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION:",
+            "ATTENDEE;PARTSTAT=ACCEPTED:",
+        );
+        let reply_result = ingest(
+            &fixture.server,
+            &organizer_info,
+            &attendee_address,
+            ItipOrigin::Delivery,
+            &organizer_address,
+            &reply,
+        )
+        .await;
+        if let Err(err) = reply_result {
+            match err {
+                ItipIngestError::Message(err) => panic!("RSVP ingest failed: {err:?}"),
+                ItipIngestError::Internal(err) => panic!("RSVP storage failed: {err:?}"),
+            }
+        }
+        let replied = stored_event(&fixture.server, organizer_id, normal_uid).await;
+        assert!(matches!(
+            attendee_status(&replied.data.event, &organizer_info, &attendee_address),
+            Some(ICalendarParticipationStatus::Accepted)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forwarded_same_uid_race_creates_one_event_across_servers() {
+        let (first, second, recipient_id, first_info, second_info) =
+            shared_recipient_servers().await;
+        let organizer_address = format!("organizer@{DOMAIN}");
+        let attendee_address = format!("attendee@{DOMAIN}");
+        let recipient_address = format!("recipient@{DOMAIN}");
+        let uid = "forwarded-same-uid-race";
+        let message = request(
+            uid,
+            "REQUEST",
+            &organizer_address,
+            &attendee_address,
+            "Forwarded race",
+        );
+
+        let _barrier_lock = ITIP_CREATE_TEST_LOCK.lock().await;
+        set_itip_create_barrier(&[uid], 2);
+        let (first_result, second_result) = bounded(
+            async {
+                tokio::join!(
+                    ingest(
+                        &first.server,
+                        &first_info,
+                        &attendee_address,
+                        ItipOrigin::Submission,
+                        &recipient_address,
+                        &message,
+                    ),
+                    ingest(
+                        &second.server,
+                        &second_info,
+                        &attendee_address,
+                        ItipOrigin::Submission,
+                        &recipient_address,
+                        &message,
+                    ),
+                )
+            },
+            "race same-UID forwarded invitations",
+        )
+        .await;
+
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+        let loser = if first_result.is_err() {
+            first_result
+        } else {
+            second_result
+        };
+        assert!(matches!(
+            loser,
+            Err(ItipIngestError::Message(ItipError::SenderIsNotOrganizer))
+        ));
+        assert_eq!(
+            stored_event_count(&first.server, recipient_id, uid).await,
+            1
+        );
+        assert_eq!(
+            stored_event_count(&second.server, recipient_id, uid).await,
+            1
+        );
+        assert_eq!(
+            namespace_generation(&first.server, recipient_id).await,
+            Some(1)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn normal_and_forwarded_create_race_creates_one_event() {
+        let (first, second, recipient_id, first_info, second_info) =
+            shared_recipient_servers().await;
+        let organizer_address = format!("organizer@{DOMAIN}");
+        let attendee_address = format!("attendee@{DOMAIN}");
+        let recipient_address = format!("recipient@{DOMAIN}");
+        let uid = "normal-forward-create-race";
+        let normal = request(
+            uid,
+            "REQUEST",
+            &organizer_address,
+            &recipient_address,
+            "Normal invitation",
+        );
+        let forwarded = request(
+            uid,
+            "REQUEST",
+            &organizer_address,
+            &attendee_address,
+            "Forwarded invitation",
+        );
+
+        let _barrier_lock = ITIP_CREATE_TEST_LOCK.lock().await;
+        set_itip_create_barrier(&[uid], 2);
+        let (normal_result, forwarded_result) = bounded(
+            async {
+                tokio::join!(
+                    ingest(
+                        &first.server,
+                        &first_info,
+                        &organizer_address,
+                        ItipOrigin::Delivery,
+                        &recipient_address,
+                        &normal,
+                    ),
+                    ingest(
+                        &second.server,
+                        &second_info,
+                        &attendee_address,
+                        ItipOrigin::Submission,
+                        &recipient_address,
+                        &forwarded,
+                    ),
+                )
+            },
+            "race normal and forwarded invitations",
+        )
+        .await;
+
+        assert!(normal_result.is_ok());
+        assert!(
+            forwarded_result.is_ok()
+                || matches!(
+                    forwarded_result,
+                    Err(ItipIngestError::Message(ItipError::SenderIsNotOrganizer))
+                )
+        );
+        assert_eq!(
+            stored_event_count(&first.server, recipient_id, uid).await,
+            1
+        );
+        assert_eq!(
+            stored_event_count(&second.server, recipient_id, uid).await,
+            1
+        );
+        assert_eq!(
+            namespace_generation(&first.server, recipient_id).await,
+            Some(1)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn different_uid_generation_conflict_retries_and_succeeds() {
+        let (first, second, recipient_id, first_info, second_info) =
+            shared_recipient_servers().await;
+        let organizer_address = format!("organizer@{DOMAIN}");
+        let attendee_address = format!("attendee@{DOMAIN}");
+        let recipient_address = format!("recipient@{DOMAIN}");
+        let first_uid = "different-uid-race-first";
+        let second_uid = "different-uid-race-second";
+        let first_message = request(
+            first_uid,
+            "REQUEST",
+            &organizer_address,
+            &attendee_address,
+            "First different UID",
+        );
+        let second_message = request(
+            second_uid,
+            "REQUEST",
+            &organizer_address,
+            &attendee_address,
+            "Second different UID",
+        );
+
+        let _barrier_lock = ITIP_CREATE_TEST_LOCK.lock().await;
+        set_itip_create_barrier(&[first_uid, second_uid], 2);
+        let (first_result, second_result) = bounded(
+            async {
+                tokio::join!(
+                    ingest(
+                        &first.server,
+                        &first_info,
+                        &attendee_address,
+                        ItipOrigin::Submission,
+                        &recipient_address,
+                        &first_message,
+                    ),
+                    ingest(
+                        &second.server,
+                        &second_info,
+                        &attendee_address,
+                        ItipOrigin::Submission,
+                        &recipient_address,
+                        &second_message,
+                    ),
+                )
+            },
+            "race different-UID forwarded invitations",
+        )
+        .await;
+
+        assert!(first_result.is_ok());
+        assert!(second_result.is_ok());
+        assert_eq!(
+            stored_event_count(&first.server, recipient_id, first_uid).await,
+            1
+        );
+        assert_eq!(
+            stored_event_count(&first.server, recipient_id, second_uid).await,
+            1
+        );
+        assert_eq!(
+            namespace_generation(&first.server, recipient_id).await,
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_event_uid_can_be_recreated_without_resetting_generation() {
+        let fixture = bounded(ServerFixture::new(), "build delete/recreate fixture").await;
+        let (_organizer_id, _attendee_id, recipient_id) = seed_race_accounts(&fixture).await;
+        let recipient_info = account_info(&fixture.server, recipient_id).await;
+        prepare_default_calendar(&fixture.server, &recipient_info).await;
+        let organizer_address = format!("organizer@{DOMAIN}");
+        let recipient_address = format!("recipient@{DOMAIN}");
+        let uid = "delete-recreate-same-uid";
+
+        let first = request(
+            uid,
+            "REQUEST",
+            &organizer_address,
+            &recipient_address,
+            "Original invitation",
+        );
+        assert!(
+            ingest(
+                &fixture.server,
+                &recipient_info,
+                &organizer_address,
+                ItipOrigin::Delivery,
+                &recipient_address,
+                &first,
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(
+            namespace_generation(&fixture.server, recipient_id).await,
+            Some(1)
+        );
+
+        delete_event(&fixture.server, &recipient_info, uid).await;
+        assert_eq!(
+            namespace_generation(&fixture.server, recipient_id).await,
+            Some(1)
+        );
+
+        let recreated = request(
+            uid,
+            "REQUEST",
+            &organizer_address,
+            &recipient_address,
+            "Recreated invitation",
+        );
+        assert!(
+            ingest(
+                &fixture.server,
+                &recipient_info,
+                &organizer_address,
+                ItipOrigin::Delivery,
+                &recipient_address,
+                &recreated,
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(
+            stored_event_count(&fixture.server, recipient_id, uid).await,
+            1
+        );
+        assert_eq!(
+            summary(
+                &stored_event(&fixture.server, recipient_id, uid)
+                    .await
+                    .data
+                    .event
+            ),
+            Some("Recreated invitation")
+        );
+        assert_eq!(
+            namespace_generation(&fixture.server, recipient_id).await,
+            Some(2)
+        );
     }
 }

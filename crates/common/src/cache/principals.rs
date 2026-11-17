@@ -31,6 +31,11 @@ use registry::schema::{
     structs::{Permissions, Tenant},
 };
 // SPDX-SnippetEnd
+
+#[cfg(not(feature = "enterprise"))]
+use crate::network::masked::MaskedAddress;
+#[cfg(not(feature = "enterprise"))]
+use registry::schema::structs::MaskedEmail;
 use compact_str::{CompactString, ToCompactString};
 use registry::{
     schema::{
@@ -591,6 +596,21 @@ impl Server {
                         } else if let Some((new_local_part, _)) = address.split_once('+') {
                             local_part = Cow::Borrowed(new_local_part);
                         }
+                    }
+                    #[cfg(not(feature = "enterprise"))]
+                    if let Some(masked_id) =
+                        MaskedAddress::parse_for_routing(local_part.as_ref())
+                        && let Some(masked_entry) = self
+                            .registry()
+                            .object::<MaskedEmail>(Id::new(masked_id))
+                            .await
+                            .caused_by(trc::location!())?
+                        && masked_entry.enable
+                        && masked_entry
+                            .expires_at
+                            .is_none_or(|at| at.timestamp() > now() as i64)
+                    {
+                        return Ok(Some(masked_entry.account_id.document_id()));
                     }
                     // SPDX-SnippetBegin
                     // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>

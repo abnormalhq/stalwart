@@ -8,6 +8,7 @@ use super::proppatch::FilePropPatchRequestHandler;
 use crate::{
     DavError, DavMethod, PropStatBuilder,
     common::{
+        create::DavCreateFence,
         ExtractETag,
         dead::{DeadPatch, DeadTarget, DisplayName},
         lock::{LockRequestHandler, ResourceState},
@@ -24,7 +25,7 @@ use dav_proto::{
     RequestHeaders, Return,
     schema::{Namespace, request::MkCol, response::MkColResponse},
 };
-use groupware::{cache::GroupwareCache, file::FileNode};
+use groupware::file::FileNode;
 use http_proto::HttpResponse;
 use hyper::StatusCode;
 use registry::schema::enums::StorageQuota;
@@ -58,14 +59,14 @@ impl FileMkColRequestHandler for Server {
             .await?
             .into_owned_uri()?;
         let account_id = resource_.account_id;
-        let resources = self
-            .fetch_groupware_resources(
-                access_token.account_id(),
-                account_id,
-                SyncCollection::FileNode,
-            )
-            .await
-            .caused_by(trc::location!())?;
+        let (resources, create_fence) = DavCreateFence::prepare(
+            self,
+            access_token,
+            account_id,
+            SyncCollection::FileNode,
+        )
+        .await
+        .caused_by(trc::location!())?;
         let path = resource_
             .resource
             .ok_or(DavError::Code(StatusCode::METHOD_NOT_ALLOWED))?;
@@ -136,7 +137,7 @@ impl FileMkColRequestHandler for Server {
         };
 
         // Apply MKCOL properties
-        let mut batch = BatchBuilder::new();
+        let mut batch = BatchBuilder::new_atomic();
         let document_id = batch.reserve_document_id(account_id, Collection::FileNode);
         let mut return_prop_stat = None;
         let mut dead_write = None;
@@ -185,10 +186,9 @@ impl FileMkColRequestHandler for Server {
             .create_document(document_id)
             .custom(ObjectIndexBuilder::<(), _>::new().with_changes(node))
             .caused_by(trc::location!())?;
-        let etag = self
-            .commit_batch(batch)
-            .await
-            .caused_by(trc::location!())?
+        let etag = create_fence
+            .commit(self, batch)
+            .await?
             .etag();
 
         if let Some(prop_stat) = return_prop_stat {
