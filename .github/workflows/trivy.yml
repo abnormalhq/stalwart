@@ -1,42 +1,52 @@
-# trivy ci workflow
+# Trivy filesystem scan of the repository (Cargo.lock, Dockerfiles, secrets).
+# This fork does not publish images, so the source tree is what gets scanned.
 name: trivy
 
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    # The branches below must be a subset of the branches above
-    branches: [ "main" ]
+    branches: [main]
   schedule:
     - cron: '00 12 * * *'
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-    if: github.repository == 'stalwartlabs/stalwart'
-    permissions:
-      contents: read # for actions/checkout to fetch code
-      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
-      actions: read # only required for a private repository by github/codeql-action/upload-sarif to get the Action run status
+  scan:
     name: Check
+    if: github.repository == 'abnormalhq/stalwart'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # Upload SARIF results to the code-scanning dashboard.
+      security-events: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
-        
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
         with:
-          scan-type: 'fs'
+          persist-credentials: false
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
           ignore-unfixed: true
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
 
       - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v4.38.2
+        # Pull requests from other forks get a read-only token and cannot upload.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@v4
         with:
-          sarif_file: 'trivy-results.sarif'
+          sarif_file: trivy-results.sarif
