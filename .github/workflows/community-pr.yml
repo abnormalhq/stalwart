@@ -17,7 +17,7 @@ concurrency:
 jobs:
   community:
     if: github.repository == 'abnormalhq/stalwart'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -104,7 +104,7 @@ jobs:
 
   dav-fence-postgres:
     if: github.repository == 'abnormalhq/stalwart'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     services:
       postgres:
@@ -139,7 +139,7 @@ jobs:
 
   recovery-foundationdb:
     if: github.repository == 'abnormalhq/stalwart'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     permissions:
       contents: read
