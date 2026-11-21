@@ -1,12 +1,10 @@
 FROM --platform=$BUILDPLATFORM docker.io/lukemathwalker/cargo-chef:0.1.78-rust-1.100.0-slim-trixie AS chef
 WORKDIR /build
 
-FROM --platform=$BUILDPLATFORM chef AS planner
-COPY . .
-RUN cargo chef prepare --recipe-path /recipe.json
-
 FROM --platform=$BUILDPLATFORM chef AS builder
 ARG TARGETPLATFORM
+# Avoid cargo-chef's normalized recipe: it leaves the local `http` lock reference
+# stale when normalizing package versions alongside the registry `http` crate.
 RUN case "${TARGETPLATFORM}" in \
     "linux/arm64") echo "aarch64-unknown-linux-gnu" > /target.txt && echo "-C linker=aarch64-linux-gnu-gcc" > /flags.txt ;; \
     "linux/amd64") echo "x86_64-unknown-linux-gnu" > /target.txt && echo "-C linker=x86_64-linux-gnu-gcc" > /flags.txt ;; \
@@ -18,8 +16,6 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
     g++-x86-64-linux-gnu binutils-x86-64-linux-gnu
 RUN rustup target add "$(cat /target.txt)"
-COPY --from=planner /recipe.json /recipe.json
-RUN RUSTFLAGS="$(cat /flags.txt)" cargo chef cook --locked --target "$(cat /target.txt)" --release --no-default-features --features "sqlite postgres mysql rocks s3 redis keep azure nats" --recipe-path /recipe.json
 COPY . .
 RUN RUSTFLAGS="$(cat /flags.txt)" cargo build --locked --target "$(cat /target.txt)" --release -p stalwart --no-default-features --features "sqlite postgres mysql rocks s3 redis keep azure nats"
 RUN mv "/build/target/$(cat /target.txt)/release" "/output"
