@@ -1,0 +1,192 @@
+name: Publish Community Image
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+      expected_sha:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Existing published release tag to build
+        required: true
+        default: v1.2.0
+        type: string
+      expected_sha:
+        description: Optional full commit SHA expected for the release tag
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: community-image-${{ github.repository }}-${{ inputs.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'abnormalhq/stalwart' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    steps:
+      - name: Require the trusted main workflow context
+        run: |
+          if [[ "$GITHUB_REPOSITORY" != "abnormalhq/stalwart" || "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Publishing is allowed only from abnormalhq/stalwart on refs/heads/main." >&2
+            exit 1
+          fi
+
+      - name: Checkout trusted workflow tools at the workflow invocation SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          path: trusted
+          persist-credentials: false
+
+      - name: Validate release tag format
+        env:
+          TAG: ${{ inputs.tag_name }}
+        run: python3 trusted/scripts/publish_community_image.py validate-tag --tag "$TAG"
+
+      - name: Resolve release tag and expected SHA before source checkout
+        id: resolve
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag_name }}
+        run: >-
+          python3 trusted/scripts/publish_community_image.py resolve-tag
+          --tag "$TAG"
+          --expected-sha "$EXPECTED_SHA"
+          --trusted-dir trusted
+
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+
+      - name: Verify immutable source and wait for required checks
+        id: validate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.resolve.outputs.sha }}
+          TAG_PEELED_OID: ${{ steps.resolve.outputs.tag_peeled_oid }}
+          TAG_REF_OID: ${{ steps.resolve.outputs.tag_ref_oid }}
+          TAG: ${{ inputs.tag_name }}
+        run: >-
+          python3 trusted/scripts/publish_community_image.py validate-source
+          --tag "$TAG"
+          --sha "$RELEASE_SHA"
+          --tag-ref-oid "$TAG_REF_OID"
+          --tag-peeled-oid "$TAG_PEELED_OID"
+          --source-dir source
+          --trusted-dir trusted
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build Community image without pushing
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: source
+          file: source/Dockerfile
+          platforms: linux/amd64
+          tags: ghcr.io/abnormalhq/stalwart:${{ steps.validate.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/abnormalhq/stalwart
+            org.opencontainers.image.version=${{ steps.validate.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.validate.outputs.sha }}
+          pull: true
+          load: true
+          push: false
+          provenance: false
+
+      - name: Smoke test built image and OCI labels
+        env:
+          IMAGE_REF: ghcr.io/abnormalhq/stalwart:${{ steps.validate.outputs.tag }}
+          RELEASE_SHA: ${{ steps.validate.outputs.sha }}
+          RELEASE_TAG: ${{ steps.validate.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+        run: >-
+          python3 trusted/scripts/publish_community_image.py verify-image
+          --image-ref "$IMAGE_REF"
+          --tag "$RELEASE_TAG"
+          --version "$RELEASE_VERSION"
+          --sha "$RELEASE_SHA"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Revalidate release tag immediately before push
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.validate.outputs.sha }}
+          TAG: ${{ steps.validate.outputs.tag }}
+          TAG_PEELED_OID: ${{ steps.validate.outputs.tag_peeled_oid }}
+          TAG_REF_OID: ${{ steps.validate.outputs.tag_ref_oid }}
+        run: >-
+          python3 trusted/scripts/publish_community_image.py revalidate
+          --tag "$TAG"
+          --sha "$RELEASE_SHA"
+          --tag-ref-oid "$TAG_REF_OID"
+          --tag-peeled-oid "$TAG_PEELED_OID"
+          --source-dir source
+          --trusted-dir trusted
+
+      - name: Refuse to overwrite an existing version tag
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.validate.outputs.tag }}
+        run: python3 trusted/scripts/publish_community_image.py check-registry-tag --tag "$TAG"
+
+      - name: Push the fixed release tag
+        env:
+          IMAGE: ghcr.io/abnormalhq/stalwart
+          TAG: ${{ steps.validate.outputs.tag }}
+        run: docker push "$IMAGE:$TAG"
+
+      - name: Read the published manifest digest
+        id: digest
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.validate.outputs.tag }}
+        run: python3 trusted/scripts/publish_community_image.py get-digest --tag "$TAG"
+
+      - name: Pull the published image by digest
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: docker pull "ghcr.io/abnormalhq/stalwart@$DIGEST"
+
+      - name: Verify pulled image and write summary
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          IMAGE_REF: ghcr.io/abnormalhq/stalwart@${{ steps.digest.outputs.digest }}
+          RELEASE_SHA: ${{ steps.validate.outputs.sha }}
+          RELEASE_TAG: ${{ steps.validate.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+        run: >-
+          python3 trusted/scripts/publish_community_image.py verify-image
+          --image-ref "$IMAGE_REF"
+          --tag "$RELEASE_TAG"
+          --version "$RELEASE_VERSION"
+          --sha "$RELEASE_SHA"
+          --digest "$DIGEST"
+          --write-summary
