@@ -1,6 +1,7 @@
 import argparse
 import json
 import unittest
+import urllib.parse
 from unittest import mock
 
 import publish_community_image as publisher
@@ -54,6 +55,90 @@ class PublishGuardTests(unittest.TestCase):
         state, run = workflow_run_state(runs, SHA)
         self.assertEqual(state, "failure")
         self.assertEqual(run["conclusion"], "failure")
+
+    def test_workflow_history_filters_events_and_paginates_past_mixed_runs(self):
+        def read_history(old_push_conclusion):
+            calls = []
+
+            def api(path, _token):
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+                event = query["event"][0]
+                page = int(query["page"][0])
+                calls.append((event, page))
+                if event == "push" and page == 1:
+                    runs = [
+                        {
+                            "head_sha": SHA,
+                            "event": "schedule",
+                            "head_branch": "main",
+                            "status": "completed",
+                            "conclusion": "success",
+                        }
+                        for _ in range(100)
+                    ]
+                    return {"total_count": 101, "workflow_runs": runs}
+                if event == "push" and page == 2:
+                    return {
+                        "total_count": 101,
+                        "workflow_runs": [
+                            {
+                                "head_sha": SHA,
+                                "event": "push",
+                                "head_branch": "main",
+                                "status": "completed",
+                                "conclusion": old_push_conclusion,
+                            }
+                        ],
+                    }
+                if event == "workflow_dispatch" and page == 1:
+                    return {
+                        "total_count": 1,
+                        "workflow_runs": [
+                            {
+                                "head_sha": SHA,
+                                "event": "workflow_dispatch",
+                                "head_branch": "main",
+                                "status": "completed",
+                                "conclusion": "success",
+                            }
+                        ],
+                    }
+                self.fail("unexpected workflow run page: " + repr((event, page)))
+
+            with mock.patch.object(publisher, "github_api_json", side_effect=api):
+                runs = publisher.get_workflow_runs("community-pr.yml", SHA, "token")
+            return runs, calls
+
+        failed_runs, calls = read_history("failure")
+        self.assertEqual(workflow_run_state(failed_runs, SHA)[0], "failure")
+        self.assertEqual(calls, [("push", 1), ("push", 2), ("workflow_dispatch", 1)])
+        successful_runs, _ = read_history("success")
+        self.assertEqual(workflow_run_state(successful_runs, SHA)[0], "success")
+
+    def test_workflow_history_truncation_cap_and_api_errors_fail_closed(self):
+        with mock.patch.object(
+            publisher,
+            "github_api_json",
+            return_value={"total_count": 1001, "workflow_runs": []},
+        ):
+            with self.assertRaisesRegex(PublishError, "1000-run result cap"):
+                publisher.get_workflow_runs("community-pr.yml", SHA, "token")
+
+        with mock.patch.object(
+            publisher,
+            "github_api_json",
+            return_value={"total_count": 101, "workflow_runs": [{} for _ in range(99)]},
+        ):
+            with self.assertRaisesRegex(PublishError, "truncated"):
+                publisher.get_workflow_runs("community-pr.yml", SHA, "token")
+
+        with mock.patch.object(
+            publisher,
+            "github_api_json",
+            side_effect=PublishError("GitHub API returned HTTP 403"),
+        ):
+            with self.assertRaisesRegex(PublishError, "HTTP 403"):
+                publisher.get_workflow_runs("community-pr.yml", SHA, "token")
 
     def test_missing_checks_timeout_and_pre_push_recheck_fail_closed(self):
         fetch_none = lambda *_: []

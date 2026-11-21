@@ -18,6 +18,9 @@ REPOSITORY = "abnormalhq/stalwart"
 IMAGE = "ghcr.io/abnormalhq/stalwart"
 IMAGE_SOURCE = "https://github.com/abnormalhq/stalwart"
 WORKFLOWS = ("community-pr.yml", "trivy.yml")
+WORKFLOW_RUN_EVENTS = ("push", "workflow_dispatch")
+WORKFLOW_RUN_PAGE_SIZE = 100
+WORKFLOW_RUN_LIMIT = 1000
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 ACCEPT = ", ".join(
@@ -169,15 +172,56 @@ def get_release(tag, token):
 
 
 def get_workflow_runs(workflow, sha, token):
-    query = urllib.parse.urlencode({"head_sha": sha, "per_page": "100"})
-    payload = github_api_json(
-        "/actions/workflows/" + urllib.parse.quote(workflow, safe="") + "/runs?" + query,
-        token,
-    )
-    runs = payload.get("workflow_runs") if isinstance(payload, dict) else None
-    if not isinstance(runs, list):
-        raise PublishError("GitHub Actions API did not return workflow runs for " + workflow)
-    return runs
+    all_runs = []
+    for event in WORKFLOW_RUN_EVENTS:
+        event_runs = []
+        expected_total = None
+        for page in range(1, WORKFLOW_RUN_LIMIT // WORKFLOW_RUN_PAGE_SIZE + 1):
+            query = urllib.parse.urlencode(
+                {
+                    "event": event,
+                    "head_sha": sha,
+                    "per_page": str(WORKFLOW_RUN_PAGE_SIZE),
+                    "page": str(page),
+                }
+            )
+            payload = github_api_json(
+                "/actions/workflows/"
+                + urllib.parse.quote(workflow, safe="")
+                + "/runs?"
+                + query,
+                token,
+            )
+            if not isinstance(payload, dict):
+                raise PublishError("GitHub Actions API returned invalid workflow runs for " + workflow)
+            total = payload.get("total_count")
+            runs = payload.get("workflow_runs")
+            if type(total) is not int or total < 0:
+                raise PublishError("GitHub Actions API omitted the workflow run count for " + workflow)
+            if total > WORKFLOW_RUN_LIMIT:
+                raise PublishError(
+                    workflow
+                    + " has more than the GitHub Actions API's 1000-run result cap for "
+                    + event
+                    + "; refusing to trust an incomplete history"
+                )
+            if expected_total is not None and total != expected_total:
+                raise PublishError("GitHub Actions workflow run history changed while being paginated")
+            expected_total = total
+            if not isinstance(runs, list):
+                raise PublishError("GitHub Actions API did not return workflow runs for " + workflow)
+            expected_page_size = min(WORKFLOW_RUN_PAGE_SIZE, total - len(event_runs))
+            if len(runs) != expected_page_size:
+                raise PublishError("GitHub Actions API returned a truncated workflow run page for " + workflow)
+            event_runs.extend(runs)
+            if len(event_runs) == expected_total:
+                break
+        else:
+            raise PublishError("GitHub Actions workflow run history exceeded the pagination limit")
+        if len(event_runs) != expected_total:
+            raise PublishError("GitHub Actions workflow run history is incomplete")
+        all_runs.extend(event_runs)
+    return all_runs
 
 
 def check_required_workflows(sha, token, fetch_runs=None):
