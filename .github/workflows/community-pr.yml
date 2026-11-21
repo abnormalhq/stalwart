@@ -52,6 +52,9 @@ jobs:
       - name: Check Release Please metadata coverage
         run: python3 scripts/check-release-please.py
 
+      - name: Test Community image publication guards
+        run: python3 -m unittest discover -s scripts -p 'test_publish_community_image.py'
+
       - name: Run presentation and recipient-policy tests
         shell: bash
         run: |

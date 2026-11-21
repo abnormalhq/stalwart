@@ -33,7 +33,7 @@ It rejects extra Cargo arguments so an invocation cannot accidentally add `enter
 
 The `.min` and `.min.gz` filenames are retained for the server's existing embedded-asset paths. `scripts/generate-ui-assets.py` creates the HTML copies and gzip files from checked-in sources without minifying JavaScript or CSS; it also updates the 12-character UI asset hash and substitutes that hash in packaged login and RSVP pages. Use `python3 scripts/generate-ui-assets.py --check` to verify generated files with the local Python/zlib toolchain.
 
-Docker build recipes also use locked dependencies and Community-only features. This repository does not publish container images or deploy binaries.
+Docker build recipes also use locked dependencies and Community-only features. The approved release workflow publishes a Community-only Linux amd64 image to GHCR; see [CONTRIBUTING.md](CONTRIBUTING.md) for its checks and backfill procedure. It does not deploy binaries or change package visibility.
 
 ## What is preserved
 

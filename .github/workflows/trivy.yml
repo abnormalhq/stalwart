@@ -1,5 +1,5 @@
 # Trivy filesystem scan of the repository (Cargo.lock, Dockerfiles, secrets).
-# This fork does not publish images, so the source tree is what gets scanned.
+# The image publisher requires this source scan to succeed for the release SHA.
 name: trivy
 
 on:

@@ -8,7 +8,7 @@ Thank you for considering a contribution. This repository is the Abnormal-owned 
 - Preserve upstream copyright/license notices and existing configuration, storage, executable, and protocol identifiers unless a separately reviewed compatibility plan approves a change.
 - Keep `/admin` and `/account` as configurable Console redirect entry points; do not restore the upstream WebUI bootstrap or imply SSO or feature parity.
 - Keep changes focused and include regression coverage for changed behavior.
-- Do not add image publishing or deployment automation without explicit project approval.
+- Do not add deployment automation. Community image publishing is limited to the approved GHCR release workflow below.
 
 ## Local workflow
 
@@ -37,6 +37,10 @@ Release Please runs on pushes to `main` and opens a synchronized release PR from
 Release PRs update the root version, the 36 direct workspace crate manifests, and `Cargo.lock`; fork release notes are written to `CHANGELOG-fork.md`, separate from the upstream reference `CHANGELOG.md`. Cargo may remove the `x-release-please-version` comments when regenerating `Cargo.lock`; restore them only on the 36 direct local package version lines and local-qualified dependency references. Do not annotate `event_macro` or registry records. Run `python3 scripts/check-release-please.py` to verify coverage before merging; the merge creates the version tag and GitHub release.
 
 GitHub suppresses pull-request workflow runs for PRs created with the default `GITHUB_TOKEN`. Before merging a Release Please PR, manually run **Community PR CI** from the Actions tab and select that release PR's branch for `workflow_dispatch`. If a `RELEASE_PLEASE_TOKEN` secret is already configured, the release workflow can use it instead to enable PR-triggered checks; no token is required for the default setup.
+
+After a Release Please release is created on `main`, the same workflow calls **Publish Community Image** directly, because events created with `GITHUB_TOKEN` do not start another workflow. The publisher scripts are checked out at the immutable `github.workflow_sha` for that workflow invocation; the image source is checked out separately at the SHA resolved from the release tag. For a pre-workflow release such as the v1.2.0 backfill, trusted scripts come from the reviewed workflow revision, not from the older release source. It waits for successful Community PR CI and Trivy runs for that SHA from `main` push or `main` manual-dispatch events, then builds the root `Dockerfile` for `linux/amd64` with Community features, smoke-tests the version, and publishes only `ghcr.io/abnormalhq/stalwart:<release-tag>`. It refuses to overwrite an existing tag and verifies the published digest by pulling and checking the image labels and version. No `latest`, major, or minor tags are published; this flow does not deploy binaries or change package visibility.
+
+For a release made before this workflow was merged, use **Actions → Publish Community Image → Run workflow** after merge, select `main`, and enter the existing release tag (for example, `v1.2.0`); the expected commit SHA is optional. The workflow requires a published, stable GitHub Release, matching release and Cargo versions, ancestry from `main`, successful existing CI and Trivy runs on that SHA, and an absent GHCR version tag. If any condition cannot be verified, it fails without publishing. An existing tag must be handled separately; this workflow never overwrites it. A manual run does not invoke Release Please. Package visibility remains at its current setting.
 
 Read the applicable upstream documentation for code conventions, but treat upstream support and contribution policies as applying to the upstream repository only.
 
